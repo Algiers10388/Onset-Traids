@@ -1,0 +1,33 @@
+{
+  "name": "crypto-trade-agent",
+  "version": "1.0.0",
+  "description": "Autonomous Quantitative Crypto Trading Agent with MACD, RSI, Bollinger Bands, and Multi-Exchange Execution",
+  "main": "dist/cli.js",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "start": "tsx src/cli.ts",
+    "trade": "tsx src/cli.ts",
+    "backtest": "tsx src/cli.ts --backtest",
+    "test": "tsx --test test/*.test.ts"
+  },
+  "keywords": [
+    "crypto",
+    "trading-agent",
+    "macd",
+    "rsi",
+    "bollinger-bands",
+    "arbitrage",
+    "binance",
+    "okx",
+    "coinbase"
+  ],
+  "dependencies": {
+    "dotenv": "^16.4.5"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.5.0"
+  }
+}

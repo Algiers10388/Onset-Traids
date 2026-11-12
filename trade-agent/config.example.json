@@ -1,0 +1,21 @@
+{
+  "symbols": [
+    "BTC/USDT",
+    "ETH/USDT",
+    "SOL/USDT"
+  ],
+  "exchange": "BINANCE",
+  "strategy": "TRIPLE_CONFLUENCE_PRO",
+  "leverage": 1,
+  "pollIntervalMs": 5000,
+  "risk": {
+    "maxPositionSizeUsd": 500,
+    "dailyLossLimitUsd": 150,
+    "stopLossPercent": 2.5,
+    "takeProfitPercent": 5.0,
+    "trailingStopPercent": 1.5,
+    "trailingStopEnabled": true,
+    "maxOpenPositions": 3
+  },
+  "capitalCapUsd": 500
+}

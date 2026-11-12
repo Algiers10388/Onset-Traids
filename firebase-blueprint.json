@@ -1,0 +1,158 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "User profile with authentication and trading preferences",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "description": "Firebase Auth user ID" },
+        "email": { "type": "string", "format": "email", "description": "User email address" },
+        "displayName": { "type": "string", "description": "Display name" },
+        "photoURL": { "type": "string", "description": "Avatar photo URL" },
+        "createdAt": { "type": "string", "description": "ISO timestamp of account creation" },
+        "updatedAt": { "type": "string", "description": "ISO timestamp of last update" }
+      },
+      "required": ["uid", "email"]
+    },
+    "TradingStrategy": {
+      "title": "TradingStrategy",
+      "description": "Custom algorithmic trading strategy configuration",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Unique strategy identifier" },
+        "name": { "type": "string", "description": "Strategy label" },
+        "type": { "type": "string", "description": "Algorithm type (e.g. SPATIAL_ARBITRAGE, TRIANGULAR)" },
+        "minSpreadPercent": { "type": "number", "description": "Minimum required spread" },
+        "maxPositionUsd": { "type": "number", "description": "Maximum USD per trade" },
+        "stopLossPercent": { "type": "number", "description": "Stop loss percentage" },
+        "takeProfitPercent": { "type": "number", "description": "Take profit percentage" },
+        "routingMode": { "type": "string", "description": "Execution routing mode" },
+        "updatedAt": { "type": "string", "description": "ISO timestamp of last modification" }
+      },
+      "required": ["id", "name", "type"]
+    },
+    "BotExecutionLog": {
+      "title": "BotExecutionLog",
+      "description": "Log entry of executed trade or arbitrage event",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Execution ID" },
+        "timestamp": { "type": "number", "description": "Timestamp in milliseconds" },
+        "symbol": { "type": "string", "description": "Traded token or pair" },
+        "type": { "type": "string", "description": "Order or Arbitrage type" },
+        "netProfitUsd": { "type": "number", "description": "Net realized profit in USD" },
+        "status": { "type": "string", "description": "Execution status (COMPLETED, FAILED)" },
+        "route": { "type": "string", "description": "Execution pathway or DEX venues" }
+      },
+      "required": ["id", "timestamp", "symbol", "status"]
+    },
+    "TroubleshootingSession": {
+      "title": "TroubleshootingSession",
+      "description": "Persisted chat session with Gemini troubleshooting and live updates assistant",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Unique session ID" },
+        "title": { "type": "string", "description": "Title or subject of troubleshooting session" },
+        "modelUsed": { "type": "string", "description": "Gemini model identifier used" },
+        "messages": { "type": "string", "description": "Serialized JSON of multi-turn chat messages" },
+        "createdAt": { "type": "string", "description": "Creation timestamp" },
+        "updatedAt": { "type": "string", "description": "Last message timestamp" }
+      },
+      "required": ["id", "title", "createdAt"]
+    },
+    "PortfolioSnapshot": {
+      "title": "PortfolioSnapshot",
+      "description": "Saved portfolio and fiat vault balances",
+      "type": "object",
+      "properties": {
+        "cash": { "type": "number", "description": "Available cash balance in USD" },
+        "totalValue": { "type": "number", "description": "Total portfolio valuation" },
+        "mode": { "type": "string", "description": "Trading execution mode" },
+        "updatedAt": { "type": "string", "description": "ISO timestamp of snapshot" }
+      },
+      "required": ["cash", "totalValue", "mode"]
+    },
+    "WatchedWallet": {
+      "title": "WatchedWallet",
+      "description": "User bookmarked on-chain wallet addresses for live monitoring",
+      "type": "object",
+      "properties": {
+        "address": { "type": "string", "description": "EVM or Crypto public address" },
+        "label": { "type": "string", "description": "Custom user tag or label" },
+        "network": { "type": "string", "description": "Network chain name (e.g. Ethereum, Arbitrum)" },
+        "totalNetWorthUsd": { "type": "number", "description": "Cached total net worth valuation" },
+        "tokensCount": { "type": "number", "description": "Number of active token holdings" },
+        "addedAt": { "type": "string", "description": "ISO timestamp when added" },
+        "updatedAt": { "type": "string", "description": "ISO timestamp of last update" }
+      },
+      "required": ["address", "network", "addedAt"]
+    },
+    "BankConnection": {
+      "title": "BankConnection",
+      "description": "Tokenized bank account connection for fiat rails and settlement",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Unique connection ID" },
+        "bankName": { "type": "string", "description": "Name of financial institution" },
+        "accountType": { "type": "string", "description": "Account type (CHECKING, SAVINGS)" },
+        "accountNumberMasked": { "type": "string", "description": "Masked account number with last 4 digits" },
+        "routingNumber": { "type": "string", "description": "Masked ABA routing number" },
+        "status": { "type": "string", "description": "Verification status (VERIFIED, PENDING)" },
+        "tokenizedId": { "type": "string", "description": "PCI/NACHA compliant cryptographic token" },
+        "connectedVia": { "type": "string", "description": "Connection rail (PLAID_OPEN_BANKING, MANUAL_ACH_ROUTING)" },
+        "addedAt": { "type": "string", "description": "ISO timestamp of connection" }
+      },
+      "required": ["id", "bankName", "status", "accountNumberMasked"]
+    },
+    "BotSecuritySettings": {
+      "title": "BotSecuritySettings",
+      "description": "Trading bot account security guardrails, circuit breakers, and 2FA configuration",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Settings record identifier" },
+        "twoFactorEnforced": { "type": "boolean", "description": "Whether 2FA is required for transfers and withdrawals" },
+        "emergencyFreezeActive": { "type": "boolean", "description": "Instant kill-switch to halt all trading bot execution" },
+        "maxSingleOrderUsd": { "type": "number", "description": "Maximum USD ceiling per individual trade" },
+        "maxDailyLossUsd": { "type": "number", "description": "Daily loss circuit breaker limit" },
+        "maxLeverageAllowed": { "type": "number", "description": "Maximum leverage ceiling allowed" },
+        "ipWhitelistEnabled": { "type": "boolean", "description": "Whether bot execution is restricted to authorized IPs" },
+        "updatedAt": { "type": "string", "description": "ISO timestamp of last update" }
+      },
+      "required": ["id", "twoFactorEnforced", "emergencyFreezeActive", "maxSingleOrderUsd"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "UserProfile",
+      "description": "Root user profile document"
+    },
+    "/users/{userId}/strategies/{strategyId}": {
+      "schema": "TradingStrategy",
+      "description": "User saved algorithmic trading bot configurations"
+    },
+    "/users/{userId}/executions/{executionId}": {
+      "schema": "BotExecutionLog",
+      "description": "User execution logs and performance metrics"
+    },
+    "/users/{userId}/chats/{chatId}": {
+      "schema": "TroubleshootingSession",
+      "description": "User Gemini troubleshooting and live market update chat sessions"
+    },
+    "/users/{userId}/portfolio/{snapshotId}": {
+      "schema": "PortfolioSnapshot",
+      "description": "User saved portfolio valuations"
+    },
+    "/users/{userId}/watched_wallets/{walletAddress}": {
+      "schema": "WatchedWallet",
+      "description": "User bookmarked and monitored on-chain wallet addresses"
+    },
+    "/users/{userId}/bank_connections/{bankId}": {
+      "schema": "BankConnection",
+      "description": "User tokenized and verified bank account connections"
+    },
+    "/users/{userId}/bot_security_settings/{settingId}": {
+      "schema": "BotSecuritySettings",
+      "description": "User trading bot account protection and risk guardrails"
+    }
+  }
+}

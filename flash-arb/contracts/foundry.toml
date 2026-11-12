@@ -1,0 +1,26 @@
+[profile.default]
+src = "src"
+out = "out"
+libs = ["lib"]
+optimizer = true
+optimizer_runs = 1000000
+via_ir = true   # matches scripts/compile-contracts.cjs (executeOptimizedArbitrage has 10 params -> stack-too-deep without IR)
+evm_version = "cancun"
+auto_detect_solc = true
+
+# Cross-Platform Compiler Setup:
+# 1. Termux (Android aarch64): Install native solc via `pkg install solidity`, then run:
+#    forge test --use $(which solc) --fork-url https://arb1.arbitrum.io/rpc
+# 2. WSL (Windows Subsystem for Linux - Recommended on PC):
+#    Runs standard Linux x86_64, svm downloads automatically or use system solc.
+# 3. Windows PowerShell:
+#    Install solc via `winget install Ethereum.Solidity` or `npm install -g solc`.
+
+[rpc_endpoints]
+arbitrum = "https://arb1.arbitrum.io/rpc"
+base = "https://mainnet.base.org"
+optimism = "https://mainnet.optimism.io"
+
+[fuzz]
+runs = 1000
+max_test_rejects = 65536

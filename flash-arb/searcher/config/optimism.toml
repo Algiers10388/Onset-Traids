@@ -1,0 +1,57 @@
+# ==============================================================================
+# Optimism Mainnet (Chain ID: 10) FlashArb Searcher Configuration
+# ==============================================================================
+
+chain_id = 10
+chain_name = "optimism"
+
+rpc_http = "https://mainnet.optimism.io"
+rpc_ws = "wss://optimism-mainnet.public.blastapi.io"
+
+relay_endpoint = "https://optimism.builder-relay.io"
+is_l2 = true
+sequencer_priority_bidding = true
+tip_share_percent = 60
+
+# Aave V3 on Optimism
+aave_v3_pool = "0x794a61358D6845594F94dc1DB02A252b5b4814aD"
+aave_v3_addresses_provider = "0xa97684ead0e402dC232d5A977953DF7ECBaB3CDb"
+aave_flash_fee_bps = 5
+
+flash_arb_contract = "0x0000000000000000000000000000000000000000"
+
+[dexes.uniswap_v3]
+router = "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45"
+quoter = "0xb27308f9F90D607463bb33eA1BeBb41C27CE5AB6"
+factory = "0x1F98431c8aD98523631AE4a59f267346ea31F984"
+
+# Velodrome (Solidly fork): router ABI differs from UniswapV2Router02 -> not supported by FlashArbOptimized, skipped by the searcher
+[dexes.velodrome]
+router = "0xa062aE8A9c5e11aaA026fc2670B0D65cCc8B2858"
+factory = "0x25CbdDb98b35ab1FF77413456B31EC81A6B6B746"
+
+[tokens]
+WETH = "0x4200000000000000000000000000000000000006"
+USDC = "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85"
+USDT = "0x94b008aA00579c1307B0EF2c499aD98a8ce58e58"
+OP   = "0x4200000000000000000000000000000000000042"
+
+[risk]
+min_net_profit_usd = 7.00
+max_gas_per_tx = 800000
+daily_revert_loss_cap_usd = 60.00
+consecutive_failure_limit = 3
+simulation_engine = "revm"
+excluded_tokens = []
+
+# NOTE: [beneficiary]/[signer] below are informational only. The searcher reads FLASH_ARB_PROFIT_WALLET and FLASH_ARB_SIGNER_KEY from the environment.
+[beneficiary]
+profit_recipient_address = "0x65602EB9e09B07002872E074004400d37e27CCB9"  # MetaMask (informational: the searcher reads FLASH_ARB_PROFIT_WALLET, see run-live.sh)
+label = "Main Arb Profit Vault"
+auto_sweep = true
+
+[signer]
+gas_wallet_address = "0xF1d765d693f9e6fAb0c4a2FCa942d9D54233C966"
+label = "Optimism Mainnet Gas Funder"
+private_key_env = "FLASH_ARB_SIGNER_KEY"
+

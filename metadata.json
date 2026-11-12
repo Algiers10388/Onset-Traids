@@ -1,0 +1,6 @@
+{
+  "name": "Crypto Trade Agent & Strategy Simulator",
+  "description": "Multi-exchange cryptocurrency trading agent with live market data feeds from Kraken, Coinbase, Binance and NonKYC, live real exchange order execution with HMAC-authenticated signatures, secure banking connectivity (ACH/FedNow/Wire), instant debit card loading/withdrawals, multi-exchange Smart Order Routing (SOR), algorithmic execution bot, and AI risk auditor.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

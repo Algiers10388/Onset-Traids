@@ -1,0 +1,25 @@
+[package]
+name = "flash-arb-searcher"
+version = "0.2.0"
+edition = "2021"
+description = "Multi-chain flash loan arbitrage searcher (on-chain pool reads, eth_call verification)"
+
+[dependencies]
+tokio = { version = "1.38", features = ["full"] }
+ethers = { version = "2.0", features = ["rustls"] }
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+eyre = "0.6"
+clap = { version = "4.5", features = ["derive"] }
+dashmap = "5.5"
+futures-util = "0.3"
+
+# NOTE: removed unused/heavy deps (revm, uniswap-v3-math, reqwest, serde_json, async-trait, num-*, ipc/ws features).
+# panic = "abort" removed: one panic must not kill every chain worker. LTO is "thin" so it still builds on a phone.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+strip = true

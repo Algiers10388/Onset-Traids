@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Crypto Trade Agent & Strategy Simulator</title>
+    <meta name="description" content="Multi-exchange cryptocurrency trading agent with live market data feeds from Kraken, Coinbase, Binance and NonKYC, live real exchange order execution with HMAC-authenticated signatures, secure banking connectivity (ACH/FedNow/Wire), instant debit card loading/withdrawals, multi-exchange Smart Order Routing (SOR), algorithmic execution bot, and AI risk auditor." />
+    <meta property="og:title" content="Crypto Trade Agent & Strategy Simulator" />
+    <meta property="og:description" content="Multi-exchange cryptocurrency trading agent with live market data feeds from Kraken, Coinbase, Binance and NonKYC, live real exchange order execution with HMAC-authenticated signatures, secure banking connectivity (ACH/FedNow/Wire), instant debit card loading/withdrawals, multi-exchange Smart Order Routing (SOR), algorithmic execution bot, and AI risk auditor." />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <script>
+      (function() {
+        // Prevent extension collisions where multiple Web3 wallets attempt to overwrite window.ethereum
+        try {
+          var _eth = window.ethereum;
+          Object.defineProperty(window, 'ethereum', {
+            configurable: true,
+            enumerable: true,
+            get: function() {
+              return _eth;
+            },
+            set: function(val) {
+              _eth = val;
+            }
+          });
+        } catch (e) {}
+
+        // Catch and prevent unhandled "Cannot set property ethereum of #<Window> which has only a getter"
+        window.addEventListener('error', function(event) {
+          if (
+            event &&
+            event.message &&
+            typeof event.message === 'string' &&
+            event.message.indexOf('Cannot set property ethereum') !== -1
+          ) {
+            event.preventDefault();
+            event.stopImmediatePropagation();
+            return true;
+          }
+        }, true);
+
+        window.addEventListener('unhandledrejection', function(event) {
+          if (
+            event &&
+            event.reason &&
+            (event.reason.message || String(event.reason)).indexOf('Cannot set property ethereum') !== -1
+          ) {
+            event.preventDefault();
+            event.stopImmediatePropagation();
+          }
+        }, true);
+      })();
+    </script>
+  </head>
+  <body class="bg-[#0B0F17] text-slate-100 antialiased selection:bg-cyan-500/20 selection:text-cyan-300">
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+
