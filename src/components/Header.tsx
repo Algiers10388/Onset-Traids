@@ -1,13 +1,11 @@
-import React, { useState } from 'react';
+import React from 'react';
 import {
   Activity,
   ArrowUpFromLine,
   Bot,
   BrainCircuit,
   Eye,
-  Key,
   Landmark,
-  MoreVertical,
   Radar,
   RotateCcw,
   Sparkles,
@@ -69,7 +67,6 @@ export const Header: React.FC<HeaderProps> = ({
   onChainSignalsCount = 5,
   sentimentScore,
 }) => {
-  const [showToolsMenu, setShowToolsMenu] = useState(false);
   const totalEquity = portfolio.cash + unrealizedPnl;
   const { user, signInWithGoogle, signOutUser } = useAuth();
   const totalPnl = totalEquity - portfolio.startingBalance;
@@ -78,119 +75,36 @@ export const Header: React.FC<HeaderProps> = ({
 
   const isLiveTrading = tradingMode === 'LIVE_REAL_TRADING';
 
+  const optionTabBaseClass =
+    'flex items-center gap-1.5 px-2.5 py-2 text-xs font-mono border-b-2 border-transparent text-slate-400 hover:text-slate-100 hover:bg-slate-800/40 hover:border-slate-600 transition-colors cursor-pointer whitespace-nowrap shrink-0';
+
   return (
-    <header className="border-b border-slate-800/90 bg-[#090D16]/95 backdrop-blur-md sticky top-0 z-40">
-      <div className="max-w-7xl mx-auto px-3 sm:px-4 h-14 flex items-center justify-between gap-2 sm:gap-3">
-        {/* LEFT: Brand + Primary Navigation */}
-        <div className="flex items-center gap-2 sm:gap-3 min-w-0">
-          <div className="flex items-center gap-2 shrink-0">
-            <div
-              className={`flex h-8 w-8 items-center justify-center rounded-lg border shadow-sm ${
-                isLiveTrading
-                  ? 'bg-rose-500/15 border-rose-500/40 text-rose-400'
-                  : 'bg-cyan-500/15 border-cyan-500/30 text-cyan-400'
-              }`}
-            >
-              <Bot className="h-4 w-4" />
-            </div>
-            <div className="hidden 2xl:flex flex-col leading-none">
-              <span className="text-sm font-bold tracking-tight text-white font-mono">
-                APEX<span className="text-cyan-400">QUANT</span>
-              </span>
-              <span className="text-[9px] text-slate-500 font-mono mt-0.5">
-                Multi-Exchange SOR
-              </span>
-            </div>
+    <header className="border-b border-slate-800/90 bg-[#090D16] sticky top-0 z-40">
+      {/* Row 1: Brand + Live Telemetry + Bot Toggle + Auth */}
+      <div className="max-w-7xl mx-auto px-3 sm:px-4 min-h-12 py-1.5 flex items-center justify-between gap-3">
+        {/* Brand */}
+        <div className="flex items-center gap-2.5 shrink-0">
+          <div
+            className={`flex h-8 w-8 items-center justify-center rounded-lg border shadow-sm ${
+              isLiveTrading
+                ? 'bg-rose-500/15 border-rose-500/40 text-rose-400'
+                : 'bg-cyan-500/15 border-cyan-500/30 text-cyan-400'
+            }`}
+          >
+            <Bot className="h-4 w-4" />
           </div>
-
-          {onSelectTab && (
-            <nav className="flex items-center p-0.5 rounded-lg bg-slate-950/80 border border-slate-800 text-xs font-mono overflow-x-auto no-scrollbar">
-              <button
-                type="button"
-                onClick={() => onSelectTab('TRADING_DESK')}
-                className={`flex items-center gap-1 px-2.5 py-1 rounded-md transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
-                  activeTab === 'TRADING_DESK'
-                    ? 'bg-slate-800 text-white font-semibold shadow-sm'
-                    : 'text-slate-400 hover:text-slate-200'
-                }`}
-              >
-                <Zap className="h-3 w-3 text-cyan-400 shrink-0" />
-                <span>Desk</span>
-              </button>
-
-              <button
-                type="button"
-                onClick={() => onSelectTab('SENTIMENT_RADAR')}
-                className={`flex items-center gap-1 px-2.5 py-1 rounded-md transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
-                  activeTab === 'SENTIMENT_RADAR'
-                    ? 'bg-pink-600/30 text-pink-200 font-semibold shadow-sm border border-pink-500/40'
-                    : 'text-slate-400 hover:text-slate-200'
-                }`}
-                title="AI Sentiment Analysis & Social Media Radar"
-              >
-                <BrainCircuit className="h-3 w-3 text-pink-400 shrink-0" />
-                <span>Sentiment</span>
-                {sentimentScore !== undefined && (
-                  <span
-                    className={`text-[10px] ml-0.5 px-1 rounded font-bold tabular-nums ${
-                      sentimentScore > 0
-                        ? 'text-emerald-400 bg-emerald-950/60'
-                        : sentimentScore < 0
-                        ? 'text-rose-400 bg-rose-950/60'
-                        : 'text-slate-400'
-                    }`}
-                  >
-                    {sentimentScore > 0 ? `+${sentimentScore}` : sentimentScore}
-                  </span>
-                )}
-              </button>
-
-              <button
-                type="button"
-                onClick={() => onSelectTab('ETHERSCAN_INTELLIGENCE')}
-                className={`flex items-center gap-1 px-2.5 py-1 rounded-md transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
-                  activeTab === 'ETHERSCAN_INTELLIGENCE'
-                    ? 'bg-indigo-600/30 text-indigo-200 font-semibold shadow-sm'
-                    : 'text-slate-400 hover:text-slate-200'
-                }`}
-              >
-                <Radar className="h-3 w-3 text-indigo-400 shrink-0" />
-                <span className="hidden xl:inline">Etherscan</span>
-                <span>Radar</span>
-                <span className="text-[10px] text-emerald-400 tabular-nums">({onChainSignalsCount})</span>
-              </button>
-
-              <button
-                type="button"
-                onClick={() => onSelectTab('FLASH_ARB_BOT')}
-                className={`flex items-center gap-1 px-2.5 py-1 rounded-md transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
-                  activeTab === 'FLASH_ARB_BOT'
-                    ? 'bg-cyan-500/20 text-cyan-200 font-semibold shadow-sm'
-                    : 'text-slate-400 hover:text-slate-200'
-                }`}
-              >
-                <Zap className="h-3 w-3 text-cyan-400 shrink-0" />
-                <span>Flash Arb</span>
-              </button>
-
-              <button
-                type="button"
-                onClick={() => onSelectTab('WALLET_MONITOR')}
-                className={`hidden md:flex items-center gap-1 px-2.5 py-1 rounded-md transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
-                  activeTab === 'WALLET_MONITOR'
-                    ? 'bg-emerald-500/20 text-emerald-200 font-semibold shadow-sm'
-                    : 'text-slate-400 hover:text-slate-200'
-                }`}
-              >
-                <Eye className="h-3 w-3 text-emerald-400 shrink-0" />
-                <span>Monitor</span>
-              </button>
-            </nav>
-          )}
+          <div className="flex flex-col leading-none">
+            <span className="text-sm font-bold tracking-tight text-white font-mono">
+              APEX<span className="text-cyan-400">QUANT</span>
+            </span>
+            <span className="hidden sm:block text-[9px] text-slate-500 font-mono mt-0.5">
+              Multi-Exchange SOR
+            </span>
+          </div>
         </div>
 
-        {/* CENTER: Compact Portfolio Telemetry */}
-        <div className="hidden xl:flex items-center gap-2.5 bg-slate-950/70 border border-slate-800/80 px-3 py-1 rounded-lg text-xs font-mono shrink-0 whitespace-nowrap">
+        {/* Center Telemetry */}
+        <div className="hidden md:flex items-center gap-2.5 bg-slate-950/80 border border-slate-800/80 px-3 py-1 rounded-lg text-xs font-mono shrink-0 whitespace-nowrap">
           <div className="flex items-center gap-1">
             <span className="text-slate-500 text-[11px]">Equity:</span>
             <span className="text-white font-bold tabular-nums">{formatCurrency(totalEquity)}</span>
@@ -208,9 +122,9 @@ export const Header: React.FC<HeaderProps> = ({
             </span>
           </div>
 
-          <span className="text-slate-700">·</span>
+          <span className="text-slate-700 hidden lg:inline">·</span>
 
-          <div className="flex items-center gap-1">
+          <div className="hidden lg:flex items-center gap-1">
             <span className="text-slate-500 text-[11px]">Pos:</span>
             <span className="text-cyan-400 font-semibold tabular-nums">{activePositionsCount}</span>
           </div>
@@ -219,12 +133,12 @@ export const Header: React.FC<HeaderProps> = ({
 
           <div className="flex items-center gap-1.5 text-rose-300 font-bold text-[10px] tracking-wide">
             <span className="h-1.5 w-1.5 rounded-full bg-rose-500 shrink-0" />
-            <span className="font-mono uppercase">LIVE</span>
+            <span className="font-mono uppercase">{isLiveTrading ? 'LIVE REAL' : 'LIVE'}</span>
           </div>
         </div>
 
-        {/* RIGHT: Primary Action Controls */}
-        <div className="flex items-center gap-1.5 shrink-0">
+        {/* Right Primary Controls: Bot Status + Auth */}
+        <div className="flex items-center gap-2 shrink-0">
           <button
             type="button"
             onClick={onToggleBot}
@@ -246,192 +160,11 @@ export const Header: React.FC<HeaderProps> = ({
                   : 'bg-slate-400'
               }`}
             />
-            <span className="font-mono text-[11px] hidden sm:inline">
+            <span className="font-mono text-[11px]">
               {botRunning ? (isLiveTrading ? 'LIVE BOT' : 'BOT RUNNING') : 'BOT STANDBY'}
             </span>
           </button>
 
-          <button
-            type="button"
-            onClick={onOpenFiatAccount}
-            className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 border border-emerald-500/30 text-emerald-300 text-xs font-mono transition-colors cursor-pointer whitespace-nowrap shrink-0"
-            title="Open Treasury & Bank/Card Funding Rail"
-          >
-            <Landmark className="h-3.5 w-3.5 text-emerald-400 shrink-0" />
-            <span className="font-bold text-white text-[11px] tabular-nums">
-              {formatCurrency(fiatAccountAvailableBalance)}
-            </span>
-          </button>
-
-          {onOpenOkxWallet && (
-            <button
-              type="button"
-              onClick={onOpenOkxWallet}
-              className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg border text-xs font-mono transition-all cursor-pointer whitespace-nowrap shrink-0 ${
-                okxConnectedAddress
-                  ? 'bg-neutral-900 border-white/40 text-white hover:border-white shadow-sm'
-                  : 'bg-slate-900 hover:bg-slate-800 border-slate-700 text-slate-300 hover:text-white'
-              }`}
-              title={
-                okxConnectedAddress
-                  ? `Connected OKX Wallet: ${okxConnectedAddress}`
-                  : 'Connect OKX Web3 Wallet (..11)'
-              }
-            >
-              <div className="w-3 h-3 rounded-[2px] bg-black border border-white/40 grid grid-cols-2 gap-0.5 p-0.5 shrink-0">
-                <div className="bg-white rounded-[0.5px]" />
-                <div className="bg-black" />
-              </div>
-              <span className="hidden sm:inline text-[11px] font-bold">
-                {okxConnectedAddress
-                  ? `OKX ${
-                      okxConnectedAddress.toLowerCase().endsWith('11')
-                        ? '..11'
-                        : `${okxConnectedAddress.slice(0, 4)}..${okxConnectedAddress.slice(-2)}`
-                    }`
-                  : 'OKX ..11'}
-              </span>
-              <span
-                className={`h-1.5 w-1.5 rounded-full shrink-0 ${
-                  okxConnectedAddress ? 'bg-cyan-400' : 'bg-amber-400'
-                }`}
-              />
-            </button>
-          )}
-
-          {onOpenAiTroubleshooter && (
-            <button
-              type="button"
-              onClick={onOpenAiTroubleshooter}
-              className="flex items-center gap-1 px-2 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 border border-cyan-500/40 text-cyan-300 text-xs font-mono transition-colors cursor-pointer whitespace-nowrap shrink-0"
-              title="AI Strategy Copilot & Quant Diagnostics"
-            >
-              <Bot className="h-3.5 w-3.5 text-cyan-400 shrink-0" />
-              <span className="hidden lg:inline text-[11px]">Copilot</span>
-            </button>
-          )}
-
-          {/* Tools & Utilities Dropdown Menu */}
-          <div className="relative shrink-0">
-            <button
-              type="button"
-              onClick={() => setShowToolsMenu(!showToolsMenu)}
-              className={`p-1.5 rounded-lg border transition-colors cursor-pointer flex items-center justify-center ${
-                showToolsMenu
-                  ? 'bg-slate-800 text-white border-slate-600'
-                  : 'bg-slate-900 text-slate-400 hover:text-white border-slate-800 hover:border-slate-700'
-              }`}
-              title="More Tools: Exchanges, Cake Wallet, Backtest Lab, AI Risk Audit, Withdrawals"
-              aria-label="More tools menu"
-            >
-              <MoreVertical className="h-4 w-4" />
-            </button>
-
-            {showToolsMenu && (
-              <>
-                <div className="fixed inset-0 z-40" onClick={() => setShowToolsMenu(false)} />
-                <div className="absolute right-0 mt-1.5 w-60 rounded-xl bg-slate-900 border border-slate-800 shadow-2xl p-1.5 z-50 text-xs font-mono flex flex-col gap-0.5 animate-in fade-in-50 duration-150">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setShowToolsMenu(false);
-                      onOpenExchanges();
-                    }}
-                    className="flex items-center gap-2.5 px-3 py-2 rounded-lg text-slate-300 hover:text-white hover:bg-slate-800 transition-colors w-full text-left cursor-pointer"
-                  >
-                    <Wallet className="h-3.5 w-3.5 text-cyan-400" />
-                    <span>Exchange Wallets & Keys</span>
-                  </button>
-
-                  {onOpenCakeWallet && (
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setShowToolsMenu(false);
-                        onOpenCakeWallet();
-                      }}
-                      className="flex items-center gap-2.5 px-3 py-2 rounded-lg text-slate-300 hover:text-white hover:bg-slate-800 transition-colors w-full text-left cursor-pointer"
-                    >
-                      <span className="text-xs">🍰</span>
-                      <span>Cake Wallet (..5d)</span>
-                    </button>
-                  )}
-
-                  {onOpenOkxWallet && (
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setShowToolsMenu(false);
-                        onOpenOkxWallet();
-                      }}
-                      className="flex items-center gap-2.5 px-3 py-2 rounded-lg text-slate-300 hover:text-white hover:bg-slate-800 transition-colors w-full text-left cursor-pointer"
-                    >
-                      <Key className="h-3.5 w-3.5 text-amber-400" />
-                      <span>
-                        {okxConnectedAddress
-                          ? `OKX: ${okxConnectedAddress.slice(0, 6)}...`
-                          : 'Connect OKX Wallet (..11)'}
-                      </span>
-                    </button>
-                  )}
-
-                  <div className="h-px bg-slate-800 my-1" />
-
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setShowToolsMenu(false);
-                      onOpenBacktest();
-                    }}
-                    className="flex items-center gap-2.5 px-3 py-2 rounded-lg text-slate-300 hover:text-white hover:bg-slate-800 transition-colors w-full text-left cursor-pointer"
-                  >
-                    <Activity className="h-3.5 w-3.5 text-cyan-400" />
-                    <span>Backtest Lab</span>
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setShowToolsMenu(false);
-                      onOpenAudit();
-                    }}
-                    className="flex items-center gap-2.5 px-3 py-2 rounded-lg text-slate-300 hover:text-white hover:bg-slate-800 transition-colors w-full text-left cursor-pointer"
-                  >
-                    <Sparkles className="h-3.5 w-3.5 text-purple-400" />
-                    <span>AI Risk Audit</span>
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setShowToolsMenu(false);
-                      onOpenWithdraw();
-                    }}
-                    className="flex items-center gap-2.5 px-3 py-2 rounded-lg text-slate-300 hover:text-white hover:bg-slate-800 transition-colors w-full text-left cursor-pointer"
-                  >
-                    <ArrowUpFromLine className="h-3.5 w-3.5 text-rose-400" />
-                    <span>Withdraw Capital</span>
-                  </button>
-
-                  <div className="h-px bg-slate-800 my-1" />
-
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setShowToolsMenu(false);
-                      onResetPortfolio();
-                    }}
-                    className="flex items-center gap-2.5 px-3 py-2 rounded-lg text-emerald-400 hover:text-emerald-300 hover:bg-emerald-950/30 transition-colors w-full text-left cursor-pointer"
-                  >
-                    <RotateCcw className="h-3.5 w-3.5" />
-                    <span>Sync & Refresh Live Ledger</span>
-                  </button>
-                </div>
-              </>
-            )}
-          </div>
-
-          {/* User Profile / Auth */}
           {user ? (
             <div className="flex items-center gap-1.5 pl-1 shrink-0">
               {user.photoURL ? (
@@ -448,7 +181,7 @@ export const Header: React.FC<HeaderProps> = ({
               <button
                 type="button"
                 onClick={signOutUser}
-                className="text-[10px] text-slate-400 hover:text-rose-400 font-mono transition-colors cursor-pointer hidden sm:inline whitespace-nowrap"
+                className="text-[11px] text-slate-400 hover:text-rose-400 font-mono transition-colors cursor-pointer hidden sm:inline whitespace-nowrap"
                 title="Sign Out"
               >
                 Sign Out
@@ -482,6 +215,229 @@ export const Header: React.FC<HeaderProps> = ({
               <span className="hidden sm:inline text-[11px]">Sign In</span>
             </button>
           )}
+        </div>
+      </div>
+
+      {/* Row 2: Full-Width Tab Rail — Views + All Tool Options as Clean Tabs */}
+      <div className="border-t border-slate-800/80 bg-[#0B101B]">
+        <div
+          className="max-w-7xl mx-auto px-3 sm:px-4 flex items-center gap-0.5 overflow-x-auto no-scrollbar"
+          role="tablist"
+          aria-label="Workspace views and tools"
+        >
+          {onSelectTab && (
+            <>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={activeTab === 'TRADING_DESK'}
+                onClick={() => onSelectTab('TRADING_DESK')}
+                className={`flex items-center gap-1.5 px-3 py-2 text-xs font-mono border-b-2 transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
+                  activeTab === 'TRADING_DESK'
+                    ? 'border-cyan-400 text-white font-semibold bg-slate-800/50'
+                    : 'border-transparent text-slate-400 hover:text-slate-100 hover:bg-slate-800/30'
+                }`}
+              >
+                <Zap className="h-3.5 w-3.5 text-cyan-400 shrink-0" />
+                <span>Desk</span>
+              </button>
+
+              <button
+                type="button"
+                role="tab"
+                aria-selected={activeTab === 'SENTIMENT_RADAR'}
+                onClick={() => onSelectTab('SENTIMENT_RADAR')}
+                className={`flex items-center gap-1.5 px-3 py-2 text-xs font-mono border-b-2 transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
+                  activeTab === 'SENTIMENT_RADAR'
+                    ? 'border-pink-400 text-pink-100 font-semibold bg-pink-500/10'
+                    : 'border-transparent text-slate-400 hover:text-slate-100 hover:bg-slate-800/30'
+                }`}
+                title="AI Sentiment Analysis & Social Media Radar"
+              >
+                <BrainCircuit className="h-3.5 w-3.5 text-pink-400 shrink-0" />
+                <span>Sentiment</span>
+                {sentimentScore !== undefined && (
+                  <span
+                    className={`text-[10px] px-1.5 py-0.5 rounded font-bold tabular-nums leading-none ${
+                      sentimentScore > 0
+                        ? 'text-emerald-400 bg-emerald-950/70'
+                        : sentimentScore < 0
+                        ? 'text-rose-400 bg-rose-950/70'
+                        : 'text-slate-400 bg-slate-800'
+                    }`}
+                  >
+                    {sentimentScore > 0 ? `+${sentimentScore}` : sentimentScore}
+                  </span>
+                )}
+              </button>
+
+              <button
+                type="button"
+                role="tab"
+                aria-selected={activeTab === 'ETHERSCAN_INTELLIGENCE'}
+                onClick={() => onSelectTab('ETHERSCAN_INTELLIGENCE')}
+                className={`flex items-center gap-1.5 px-3 py-2 text-xs font-mono border-b-2 transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
+                  activeTab === 'ETHERSCAN_INTELLIGENCE'
+                    ? 'border-indigo-400 text-indigo-100 font-semibold bg-indigo-500/10'
+                    : 'border-transparent text-slate-400 hover:text-slate-100 hover:bg-slate-800/30'
+                }`}
+              >
+                <Radar className="h-3.5 w-3.5 text-indigo-400 shrink-0" />
+                <span>Etherscan Radar</span>
+                <span className="text-[10px] text-emerald-400 font-semibold tabular-nums">
+                  ({onChainSignalsCount})
+                </span>
+              </button>
+
+              <button
+                type="button"
+                role="tab"
+                aria-selected={activeTab === 'FLASH_ARB_BOT'}
+                onClick={() => onSelectTab('FLASH_ARB_BOT')}
+                className={`flex items-center gap-1.5 px-3 py-2 text-xs font-mono border-b-2 transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
+                  activeTab === 'FLASH_ARB_BOT'
+                    ? 'border-cyan-400 text-cyan-100 font-semibold bg-cyan-500/10'
+                    : 'border-transparent text-slate-400 hover:text-slate-100 hover:bg-slate-800/30'
+                }`}
+              >
+                <Zap className="h-3.5 w-3.5 text-cyan-400 shrink-0" />
+                <span>Flash Arb</span>
+              </button>
+
+              <button
+                type="button"
+                role="tab"
+                aria-selected={activeTab === 'WALLET_MONITOR'}
+                onClick={() => onSelectTab('WALLET_MONITOR')}
+                className={`flex items-center gap-1.5 px-3 py-2 text-xs font-mono border-b-2 transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
+                  activeTab === 'WALLET_MONITOR'
+                    ? 'border-emerald-400 text-emerald-100 font-semibold bg-emerald-500/10'
+                    : 'border-transparent text-slate-400 hover:text-slate-100 hover:bg-slate-800/30'
+                }`}
+              >
+                <Eye className="h-3.5 w-3.5 text-emerald-400 shrink-0" />
+                <span>Monitor</span>
+              </button>
+
+              <div className="h-4 w-px bg-slate-800 shrink-0 mx-1.5" aria-hidden="true" />
+            </>
+          )}
+
+          {/* Option Tabs */}
+          <button
+            type="button"
+            onClick={onOpenFiatAccount}
+            className={optionTabBaseClass}
+            title="Open Treasury & Bank/Card Funding Rail"
+          >
+            <Landmark className="h-3.5 w-3.5 text-emerald-400 shrink-0" />
+            <span>Treasury</span>
+            <span className="text-emerald-300 font-bold tabular-nums">
+              {formatCurrency(fiatAccountAvailableBalance)}
+            </span>
+          </button>
+
+          <button
+            type="button"
+            onClick={onOpenExchanges}
+            className={optionTabBaseClass}
+            title="Exchange Wallets & Keys"
+          >
+            <Wallet className="h-3.5 w-3.5 text-cyan-400 shrink-0" />
+            <span>Exchanges</span>
+          </button>
+
+          {onOpenOkxWallet && (
+            <button
+              type="button"
+              onClick={onOpenOkxWallet}
+              className={optionTabBaseClass}
+              title={
+                okxConnectedAddress
+                  ? `Connected OKX Wallet: ${okxConnectedAddress}`
+                  : 'Connect OKX Web3 Wallet (..11)'
+              }
+            >
+              <span
+                className={`h-1.5 w-1.5 rounded-full shrink-0 ${
+                  okxConnectedAddress ? 'bg-cyan-400' : 'bg-amber-400'
+                }`}
+              />
+              <span>
+                {okxConnectedAddress
+                  ? `OKX ${
+                      okxConnectedAddress.toLowerCase().endsWith('11')
+                        ? '..11'
+                        : `${okxConnectedAddress.slice(0, 4)}..${okxConnectedAddress.slice(-2)}`
+                    }`
+                  : 'OKX ..11'}
+              </span>
+            </button>
+          )}
+
+          {onOpenCakeWallet && (
+            <button
+              type="button"
+              onClick={onOpenCakeWallet}
+              className={optionTabBaseClass}
+              title="Cake Wallet (..5d)"
+            >
+              <span className="text-xs leading-none">🍰</span>
+              <span>Cake ..5d</span>
+            </button>
+          )}
+
+          <button
+            type="button"
+            onClick={onOpenBacktest}
+            className={optionTabBaseClass}
+            title="Open Backtest Lab"
+          >
+            <Activity className="h-3.5 w-3.5 text-cyan-400 shrink-0" />
+            <span>Backtest</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={onOpenAudit}
+            className={optionTabBaseClass}
+            title="Run AI Risk Audit"
+          >
+            <Sparkles className="h-3.5 w-3.5 text-purple-400 shrink-0" />
+            <span>AI Audit</span>
+          </button>
+
+          {onOpenAiTroubleshooter && (
+            <button
+              type="button"
+              onClick={onOpenAiTroubleshooter}
+              className={optionTabBaseClass}
+              title="AI Strategy Copilot & Quant Diagnostics"
+            >
+              <Bot className="h-3.5 w-3.5 text-cyan-400 shrink-0" />
+              <span>Copilot</span>
+            </button>
+          )}
+
+          <button
+            type="button"
+            onClick={onOpenWithdraw}
+            className={optionTabBaseClass}
+            title="Withdraw Capital"
+          >
+            <ArrowUpFromLine className="h-3.5 w-3.5 text-rose-400 shrink-0" />
+            <span>Withdraw</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={onResetPortfolio}
+            className="flex items-center gap-1.5 px-2.5 py-2 text-xs font-mono border-b-2 border-transparent text-emerald-400 hover:text-emerald-300 hover:bg-emerald-950/30 hover:border-emerald-500/60 transition-colors cursor-pointer whitespace-nowrap shrink-0"
+            title="Sync & Refresh Live Ledger"
+          >
+            <RotateCcw className="h-3.5 w-3.5 shrink-0" />
+            <span>Sync</span>
+          </button>
         </div>
       </div>
     </header>
