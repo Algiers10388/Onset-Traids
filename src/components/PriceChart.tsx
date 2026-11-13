@@ -189,7 +189,7 @@ export const PriceChart: React.FC<PriceChartProps> = ({
             className={`px-2.5 py-1 rounded-lg border text-xs font-mono transition-all cursor-pointer ${
               showEMA
                 ? 'bg-cyan-500/15 border-cyan-500/40 text-cyan-300 font-bold'
-                : 'bg-slate-850 border-slate-800 text-slate-400 hover:text-slate-200'
+                : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-slate-200'
             }`}
           >
             EMA (9/21)
@@ -200,7 +200,7 @@ export const PriceChart: React.FC<PriceChartProps> = ({
             className={`px-2.5 py-1 rounded-lg border text-xs font-mono transition-all cursor-pointer ${
               showBollinger
                 ? 'bg-purple-500/15 border-purple-500/40 text-purple-300 font-bold'
-                : 'bg-slate-850 border-slate-800 text-slate-400 hover:text-slate-200'
+                : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-slate-200'
             }`}
           >
             Bollinger (20,2)

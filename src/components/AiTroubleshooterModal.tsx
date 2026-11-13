@@ -447,7 +447,7 @@ export const AiTroubleshooterModal: React.FC<AiTroubleshooterModalProps> = ({
             <button
               onClick={handleSaveToCloud}
               title={user ? 'Saved to your Firestore profile' : 'Sign in to save chat sessions'}
-              className="hidden sm:flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-700 bg-slate-800/80 hover:bg-slate-750 text-xs font-semibold text-slate-300 hover:text-white transition-all cursor-pointer"
+              className="hidden sm:flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-700 bg-slate-800/80 hover:bg-slate-700 text-xs font-semibold text-slate-300 hover:text-white transition-all cursor-pointer"
             >
               <Cloud className="w-3.5 h-3.5 text-cyan-400" />
               <span>{savedCloudNotice ? 'Saved!' : user ? 'Sync Firestore' : 'Sign in to Sync'}</span>
@@ -561,7 +561,7 @@ export const AiTroubleshooterModal: React.FC<AiTroubleshooterModalProps> = ({
                 if (qp.search) setUseSearchGrounding(true);
                 handleSendMessage(qp.prompt);
               }}
-              className="px-2.5 py-1 rounded-full bg-slate-800/80 hover:bg-slate-750 text-slate-300 hover:text-white border border-slate-700/80 text-[11px] whitespace-nowrap transition-colors flex items-center gap-1 cursor-pointer"
+              className="px-2.5 py-1 rounded-full bg-slate-800/80 hover:bg-slate-700 text-slate-300 hover:text-white border border-slate-700/80 text-[11px] whitespace-nowrap transition-colors flex items-center gap-1 cursor-pointer"
             >
               <span>{qp.icon}</span>
               <span>{qp.label}</span>
@@ -598,7 +598,7 @@ export const AiTroubleshooterModal: React.FC<AiTroubleshooterModalProps> = ({
                   </span>
                   <div className="flex items-center gap-2 font-mono text-[10px]">
                     {msg.modelUsed && (
-                      <span className="px-1.5 py-0.2 rounded bg-slate-800 text-cyan-300 border border-cyan-500/30">
+                      <span className="px-1.5 py-0.5 rounded bg-slate-800 text-cyan-300 border border-cyan-500/30">
                         {msg.modelUsed}
                       </span>
                     )}

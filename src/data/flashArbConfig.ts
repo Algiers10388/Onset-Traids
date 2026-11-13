@@ -59,7 +59,6 @@ export const ARB_TOKENS: ArbTokenConfig[] = [
     balancerAvailable: true,
     typicalSpreadBps: 35,
     iconBg: 'bg-purple-500/20 text-purple-300 border-purple-500/30',
-    contractAddressArb: '0x2cCCd1A60b4125b28f09A04561B36Be9079b0E84',
   },
   {
     symbol: 'tBTC',
@@ -74,7 +73,6 @@ export const ARB_TOKENS: ArbTokenConfig[] = [
     balancerAvailable: true,
     typicalSpreadBps: 24,
     iconBg: 'bg-amber-600/20 text-amber-300 border-amber-600/30',
-    contractAddressArb: '0x6c76971F144F743232483256B4856e3747C3453B',
   },
 
   // Liquid Staking & Restaking (LSTs / LRTs - Prime Spread Arbitrage)
@@ -121,7 +119,6 @@ export const ARB_TOKENS: ArbTokenConfig[] = [
     balancerAvailable: true,
     typicalSpreadBps: 34,
     iconBg: 'bg-orange-500/20 text-orange-300 border-orange-500/30',
-    contractAddressArb: '0xEc70Dcb4A1efA46b8F2d97c310c9C4790bA5ffCA',
   },
   {
     symbol: 'ezETH',
@@ -151,7 +148,6 @@ export const ARB_TOKENS: ArbTokenConfig[] = [
     balancerAvailable: true,
     typicalSpreadBps: 40,
     iconBg: 'bg-teal-500/20 text-teal-300 border-teal-500/30',
-    contractAddressArb: '0x35751007A4073076699107938b3f613656347065',
   },
 
   // Ecosystem & DeFi Tokens
@@ -183,7 +179,6 @@ export const ARB_TOKENS: ArbTokenConfig[] = [
     balancerAvailable: true,
     typicalSpreadBps: 36,
     iconBg: 'bg-rose-500/20 text-rose-300 border-rose-500/30',
-    contractAddressArb: '0x4200000000000000000000000000000000000042',
   },
   {
     symbol: 'LINK',
@@ -258,7 +253,6 @@ export const ARB_TOKENS: ArbTokenConfig[] = [
     balancerAvailable: true,
     typicalSpreadBps: 38,
     iconBg: 'bg-blue-600/20 text-blue-300 border-blue-600/30',
-    contractAddressArb: '0x940181A94a35a4569E4529a3Cdfb74E48FD98ae3',
   },
   {
     symbol: 'VELO',
@@ -273,7 +267,6 @@ export const ARB_TOKENS: ArbTokenConfig[] = [
     balancerAvailable: true,
     typicalSpreadBps: 42,
     iconBg: 'bg-red-500/20 text-red-300 border-red-500/30',
-    contractAddressArb: '0x9560e827aF36c94D2Ac33a39bCE1Fe78631088Db',
   },
 
   // DeFi Protocol Bluechips
@@ -290,7 +283,7 @@ export const ARB_TOKENS: ArbTokenConfig[] = [
     balancerAvailable: true,
     typicalSpreadBps: 34,
     iconBg: 'bg-teal-600/20 text-teal-300 border-teal-600/30',
-    contractAddressArb: '0x0c880f670413da5450444c588998A6858b909E7f',
+    contractAddressArb: '0x0c880f6761F1af8d9Aa9C466984b80DAb9a8c9e8',
   },
   {
     symbol: 'UNI',
@@ -305,7 +298,7 @@ export const ARB_TOKENS: ArbTokenConfig[] = [
     balancerAvailable: true,
     typicalSpreadBps: 28,
     iconBg: 'bg-pink-500/20 text-pink-300 border-pink-500/30',
-    contractAddressArb: '0xfA7F8980b0F1e64a2062791CE3b0E4Cd4960932d',
+    contractAddressArb: '0xFa7F8980b0f1E64A2062791cc3b0871572f1F7f0',
   },
   {
     symbol: 'AAVE',
@@ -335,7 +328,6 @@ export const ARB_TOKENS: ArbTokenConfig[] = [
     balancerAvailable: true,
     typicalSpreadBps: 32,
     iconBg: 'bg-sky-500/20 text-sky-300 border-sky-500/30',
-    contractAddressArb: '0x13Ad51ed4F1b7e9b77187ea63f49Cf899DF2F95b',
   },
 
   // Stablecoins (Sub-cent Peg Deviations & Yield Arbitrage)
@@ -353,6 +345,21 @@ export const ARB_TOKENS: ArbTokenConfig[] = [
     typicalSpreadBps: 12,
     iconBg: 'bg-blue-500/20 text-blue-300 border-blue-500/30',
     contractAddressArb: '0xaf88d065e77c8cC2239327C5EDb3A432268e5831',
+  },
+  {
+    symbol: 'USDC.e',
+    name: 'USD Coin (Bridged)',
+    price: 1.00,
+    decimals: 6,
+    category: 'Stablecoin',
+    defaultLoan: 65000,
+    maxLoan: 1000000,
+    loanStep: 10000,
+    aaveAvailable: true,
+    balancerAvailable: true,
+    typicalSpreadBps: 14,
+    iconBg: 'bg-blue-600/20 text-blue-300 border-blue-600/30',
+    contractAddressArb: '0xFF970A61A04b1cA14834A43f5dE4533eBDDB5CC8',
   },
   {
     symbol: 'USDT',
@@ -397,7 +404,6 @@ export const ARB_TOKENS: ArbTokenConfig[] = [
     balancerAvailable: true,
     typicalSpreadBps: 20,
     iconBg: 'bg-purple-500/20 text-purple-300 border-purple-500/30',
-    contractAddressArb: '0x4988a896b1227218e4A686fdE5EabdcAbd91571f',
   },
   {
     symbol: 'FRAX',
@@ -457,7 +463,6 @@ export const ARB_TOKENS: ArbTokenConfig[] = [
     balancerAvailable: true,
     typicalSpreadBps: 25,
     iconBg: 'bg-pink-600/20 text-pink-300 border-pink-600/30',
-    contractAddressArb: '0x5575552988a977950c0617Da99E6367576D592ba',
   },
 
   // High-Volatility Memes
@@ -474,7 +479,6 @@ export const ARB_TOKENS: ArbTokenConfig[] = [
     balancerAvailable: true,
     typicalSpreadBps: 65,
     iconBg: 'bg-emerald-600/20 text-emerald-300 border-emerald-600/30',
-    contractAddressArb: '0x25d887Ce7A35172c62FEBfd67A1856620daEB000',
   },
   {
     symbol: 'SHIB',
@@ -489,7 +493,6 @@ export const ARB_TOKENS: ArbTokenConfig[] = [
     balancerAvailable: true,
     typicalSpreadBps: 58,
     iconBg: 'bg-amber-600/20 text-amber-300 border-amber-600/30',
-    contractAddressArb: '0xfAbA6f8e4a5E8Ab82F62fe7C39859FA577269BE3',
   },
 ];
 
@@ -2859,85 +2862,106 @@ impl TxExecutor {
                 continue;
             }
 
+            let code_bytes = code.as_ref();
+            let has_direct_sweep = code_bytes.windows(4).any(|w| w == [0x78, 0x04, 0xd9, 0xac]);
+            let has_rescue_to = code_bytes.windows(4).any(|w| w == [0xa7, 0x07, 0x06, 0x92]);
+            let has_rescue = code_bytes.windows(3).any(|w| w == [0xae, 0x3b, 0xf8]);
+
             // 1a. Native ETH sitting on vault contract
             let eth_bal = provider.get_balance(contract_addr, None).await.unwrap_or_default();
             if !eth_bal.is_zero() {
-                let label = format!("vault {:?} ETH ({} wei) -> {:?}", contract_addr, eth_bal, profit_recipient);
-                match self
-                    .send_verified_sweep_tx(
-                        &provider,
-                        &client,
-                        signer_address,
-                        contract_addr,
-                        encode_direct_sweep_call(profit_recipient),
-                        &label,
-                    )
-                    .await
-                {
-                    Ok(SweepTxOutcome::Confirmed(_)) => {
-                        report.contract_eth_swept_wei = report.contract_eth_swept_wei.saturating_add(eth_bal);
-                        report.txs_confirmed += 1;
+                if !has_direct_sweep {
+                    warn!(
+                        "[{}] Vault {:?} lacks executeDirectFlashArb(address) selector; skipping {} wei ETH sweep",
+                        self.config.chain_name, contract_addr, eth_bal
+                    );
+                } else {
+                    let label = format!("vault {:?} ETH ({} wei) -> {:?}", contract_addr, eth_bal, profit_recipient);
+                    match self
+                        .send_verified_sweep_tx(
+                            &provider,
+                            &client,
+                            signer_address,
+                            contract_addr,
+                            encode_direct_sweep_call(profit_recipient),
+                            &label,
+                        )
+                        .await
+                    {
+                        Ok(SweepTxOutcome::Confirmed(_)) => {
+                            report.contract_eth_swept_wei = report.contract_eth_swept_wei.saturating_add(eth_bal);
+                            report.txs_confirmed += 1;
+                        }
+                        Ok(other) => warn!("[{}] Vault ETH sweep skipped ({}): {:?}", self.config.chain_name, label, other),
+                        Err(e) => warn!("[{}] Vault ETH sweep error ({}): {:?}", self.config.chain_name, label, e),
                     }
-                    Ok(other) => warn!("[{}] Vault ETH sweep skipped ({}): {:?}", self.config.chain_name, label, other),
-                    Err(e) => warn!("[{}] Vault ETH sweep error ({}): {:?}", self.config.chain_name, label, e),
                 }
             }
 
             // 1b. Non-ETH ERC-20 dust sitting on vault contract
             let vault_tokens = self.query_token_balances(&provider, contract_addr, &tokens, block).await;
             for (sym, token_addr, bal) in vault_tokens {
-                let label_direct = format!("rescueTokensTo {} ({}) from {:?} -> {:?}", sym, bal, contract_addr, profit_recipient);
-                match self
-                    .send_verified_sweep_tx(
-                        &provider,
-                        &client,
-                        signer_address,
-                        contract_addr,
-                        encode_rescue_tokens_to_call(token_addr, profit_recipient),
-                        &label_direct,
-                    )
-                    .await
-                {
-                    Ok(SweepTxOutcome::Confirmed(_)) => {
-                        report.contract_tokens_swept += 1;
-                        report.txs_confirmed += 1;
-                    }
-                    Ok(SweepTxOutcome::SimulationReverted(_)) => {
-                        // Legacy deployments only expose \`rescueTokens(address)\` which transfers to \`owner()\` (= signer_address).
-                        // Run it first, then Phase 2 below forwards the balance from signer_address to \`profit_recipient\`.
-                        let label_legacy = format!("rescueTokens {} ({}) from {:?} -> owner {:?}", sym, bal, contract_addr, signer_address);
-                        match self
-                            .send_verified_sweep_tx(
-                                &provider,
-                                &client,
-                                signer_address,
-                                contract_addr,
-                                encode_rescue_tokens_call(token_addr),
-                                &label_legacy,
-                            )
-                            .await
-                        {
-                            Ok(SweepTxOutcome::Confirmed(_)) => {
-                                report.contract_tokens_swept += 1;
-                                report.txs_confirmed += 1;
-                            }
-                            Ok(other) => {
-                                warn!("[{}] Legacy vault token rescue skipped ({}): {:?}", self.config.chain_name, label_legacy, other);
-                                report.skipped_tokens += 1;
-                            }
-                            Err(e) => {
-                                warn!("[{}] Legacy vault token rescue error ({}): {:?}", self.config.chain_name, label_legacy, e);
-                                report.skipped_tokens += 1;
-                            }
+                if !has_rescue_to && !has_rescue {
+                    warn!(
+                        "[{}] Vault {:?} lacks rescueTokensTo/rescueTokens selectors; skipping {} ({})",
+                        self.config.chain_name, contract_addr, sym, bal
+                    );
+                    report.skipped_tokens += 1;
+                    continue;
+                }
+                if has_rescue_to {
+                    let label_direct = format!("rescueTokensTo {} ({}) from {:?} -> {:?}", sym, bal, contract_addr, profit_recipient);
+                    match self
+                        .send_verified_sweep_tx(
+                            &provider,
+                            &client,
+                            signer_address,
+                            contract_addr,
+                            encode_rescue_tokens_to_call(token_addr, profit_recipient),
+                            &label_direct,
+                        )
+                        .await
+                    {
+                        Ok(SweepTxOutcome::Confirmed(_)) => {
+                            report.contract_tokens_swept += 1;
+                            report.txs_confirmed += 1;
+                        }
+                        Ok(other) => {
+                            warn!("[{}] Vault token rescue skipped ({}): {:?}", self.config.chain_name, label_direct, other);
+                            report.skipped_tokens += 1;
+                        }
+                        Err(e) => {
+                            warn!("[{}] Vault token rescue error ({}): {:?}", self.config.chain_name, label_direct, e);
+                            report.skipped_tokens += 1;
                         }
                     }
-                    Ok(other) => {
-                        warn!("[{}] Vault token rescue skipped ({}): {:?}", self.config.chain_name, label_direct, other);
-                        report.skipped_tokens += 1;
-                    }
-                    Err(e) => {
-                        warn!("[{}] Vault token rescue error ({}): {:?}", self.config.chain_name, label_direct, e);
-                        report.skipped_tokens += 1;
+                } else {
+                    // Legacy deployments only expose \`rescueTokens(address)\` which transfers to \`owner()\` (= signer_address).
+                    // Run it first, then Phase 2 below forwards the balance from signer_address to \`profit_recipient\`.
+                    let label_legacy = format!("rescueTokens {} ({}) from {:?} -> owner {:?}", sym, bal, contract_addr, signer_address);
+                    match self
+                        .send_verified_sweep_tx(
+                            &provider,
+                            &client,
+                            signer_address,
+                            contract_addr,
+                            encode_rescue_tokens_call(token_addr),
+                            &label_legacy,
+                        )
+                        .await
+                    {
+                        Ok(SweepTxOutcome::Confirmed(_)) => {
+                            report.contract_tokens_swept += 1;
+                            report.txs_confirmed += 1;
+                        }
+                        Ok(other) => {
+                            warn!("[{}] Legacy vault token rescue skipped ({}): {:?}", self.config.chain_name, label_legacy, other);
+                            report.skipped_tokens += 1;
+                        }
+                        Err(e) => {
+                            warn!("[{}] Legacy vault token rescue error ({}): {:?}", self.config.chain_name, label_legacy, e);
+                            report.skipped_tokens += 1;
+                        }
                     }
                 }
             }
@@ -3168,6 +3192,12 @@ GMX    = "0xfc5A1A6EB076a2C7aD06eD22C90d7E710E35ad0a"
 AAVE   = "0xba5DdD1f9d7F570dc94a51479a000E3BCE967196"
 PENDLE = "0x0c880f6761F1af8d9Aa9C466984b80DAb9a8c9e8"
 UNI    = "0xFa7F8980b0f1E64A2062791cc3b0871572f1F7f0"
+cbETH  = "0x1DEBd73E752bEaF79865Fd6446b0c970EaE7732f"
+ezETH  = "0x2416092f143378750bb29b79eD961ab195CcEea5"
+MAGIC  = "0x539bdE0d7Dbd336b79148AA742883198BBF60342"
+RDNT   = "0x3082CC23568eA640225c2467653dB90e9250AaA0"
+FRAX   = "0x17FC002b466eEc40DaE837Fc4bE5c67993ddBd6F"
+USDe   = "0x5d3a1Ff2b6BAb83b63cd9AD0787074081a52ef34"
 
 # Risk Controls & Circuit Breakers
 [risk]
@@ -3177,7 +3207,8 @@ daily_revert_loss_cap_usd = 75.00 # Kill switch if daily gas spent on reverts ex
 consecutive_failure_limit = 3      # Trip circuit breaker after 3 reverts
 simulation_engine = "revm"
 excluded_tokens = [
-    "0x5979D7b546E38E414F7E9822514be443A4800529", # wstETH (rebasing / price ratio complexities)
+    "0x5979D7b546E38E414F7E9822514be443A4800529", # wstETH (sweep-compatible only; excluded from arb swaps)
+    "0x211Cc4DD073734dA055fbF44a2b4667d5E5fE5d2", # sUSDe (ERC-4626 yield token; sweep-compatible only)
 ]
 
 # NOTE: [beneficiary]/[signer] below are informational only. The searcher reads FLASH_ARB_PROFIT_WALLET and FLASH_ARB_SIGNER_KEY from the environment.
@@ -3227,10 +3258,13 @@ router = "0xCF77a3Ba9a5CA399B7C97c7488454543B869415f"
 factory = "0x420DD381b31aEf6683db6B902084cB0FFECe40Da"
 
 [tokens]
-WETH = "0x4200000000000000000000000000000000000006"
-USDC = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+WETH  = "0x4200000000000000000000000000000000000006"
+USDC  = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+USDbC = "0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA"
 cbETH = "0x2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22"
-AERO = "0x940181a94A35A4569E4529A3CDfB74e38FD98631"
+AERO  = "0x940181a94A35A4569E4529A3CDfB74e38FD98631"
+DAI   = "0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb"
+cbBTC = "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf"
 
 [risk]
 min_net_profit_usd = 6.00
@@ -3287,10 +3321,13 @@ router = "0xa062aE8A9c5e11aaA026fc2670B0D65cCc8B2858"
 factory = "0x25CbdDb98b35ab1FF77413456B31EC81A6B6B746"
 
 [tokens]
-WETH = "0x4200000000000000000000000000000000000006"
-USDC = "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85"
-USDT = "0x94b008aA00579c1307B0EF2c499aD98a8ce58e58"
-OP   = "0x4200000000000000000000000000000000000042"
+WETH  = "0x4200000000000000000000000000000000000006"
+USDC  = "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85"
+USDCe = "0x7F5c764cBc14f9669B88837ca1490cCa17c31607"
+USDT  = "0x94b008aA00579c1307B0EF2c499aD98a8ce58e58"
+DAI   = "0xDA10009cBd5D07dd0CeCc66161FC93D7c9000da1"
+OP    = "0x4200000000000000000000000000000000000042"
+WBTC  = "0x68f180fcCe6836688e9084f035309E29Bf0A2095"
 
 [risk]
 min_net_profit_usd = 7.00
@@ -3298,7 +3335,9 @@ max_gas_per_tx = 800000
 daily_revert_loss_cap_usd = 60.00
 consecutive_failure_limit = 3
 simulation_engine = "revm"
-excluded_tokens = []
+excluded_tokens = [
+    "0x1F32b1c2345538c0c6f582fCB022739c4A194Ebb", # wstETH (sweep-compatible only; excluded from arb swaps)
+]
 
 # NOTE: [beneficiary]/[signer] below are informational only. The searcher reads FLASH_ARB_PROFIT_WALLET and FLASH_ARB_SIGNER_KEY from the environment.
 [beneficiary]

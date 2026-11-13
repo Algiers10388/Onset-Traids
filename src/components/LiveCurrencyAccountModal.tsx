@@ -1019,7 +1019,7 @@ This document certifies real-time clearing across banking rails.
                             key={pct}
                             type="button"
                             onClick={() => setFundBotAmount(String(Math.floor(fiatAccount.availableBalance * pct)))}
-                            className="flex-1 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-850 border border-slate-800 hover:border-purple-500/40 text-slate-300 font-mono text-xs font-bold cursor-pointer transition-all"
+                            className="flex-1 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800/80 border border-slate-800 hover:border-purple-500/40 text-slate-300 font-mono text-xs font-bold cursor-pointer transition-all"
                           >
                             {pct === 1 ? 'MAX (100%)' : `${pct * 100}%`}
                           </button>
@@ -1827,7 +1827,7 @@ This document certifies real-time clearing across banking rails.
                         <div>
                           <div className="font-bold text-white flex items-center gap-2">
                             <span>{tx.sourceName}</span>
-                            <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-slate-800 text-slate-400">
+                            <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">
                               {tx.rail}
                             </span>
                           </div>

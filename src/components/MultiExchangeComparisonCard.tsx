@@ -273,11 +273,11 @@ export const MultiExchangeComparisonCard: React.FC<MultiExchangeComparisonCardPr
             <div className="font-bold text-white flex items-center gap-2">
               Best-Market Spread Arbitrage Engine
               {arbitrageOpp && arbitrageOpp.isActionable ? (
-                <span className="text-[10px] px-1.5 py-0.2 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 font-mono animate-pulse">
+                <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 font-mono animate-pulse">
                   WINDOW OPEN (+{arbitrageOpp.netSpreadPercent.toFixed(3)}% Net)
                 </span>
               ) : (
-                <span className="text-[10px] px-1.5 py-0.2 rounded bg-cyan-500/10 text-cyan-300 border border-cyan-500/30 font-mono">
+                <span className="text-[10px] px-1.5 py-0.5 rounded bg-cyan-500/10 text-cyan-300 border border-cyan-500/30 font-mono">
                   ACTIVE PAIR SCANNER
                 </span>
               )}

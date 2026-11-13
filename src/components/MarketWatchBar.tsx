@@ -173,7 +173,7 @@ export const MarketWatchBar: React.FC<MarketWatchBarProps> = ({
           {!showAddCustom ? (
             <button
               onClick={() => setShowAddCustom(true)}
-              className="flex items-center gap-1 px-2.5 py-1 rounded-lg bg-slate-800/80 hover:bg-slate-750 text-slate-300 hover:text-white border border-slate-700 text-xs font-semibold transition-all cursor-pointer whitespace-nowrap"
+              className="flex items-center gap-1 px-2.5 py-1 rounded-lg bg-slate-800/80 hover:bg-slate-700 text-slate-300 hover:text-white border border-slate-700 text-xs font-semibold transition-all cursor-pointer whitespace-nowrap shrink-0"
               title="Add or trade any market cryptocurrency pair"
             >
               <Plus className="h-3 w-3 text-cyan-400" />
@@ -235,14 +235,14 @@ export const MarketWatchBar: React.FC<MarketWatchBarProps> = ({
                 className={`flex items-center gap-2.5 px-3 py-1.5 rounded-xl text-left transition-all cursor-pointer border ${
                   isSelected
                     ? 'bg-slate-800 border-cyan-500/70 shadow-sm shadow-cyan-500/20 ring-1 ring-cyan-500/50'
-                    : 'bg-slate-900/60 border-slate-800/80 hover:bg-slate-850 hover:border-slate-700'
+                    : 'bg-slate-900/60 border-slate-800/80 hover:bg-slate-800/80 hover:border-slate-700'
                 }`}
               >
                 <div>
                   <div className="flex items-center gap-1.5">
                     <span className="font-bold text-xs text-white font-mono">{asset.symbol}</span>
                     <span
-                      className={`text-[9px] px-1 py-0.2 rounded font-medium ${
+                      className={`text-[9px] px-1 py-0.5 rounded font-medium ${
                         asset.category === 'Zero-KYC'
                           ? 'bg-purple-500/20 text-purple-300 border border-purple-500/30'
                           : asset.category === 'Meme'

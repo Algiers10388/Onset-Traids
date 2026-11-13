@@ -1,5 +1,6 @@
 import express, { type Request, type Response } from 'express';
 import { GoogleGenAI } from '@google/genai';
+import { getChainTokens } from './flashArbExecutor.ts';
 
 export const walletRouter = express.Router();
 
@@ -164,16 +165,27 @@ const NETWORK_ERC20_TOKENS: Record<string, Array<{ symbol: string; name: string;
     { symbol: 'LINK', name: 'Chainlink', contractAddress: '0x514910771AF9Ca656af840dff83E8264EcF986CA', decimals: 18, iconUrl: 'https://cryptologos.cc/logos/chainlink-link-logo.png' },
     { symbol: 'UNI', name: 'Uniswap', contractAddress: '0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984', decimals: 18, iconUrl: 'https://cryptologos.cc/logos/uniswap-uni-logo.png' },
   ],
-  arbitrum: [
-    { symbol: 'ARB', name: 'Arbitrum', contractAddress: '0x912CE59144191C1204E64559FE8253a0e49E6548', decimals: 18, iconUrl: 'https://cryptologos.cc/logos/arbitrum-arb-logo.png' },
-    { symbol: 'USDC', name: 'USD Coin', contractAddress: '0xaf88d065e77c8cC2239327C5EDb3A432268e5831', decimals: 6, iconUrl: 'https://cryptologos.cc/logos/usd-coin-usdc-logo.png' },
-    { symbol: 'USDT', name: 'Tether USD', contractAddress: '0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9', decimals: 6, iconUrl: 'https://cryptologos.cc/logos/tether-usdt-logo.png' },
-    { symbol: 'WETH', name: 'Wrapped Ether', contractAddress: '0x82aF49447D8a07e3bd95BD0d56f35241523fBab1', decimals: 18, iconUrl: 'https://cryptologos.cc/logos/ethereum-eth-logo.png' },
-  ],
-  base: [
-    { symbol: 'USDC', name: 'USD Coin', contractAddress: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913', decimals: 6, iconUrl: 'https://cryptologos.cc/logos/usd-coin-usdc-logo.png' },
-    { symbol: 'WETH', name: 'Wrapped Ether', contractAddress: '0x4200000000000000000000000000000000000006', decimals: 18, iconUrl: 'https://cryptologos.cc/logos/ethereum-eth-logo.png' },
-  ],
+  arbitrum: getChainTokens('arbitrum').map((t) => ({
+    symbol: t.sym,
+    name: t.compatibilityNote ? `${t.sym} (${t.compatibilityNote})` : t.sym,
+    contractAddress: t.addr,
+    decimals: t.dec,
+    iconUrl: 'https://cryptologos.cc/logos/ethereum-eth-logo.png',
+  })),
+  base: getChainTokens('base').map((t) => ({
+    symbol: t.sym,
+    name: t.compatibilityNote ? `${t.sym} (${t.compatibilityNote})` : t.sym,
+    contractAddress: t.addr,
+    decimals: t.dec,
+    iconUrl: 'https://cryptologos.cc/logos/ethereum-eth-logo.png',
+  })),
+  optimism: getChainTokens('optimism').map((t) => ({
+    symbol: t.sym,
+    name: t.compatibilityNote ? `${t.sym} (${t.compatibilityNote})` : t.sym,
+    contractAddress: t.addr,
+    decimals: t.dec,
+    iconUrl: 'https://cryptologos.cc/logos/ethereum-eth-logo.png',
+  })),
   polygon: [
     { symbol: 'USDC', name: 'USD Coin', contractAddress: '0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359', decimals: 6, iconUrl: 'https://cryptologos.cc/logos/usd-coin-usdc-logo.png' },
     { symbol: 'USDT', name: 'Tether USD', contractAddress: '0xc2132D05D31c914a87C6611C10748AEb04B58e8F', decimals: 6, iconUrl: 'https://cryptologos.cc/logos/tether-usdt-logo.png' },
@@ -294,6 +306,10 @@ walletRouter.post('/profile', async (req: Request, res: Response) => {
     // Benchmark Spot Prices
     const spotPrices: Record<string, number> = {
       ETH: 2845.5,
+      WETH: 2845.5,
+      wstETH: 3350.0,
+      cbETH: 3020.0,
+      ezETH: 2920.0,
       OKB: 48.75,
       XMR: 174.5,
       SAL: 0.245,
@@ -301,9 +317,24 @@ walletRouter.post('/profile', async (req: Request, res: Response) => {
       TARI: 0.32,
       WOW: 0.065,
       BTC: 66200.0,
+      WBTC: 66200.0,
+      cbBTC: 66200.0,
       USDT: 1.0,
       USDC: 1.0,
+      'USDC.e': 1.0,
+      USDbC: 1.0,
+      DAI: 1.0,
+      FRAX: 1.0,
+      USDe: 1.0,
+      sUSDe: 1.12,
       ARB: 0.58,
+      OP: 1.65,
+      AERO: 1.15,
+      AAVE: 165.0,
+      PENDLE: 4.5,
+      GMX: 28.5,
+      MAGIC: 0.38,
+      RDNT: 0.065,
       UNI: 7.85,
       LINK: 11.4,
       POL: 0.108,
@@ -420,7 +451,7 @@ walletRouter.post('/profile', async (req: Request, res: Response) => {
               valueUsd: bal * tokenPrice,
               change24h: 0.5,
               allocationPercent: 0,
-              category: td.symbol === 'USDC' || td.symbol === 'USDT' ? 'STABLECOIN' : 'DEFI',
+              category: ['USDC', 'USDC.e', 'USDbC', 'USDT', 'DAI', 'FRAX', 'USDe'].includes(td.symbol) ? 'STABLECOIN' : 'DEFI',
               iconUrl: td.iconUrl,
             };
           }

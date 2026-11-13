@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   Zap,
   Shield,
@@ -381,35 +381,225 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
     supportsRescueTokensTo: boolean;
     nonZeroTokens: Array<{ symbol: string; balance: string }>;
   } | null>(null);
+  const [holdingsOverview, setHoldingsOverview] = useState<{
+    chain: string;
+    chainName: string;
+    signerAddress: string | null;
+    contracts: Array<{
+      address: string;
+      isPrimary: boolean;
+      isDeployed: boolean;
+      owner: string | null;
+      ownerMatchesSigner: boolean;
+      ownerMatchesConnectedWallet: boolean;
+      accessibleForSweep: boolean;
+      supportsOptimizedArbitrage: boolean;
+      supportsRescueTokensTo: boolean;
+      supportsRescueTokens: boolean;
+      supportsDirectSweep: boolean;
+      eth: string;
+      ethUsd: number | null;
+      nonZeroTokens: Array<{
+        symbol: string;
+        address: string;
+        balance: string;
+        ercStandard?: string;
+        tokenId?: string;
+        arbCompatible: boolean;
+        sweepCompatible: boolean;
+        walletSweepCompatible?: boolean;
+        compatibilityNote: string;
+        usdValue: number | null;
+      }>;
+      compatibleNonZeroCount: number;
+      explorerUrl: string;
+    }>;
+    gasWallet: {
+      address: string;
+      eth: string;
+      ethUsd: number | null;
+      nonZeroTokens: Array<{
+        symbol: string;
+        address: string;
+        balance: string;
+        ercStandard?: string;
+        tokenId?: string;
+        arbCompatible: boolean;
+        sweepCompatible: boolean;
+        walletSweepCompatible?: boolean;
+        compatibilityNote: string;
+        usdValue: number | null;
+      }>;
+      compatibleNonZeroCount: number;
+      explorerUrl: string;
+    } | null;
+    connectedWallet: {
+      address: string;
+      eth: string;
+      ethUsd: number | null;
+      nonZeroTokens: Array<{
+        symbol: string;
+        address: string;
+        balance: string;
+        ercStandard?: string;
+        tokenId?: string;
+        arbCompatible: boolean;
+        sweepCompatible: boolean;
+        walletSweepCompatible?: boolean;
+        compatibilityNote: string;
+        usdValue: number | null;
+      }>;
+      compatibleNonZeroCount: number;
+      explorerUrl: string;
+    } | null;
+    profitWallet: {
+      address: string;
+      eth: string;
+      ethUsd: number | null;
+      nonZeroTokens: Array<{
+        symbol: string;
+        address: string;
+        balance: string;
+        ercStandard?: string;
+        tokenId?: string;
+        arbCompatible: boolean;
+        sweepCompatible: boolean;
+        walletSweepCompatible?: boolean;
+        compatibilityNote: string;
+        usdValue: number | null;
+      }>;
+      explorerUrl: string;
+    } | null;
+    supportedTokens: Array<{
+      symbol: string;
+      address: string;
+      decimals: number;
+      ercStandard?: string;
+      arbCompatible: boolean;
+      sweepCompatible: boolean;
+      walletSweepCompatible?: boolean;
+      compatibilityNote: string;
+    }>;
+    customCheckedTokens?: Array<{
+      symbol: string;
+      address: string;
+      decimals: number;
+      ercStandard: string;
+      tokenId?: string;
+      arbCompatible: boolean;
+      sweepCompatible: boolean;
+      walletSweepCompatible: boolean;
+      compatibilityNote: string;
+    }>;
+    summary: {
+      verifiedTokensCount: number;
+      deployedContractsCount: number;
+      accessibleContractsCount: number;
+      sweepableContractAssetsCount: number;
+      sweepableGasWalletTokensCount: number;
+      sweepableConnectedWalletTokensCount: number;
+      totalSweepableAssetsCount: number;
+    };
+  } | null>(null);
+  const [isLoadingHoldingsOverview, setIsLoadingHoldingsOverview] = useState<boolean>(false);
+  const [extraTokensInput, setExtraTokensInput] = useState<string>('');
   const [isSweepingAll, setIsSweepingAll] = useState<boolean>(false);
   const [includeGasWalletTokensInSweep, setIncludeGasWalletTokensInSweep] = useState<boolean>(false);
+  const [includeConnectedWalletTokensInSweep, setIncludeConnectedWalletTokensInSweep] = useState<boolean>(false);
+  const [autoSweepEndOfCycle, setAutoSweepEndOfCycle] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('flash_arb_auto_sweep_cycle') !== 'false';
+    } catch {
+      return true;
+    }
+  });
+  const autoSweepEndOfCycleRef = useRef<boolean>(autoSweepEndOfCycle);
+  const isAutoSweepingCycleRef = useRef<boolean>(false);
+  const hasInitializedAgentTxRef = useRef<boolean>(false);
+  const lastAutoSweptTradeTxRef = useRef<string | null>(null);
+  const sweepRuntimeRef = useRef({
+    extraTokensInput,
+    okxConnectedAddress,
+    isSignerKeyConfigured: false,
+    includeGasWalletTokensInSweep,
+    includeConnectedWalletTokensInSweep,
+    profitWalletAddress,
+    selectedChain,
+    deployedContracts,
+  });
+
+  const selectedChainRef = useRef<'arbitrum' | 'base' | 'optimism'>(selectedChain);
+  const [agentCountsByChain, setAgentCountsByChain] = useState<Record<'arbitrum' | 'base' | 'optimism', number> | null>(null);
+  const [agentScanError, setAgentScanError] = useState<string | null>(null);
+  const [oppProfitableOnly, setOppProfitableOnly] = useState<boolean>(false);
+  const [showAllOpportunities, setShowAllOpportunities] = useState<boolean>(false);
+  const [showAllPools, setShowAllPools] = useState<boolean>(false);
+  const poolsMatrixRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    autoSweepEndOfCycleRef.current = autoSweepEndOfCycle;
+  }, [autoSweepEndOfCycle]);
+
   const [sweepAllNotice, setSweepAllNotice] = useState<{
     success: boolean;
     message: string;
     sweptAssets?: Array<{ asset: string; amount: string; method: string; txHash: string; explorerUrl: string }>;
+    skippedIncompatible?: Array<{ source: string; asset: string; amount?: string; reason: string }>;
   } | null>(null);
 
-  const fetchAgentStatus = async () => {
+  const fetchAgentStatus = async (chainOverride?: 'arbitrum' | 'base' | 'optimism') => {
+    const targetChain = chainOverride || selectedChainRef.current;
     try {
-      const res = await fetch('/api/flash-arb/agent/status');
+      const res = await fetch(`/api/flash-arb/agent/status?chain=${targetChain}`);
       if (res.ok) {
         const data = await res.json();
         if (data.success) {
           setIsAgentRunning(Boolean(data.isRunning));
           setAgentScanCount(data.scanCount || 0);
-          setAgentLatestBlock(data.latestBlock || 0);
+          if (data.countsByChain) {
+            setAgentCountsByChain(data.countsByChain);
+          }
+          if (targetChain === selectedChainRef.current) {
+            setAgentLatestBlock(data.latestBlock || 0);
+            setAgentScanError(data.scanError || null);
+            if (Array.isArray(data.pools)) {
+              setAgentMonitoredPools(data.pools);
+              setPoolsScannedCount(data.pools.length);
+            }
+            if (Array.isArray(data.opportunities)) setAgentOpportunities(data.opportunities);
+          }
           if (data.agentState) setAgentState(data.agentState);
           if (typeof data.isSignerConfigured === 'boolean') setIsSignerKeyConfigured(data.isSignerConfigured);
           if (data.lastConfirmedTxHash) setLastConfirmedTxHash(data.lastConfirmedTxHash);
           if (data.lastConfirmedBlock) setLastConfirmedBlock(data.lastConfirmedBlock);
-          if (Array.isArray(data.pools)) setAgentMonitoredPools(data.pools);
-          if (Array.isArray(data.opportunities)) setAgentOpportunities(data.opportunities);
           if (Array.isArray(data.executedTrades)) setAgentExecutedTrades(data.executedTrades);
           if (data.config) {
             if (typeof data.config.minProfitThresholdUsd === 'number') setMinProfitThresholdUsd(data.config.minProfitThresholdUsd);
             if (data.config.gasOptimizationMode) setGasOptimizationMode(data.config.gasOptimizationMode);
             if (typeof data.config.autoOptimizeSize === 'boolean') setAutoOptimizeSize(data.config.autoOptimizeSize);
             if (typeof data.config.isAutonomousExecutionEnabled === 'boolean') setIsAutonomousExecutionEnabled(data.config.isAutonomousExecutionEnabled);
+          }
+
+          const confirmedFromList = Array.isArray(data.executedTrades)
+            ? [...data.executedTrades].reverse().find((t: any) => t?.status === 'CONFIRMED' && t?.txHash)?.txHash
+            : null;
+          const latestConfirmedTx = data.lastConfirmedTxHash || confirmedFromList || null;
+
+          if (!hasInitializedAgentTxRef.current) {
+            hasInitializedAgentTxRef.current = true;
+            if (latestConfirmedTx) {
+              lastAutoSweptTradeTxRef.current = latestConfirmedTx;
+            }
+          } else if (
+            latestConfirmedTx &&
+            latestConfirmedTx !== lastAutoSweptTradeTxRef.current
+          ) {
+            lastAutoSweptTradeTxRef.current = latestConfirmedTx;
+            if (autoSweepEndOfCycleRef.current && !isAutoSweepingCycleRef.current) {
+              void runEndOfCycleDustSweep(`Autonomous Cycle (${latestConfirmedTx.slice(0, 8)}...)`, {
+                allowWalletPrompt: sweepRuntimeRef.current.includeConnectedWalletTokensInSweep,
+              });
+            }
           }
         }
       }
@@ -471,9 +661,19 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
     }
   };
 
-  const fetchProfitWalletBalances = async () => {
+  const parseExtraTokenAddresses = (raw: string): string[] => {
+    const tokens = raw
+      .split(/[\s,;]+/)
+      .map((s) => s.trim())
+      .filter((s) => /^0x[a-fA-F0-9]{40}(:\d+)?$/.test(s));
+    return Array.from(new Set(tokens));
+  };
+
+  const fetchProfitWalletBalances = async (extraRaw?: string) => {
     try {
-      const res = await fetch(`/api/flash-arb/wallet-balances?address=${profitWalletAddress}`);
+      const extraList = parseExtraTokenAddresses(extraRaw ?? extraTokensInput);
+      const extraParam = extraList.length > 0 ? `&extraTokens=${encodeURIComponent(extraList.join(','))}` : '';
+      const res = await fetch(`/api/flash-arb/wallet-balances?chain=${selectedChain}&address=${profitWalletAddress}${extraParam}`);
       if (res.ok) {
         const data = await res.json();
         if (data.success && data.balances) {
@@ -487,10 +687,12 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
     } catch {}
   };
 
-  const fetchContractBalances = async () => {
+  const fetchContractBalances = async (extraRaw?: string) => {
     try {
       const targetAddr = deployedContracts[selectedChain] || CHAIN_CONFIG_MAP[selectedChain].contract;
-      const res = await fetch(`/api/flash-arb/contract-balances?chain=${selectedChain}&address=${encodeURIComponent(targetAddr)}`);
+      const extraList = parseExtraTokenAddresses(extraRaw ?? extraTokensInput);
+      const extraParam = extraList.length > 0 ? `&extraTokens=${encodeURIComponent(extraList.join(','))}` : '';
+      const res = await fetch(`/api/flash-arb/contract-balances?chain=${selectedChain}&address=${encodeURIComponent(targetAddr)}${extraParam}`);
       if (res.ok) {
         const data = await res.json();
         if (data.success) {
@@ -508,15 +710,61 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
     } catch {}
   };
 
-  const handleSweepAllBalances = async () => {
+  const fetchHoldingsOverview = async (extraRaw?: string) => {
+    setIsLoadingHoldingsOverview(true);
+    try {
+      const primaryAddr = deployedContracts[selectedChain] || CHAIN_CONFIG_MAP[selectedChain].contract;
+      const contractList =
+        selectedChain === 'arbitrum'
+          ? [primaryAddr, '0xeee31ff9e69904b43c124095b6f33aa61505bcc2', '0x19359c6C418669FCfC46196970814353b8766BE0']
+          : [primaryAddr];
+      const extraList = parseExtraTokenAddresses(extraRaw ?? extraTokensInput);
+      const params = new URLSearchParams({
+        chain: selectedChain,
+        contracts: Array.from(new Set(contractList)).join(','),
+        gasWallet: gasWalletAddress,
+        profitWallet: profitWalletAddress,
+      });
+      if (okxConnectedAddress) params.set('connectedWallet', okxConnectedAddress);
+      if (extraList.length > 0) params.set('extraTokens', extraList.join(','));
+      const res = await fetch(`/api/flash-arb/holdings-overview?${params.toString()}`);
+      if (res.ok) {
+        const data = await res.json();
+        if (data.success) {
+          setHoldingsOverview(data);
+          return data;
+        }
+      }
+    } catch {
+      // keep previous overview
+    } finally {
+      setIsLoadingHoldingsOverview(false);
+    }
+    return null;
+  };
+
+  const executeSweepAllBalances = async (options?: {
+    autoTriggered?: boolean;
+    cycleLabel?: string;
+    includeGasOverride?: boolean;
+    includeConnectedOverride?: boolean;
+  }) => {
     if (!isValidEvmAddress(profitWalletAddress)) {
-      setSweepAllNotice({ success: false, message: 'Configure a valid 42-character EVM Profit Vault address first.' });
+      if (!options?.autoTriggered) {
+        setSweepAllNotice({ success: false, message: 'Configure a valid 42-character EVM Profit Vault address first.' });
+      }
       return;
     }
+    const includeGas = options?.includeGasOverride ?? includeGasWalletTokensInSweep;
+    const includeConnected = options?.includeConnectedOverride ?? includeConnectedWalletTokensInSweep;
+
     setIsSweepingAll(true);
-    setSweepAllNotice(null);
-    setLiveExecutionError(null);
+    if (!options?.autoTriggered) {
+      setSweepAllNotice(null);
+      setLiveExecutionError(null);
+    }
     try {
+      const extraTokenAddresses = parseExtraTokenAddresses(extraTokensInput);
       const res = await fetch('/api/flash-arb/sweep-all', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -527,27 +775,159 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
             selectedChain === 'arbitrum'
               ? ['0xeee31ff9e69904b43c124095b6f33aa61505bcc2', '0x19359c6C418669FCfC46196970814353b8766BE0']
               : [],
+          extraTokenAddresses,
           recipient: profitWalletAddress.trim(),
-          includeGasWalletTokens: includeGasWalletTokensInSweep,
+          includeGasWalletTokens: includeGas,
+          includeConnectedWalletTokens: includeConnected,
+          connectedWalletAddress: okxConnectedAddress || undefined,
+          compatibleOnly: true,
         }),
       });
       const data = await res.json();
       if (!res.ok || !data.success) {
         throw new Error(data.error || 'Sweep All failed');
       }
+
+      const combinedSwept: Array<{ asset: string; amount: string; method: string; txHash: string; explorerUrl: string }> =
+        Array.isArray(data.sweptAssets) ? [...data.sweptAssets] : [];
+      const walletFailures: Array<{ source: string; asset: string; amount?: string; reason: string }> =
+        Array.isArray(data.skippedIncompatible) ? [...data.skippedIncompatible] : [];
+
+      if (Array.isArray(data.pendingWalletTxs) && data.pendingWalletTxs.length > 0) {
+        if (!okxConnectedAddress) {
+          throw new Error('Wallet signature required for connected/owner holdings. Connect your Web3 wallet first.');
+        }
+        const targetChainHex = CHAIN_CONFIG_MAP[selectedChain].chainIdHex;
+        const currentChainHex = await getConnectedChainId();
+        if (currentChainHex && currentChainHex.toLowerCase() !== targetChainHex.toLowerCase()) {
+          await switchOkxChain(targetChainHex);
+        }
+        for (const ptx of data.pendingWalletTxs) {
+          if (ptx.signerRequired && ptx.signerRequired.toLowerCase() !== okxConnectedAddress.toLowerCase()) {
+            walletFailures.push({
+              source: ptx.source,
+              asset: ptx.asset,
+              amount: ptx.amount,
+              reason: `Requires owner wallet ${formatShortAddress(ptx.signerRequired)} (connected: ${formatShortAddress(okxConnectedAddress)})`,
+            });
+            continue;
+          }
+          const txHash = await sendOkxTransaction({
+            from: okxConnectedAddress,
+            to: ptx.to,
+            data: ptx.data,
+            gas: ptx.gas,
+          });
+          const receipt = await waitForTxReceipt(txHash, CHAIN_CONFIG_MAP[selectedChain].rpcUrl);
+          if (receipt && receipt.status === 0) {
+            throw new Error(`Wallet transaction ${txHash} reverted on-chain.`);
+          }
+          combinedSwept.push({
+            asset: ptx.asset,
+            amount: ptx.amount,
+            method: `${ptx.method} (Wallet)`,
+            txHash,
+            explorerUrl: `${CHAIN_CONFIG_MAP[selectedChain].explorer}/tx/${txHash}`,
+          });
+        }
+      }
+
+      const prefix = options?.autoTriggered
+        ? `End-of-cycle dust sweep (${options.cycleLabel || 'Cycle Complete'}): `
+        : '';
+      const finalMsg =
+        combinedSwept.length > 0
+          ? `${prefix}Swept ${combinedSwept.length} compatible ERC-20/1155/ETH asset holding(s) to Profit Vault ${formatShortAddress(profitWalletAddress)}.`
+          : `${prefix}${data.message || 'Sweep check completed cleanly.'}`;
+
       setSweepAllNotice({
         success: true,
-        message: data.message || 'Sweep completed cleanly.',
-        sweptAssets: data.sweptAssets || [],
+        message: finalMsg,
+        sweptAssets: combinedSwept,
+        skippedIncompatible: walletFailures,
       });
-      await Promise.all([fetchProfitWalletBalances(), fetchContractBalances(), fetchGasStatus()]);
+      await Promise.all([
+        fetchProfitWalletBalances(),
+        fetchContractBalances(),
+        fetchHoldingsOverview(),
+        fetchGasStatus(),
+      ]);
     } catch (err: any) {
       setSweepAllNotice({
         success: false,
-        message: err.message || 'Sweep All failed',
+        message: options?.autoTriggered
+          ? `End-of-cycle dust sweep (${options.cycleLabel || 'Cycle'}) note: ${err.message || 'Sweep skipped'}`
+          : err.message || 'Sweep All failed',
       });
     } finally {
       setIsSweepingAll(false);
+    }
+  };
+
+  const handleSweepAllBalances = () => {
+    void executeSweepAllBalances();
+  };
+
+  const runEndOfCycleDustSweep = async (
+    cycleLabel: string,
+    options?: { allowWalletPrompt?: boolean }
+  ) => {
+    const rt = sweepRuntimeRef.current;
+    if (isAutoSweepingCycleRef.current) return;
+    if (!isValidEvmAddress(rt.profitWalletAddress)) return;
+
+    isAutoSweepingCycleRef.current = true;
+    try {
+      const overview = await fetchHoldingsOverview(rt.extraTokensInput);
+      await Promise.all([fetchProfitWalletBalances(rt.extraTokensInput), fetchContractBalances(rt.extraTokensInput), fetchGasStatus()]);
+
+      if (!overview?.summary) return;
+
+      const contractDustCount = overview.summary.sweepableContractAssetsCount || 0;
+      const gasDustCount = rt.isSignerKeyConfigured
+        ? overview.summary.sweepableGasWalletTokensCount || 0
+        : 0;
+      const canSweepConnected = Boolean(
+        rt.okxConnectedAddress &&
+          rt.okxConnectedAddress.toLowerCase() !== rt.profitWalletAddress.toLowerCase() &&
+          (rt.includeConnectedWalletTokensInSweep || options?.allowWalletPrompt)
+      );
+      const connectedDustCount = canSweepConnected
+        ? overview.summary.sweepableConnectedWalletTokensCount || 0
+        : 0;
+
+      const totalSweepableDust = contractDustCount + gasDustCount + connectedDustCount;
+
+      if (totalSweepableDust <= 0) {
+        setSweepAllNotice({
+          success: true,
+          message: `End-of-cycle scan (${cycleLabel}): 0 compatible ERC-20/1155 dust tokens detected across contracts or wallets — Profit Vault ${formatShortAddress(profitWalletAddress)} is clean.`,
+        });
+        return;
+      }
+
+      if (
+        contractDustCount > 0 &&
+        gasDustCount === 0 &&
+        connectedDustCount === 0 &&
+        !isSignerKeyConfigured &&
+        !options?.allowWalletPrompt
+      ) {
+        setSweepAllNotice({
+          success: true,
+          message: `End-of-cycle scan (${cycleLabel}) detected ${contractDustCount} compatible dust asset(s) on contracts. Configure signer key or click Sweep Compatible Holdings to sign via wallet.`,
+        });
+        return;
+      }
+
+      await executeSweepAllBalances({
+        autoTriggered: true,
+        cycleLabel,
+        includeGasOverride: gasDustCount > 0 || includeGasWalletTokensInSweep,
+        includeConnectedOverride: canSweepConnected && connectedDustCount > 0,
+      });
+    } finally {
+      isAutoSweepingCycleRef.current = false;
     }
   };
 
@@ -589,7 +969,12 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
         }
         if (data.requiresWallet && data.txPayload) {
           const hash = await sendOkxTransaction(data.txPayload);
+          lastAutoSweptTradeTxRef.current = hash;
           setLastConfirmedTxHash(hash);
+          const receipt = await waitForTxReceipt(hash, CHAIN_CONFIG_MAP[selectedChain].rpcUrl);
+          if (receipt && receipt.status === 0) {
+            throw new Error(`Arbitrage transaction ${hash} reverted on-chain.`);
+          }
           await fetch('/api/flash-arb/agent/verify-receipt', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -603,12 +988,16 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
             }),
           }).catch(() => {});
           await Promise.all([fetchProfitWalletBalances(), fetchContractBalances(), fetchAgentStatus()]);
+          if (autoSweepEndOfCycleRef.current) {
+            await runEndOfCycleDustSweep('Wallet Execution Cycle', { allowWalletPrompt: true });
+          }
           return;
         }
         throw new Error(data.error || 'Agent execution failed');
       }
       if (data.txHash || data.trade?.txHash) {
         const txHash = data.txHash || data.trade.txHash;
+        lastAutoSweptTradeTxRef.current = txHash;
         setLastConfirmedTxHash(txHash);
         const profitUsd = Number(data.trade?.netProfitUsd ?? data.opportunity?.estNetProfitUsd ?? 0);
         setLiveExecutionSuccess({
@@ -632,6 +1021,9 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
         });
       }
       await Promise.all([fetchProfitWalletBalances(), fetchContractBalances(), fetchAgentStatus()]);
+      if (autoSweepEndOfCycleRef.current) {
+        await runEndOfCycleDustSweep('Server Execution Cycle', { allowWalletPrompt: false });
+      }
     } catch (err: any) {
       setLiveExecutionError(err.message || 'Agent trade dispatch failed');
     } finally {
@@ -830,6 +1222,29 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
   const [signerKeySuccessNotice, setSignerKeySuccessNotice] = useState<string | null>(null);
   const [isSavingSignerKey, setIsSavingSignerKey] = useState<boolean>(false);
 
+  useEffect(() => {
+    selectedChainRef.current = selectedChain;
+    sweepRuntimeRef.current = {
+      extraTokensInput,
+      okxConnectedAddress,
+      isSignerKeyConfigured,
+      includeGasWalletTokensInSweep,
+      includeConnectedWalletTokensInSweep,
+      profitWalletAddress,
+      selectedChain,
+      deployedContracts,
+    };
+  }, [
+    extraTokensInput,
+    okxConnectedAddress,
+    isSignerKeyConfigured,
+    includeGasWalletTokensInSweep,
+    includeConnectedWalletTokensInSweep,
+    profitWalletAddress,
+    selectedChain,
+    deployedContracts,
+  ]);
+
   // Query Real On-Chain Gas Balances
   const fetchGasStatus = async (overrideAddress?: string) => {
     setIsLoadingGasStatus(true);
@@ -903,6 +1318,7 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
     fetchAgentStatus();
     fetchProfitWalletBalances();
     fetchContractBalances();
+    fetchHoldingsOverview();
     checkContractDeployment('arbitrum');
     checkContractDeployment('base');
     checkContractDeployment('optimism');
@@ -935,8 +1351,14 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
   }, [gasWalletAddress, profitWalletAddress]);
 
   useEffect(() => {
+    selectedChainRef.current = selectedChain;
+    setPoolProtocolFilter('ALL');
+    setAgentScanError(null);
+    void fetchAgentStatus(selectedChain);
     checkContractDeployment(selectedChain, deployedContracts[selectedChain]);
+    fetchProfitWalletBalances();
     fetchContractBalances();
+    fetchHoldingsOverview();
     const targetAddr = deployedContracts[selectedChain];
     if (targetAddr && isValidEvmAddress(targetAddr)) {
       fetch('/api/flash-arb/deployed-contracts', {
@@ -945,7 +1367,7 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
         body: JSON.stringify({ chain: selectedChain, address: targetAddr }),
       }).catch(() => {});
     }
-  }, [selectedChain, deployedContracts]);
+  }, [selectedChain, deployedContracts, okxConnectedAddress]);
 
   // Sync from Firestore when user is authenticated
   useEffect(() => {
@@ -1367,6 +1789,18 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
         }
       }
 
+      if (txHash) {
+        lastAutoSweptTradeTxRef.current = txHash;
+        try {
+          const receipt = await waitForTxReceipt(txHash, cfg.rpcUrl);
+          if (receipt && receipt.status === 0) {
+            throw new Error(`On-chain execution ${txHash} reverted.`);
+          }
+        } catch (waitErr: any) {
+          if (waitErr?.message?.includes('reverted')) throw waitErr;
+        }
+      }
+
       // Update Cumulative Session Performance Statistics
       setTotalRealizedAlpha((prev) => {
         const next = Number((prev + realizedAlpha).toFixed(2));
@@ -1424,6 +1858,10 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
         timestamp: new Date().toLocaleTimeString(),
         blockLatency: '7.6ms',
       });
+
+      if (autoSweepEndOfCycleRef.current) {
+        await runEndOfCycleDustSweep('Direct Execution Cycle', { allowWalletPrompt: true });
+      }
     } catch (err: any) {
       setLiveExecutionError(err.message || 'Failed to dispatch live transaction');
     } finally {
@@ -1586,18 +2024,28 @@ RPC_BASE_WS=wss://base-mainnet.public.blastapi.io
   // Scan Real Live Pools & Order Books across Multiple Tokens
   const handleScanLivePools = async () => {
     setIsScanningPools(true);
+    const scanChain = selectedChain;
     try {
-      // Real on-chain pool reads (Arbitrum RPC) performed by the server agent. Nothing is estimated here.
-      const res = await fetch('/api/flash-arb/agent/status');
+      // Real on-chain pool reads (Arbitrum / Base / Optimism RPC) performed by the server agent. Nothing is estimated here.
+      const res = await fetch(`/api/flash-arb/agent/status?chain=${scanChain}`);
       const data = await res.json();
       if (!res.ok || !data.success) throw new Error(data?.error || `HTTP ${res.status}`);
-      setPoolsScannedCount(Array.isArray(data.pools) ? data.pools.length : 0);
+      if (data.countsByChain) setAgentCountsByChain(data.countsByChain);
+      setAgentScanError(data.scanError || null);
+      if (Array.isArray(data.pools)) {
+        setAgentMonitoredPools(data.pools);
+        setPoolsScannedCount(data.pools.length);
+      } else {
+        setPoolsScannedCount(0);
+      }
+      setAgentLatestBlock(data.latestBlock || 0);
       setAgentOpportunities(Array.isArray(data.opportunities) ? data.opportunities : []);
       setOpportunities([]);
       const best = (data.opportunities || []).reduce((m: number, o: any) => Math.max(m, o.grossSpreadBps || 0), 0);
       if (best > maxSpreadDiscoveredBps) setMaxSpreadDiscoveredBps(Number(best.toFixed(1)));
-    } catch (e) {
+    } catch (e: any) {
       console.warn('Pool scan failed:', e);
+      setAgentScanError(e?.message || 'Pool scan failed');
       setAgentOpportunities([]);
       setOpportunities([]);
     } finally {
@@ -1620,53 +2068,43 @@ RPC_BASE_WS=wss://base-mainnet.public.blastapi.io
   return (
     <div className="space-y-6 animate-in fade-in duration-300">
       {/* Header Banner */}
-      <div className="p-6 rounded-2xl bg-gradient-to-r from-cyan-950/80 via-slate-900 to-indigo-950/80 border border-cyan-500/30 shadow-2xl relative overflow-hidden">
-        <div className="absolute top-0 right-0 p-8 opacity-10 pointer-events-none">
-          <Zap className="h-64 w-64 text-cyan-400" />
-        </div>
-
-        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-6 relative z-10">
-          <div className="space-y-2">
-            <div className="flex flex-wrap items-center gap-2.5">
-              <span className="px-2.5 py-1 rounded-lg bg-cyan-500/20 border border-cyan-400/40 text-cyan-300 font-mono text-xs font-bold flex items-center gap-1.5 shadow-sm">
+      <div className="p-5 sm:p-6 rounded-2xl bg-gradient-to-r from-cyan-950/70 via-slate-900 to-indigo-950/70 border border-cyan-500/30 shadow-xl relative overflow-hidden">
+        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 relative z-10">
+          <div className="space-y-1.5">
+            <div className="flex flex-wrap items-center gap-2 text-[11px] font-mono text-slate-400">
+              <span className="text-cyan-300 font-bold tracking-wider uppercase flex items-center gap-1">
                 <Zap className="h-3.5 w-3.5 text-cyan-400" />
-                FLASH ARB ENGINE V2
+                Flash Arb Engine V2
               </span>
-              <span className="px-2.5 py-1 rounded-lg bg-emerald-500/20 border border-emerald-400/40 text-emerald-300 font-mono text-xs flex items-center gap-1.5">
-                <Sparkles className="h-3.5 w-3.5 text-emerald-400" />
-                0% BALANCER VAULT + EIP-1153 TRANSIENT
-              </span>
-              <span className="px-2.5 py-1 rounded-lg bg-indigo-500/20 border border-indigo-400/40 text-indigo-300 font-mono text-xs flex items-center gap-1.5">
-                <Coins className="h-3.5 w-3.5 text-indigo-400" />
-                {ARB_TOKENS.length} TOKENS · {agentMonitoredPools.length || 70} DEX POOLS
-              </span>
-              <span className="px-2.5 py-1 rounded-lg font-mono text-xs font-bold border bg-rose-500/20 border-rose-500/40 text-rose-300 flex items-center gap-1.5">
-                <span className="h-1.5 w-1.5 rounded-full bg-rose-500 animate-ping" />
-                <span>PRIVATE BUILDER RELAY ACTIVE</span>
+              <span className="text-slate-600">·</span>
+              <span className="text-emerald-300">0% Balancer Vault + EIP-1153</span>
+              <span className="text-slate-600">·</span>
+              <span>
+                {ARB_TOKENS.length} Tokens · {agentMonitoredPools.length || (agentCountsByChain ? agentCountsByChain[selectedChain] : (selectedChain === 'base' ? 41 : selectedChain === 'optimism' ? 26 : 70))} {targetChainConfig.name.split(' ')[0]} Pools
               </span>
             </div>
 
-            <h1 className="text-2xl sm:text-3xl font-black text-white tracking-tight">
-              Enhanced DeFi Flash Loan Arbitrage Engine (Arbitrum · Base · Optimism)
+            <h1 className="text-xl sm:text-2xl font-black text-white tracking-tight">
+              Multi-Chain Flash Loan Arbitrage Engine
             </h1>
-            <p className="text-sm text-slate-300 max-w-4xl leading-relaxed">
-              Zero-capital quantitative arbitrage searcher. Borrow millions with <strong className="text-emerald-300 font-mono">0.00% loan fees</strong> via Balancer V2, bypass periphery routers directly via <strong className="text-cyan-300 font-mono">IUniswapV3Pool.swap() callbacks</strong>, slash L1 gas with <strong className="text-purple-300 font-mono">Cancun EIP-1153 transient storage</strong>, and capture spreads across 13 concentrated & invariant pools.
+            <p className="text-xs sm:text-sm text-slate-300 max-w-3xl leading-relaxed">
+              Zero-capital atomic arbitrage across <strong className="text-white font-mono">Arbitrum · Base · Optimism</strong> ({agentCountsByChain ? agentCountsByChain.arbitrum + agentCountsByChain.base + agentCountsByChain.optimism : 137} live pools) with direct pool callbacks and EIP-1153 transient storage.
             </p>
           </div>
 
-          <div className="flex flex-wrap items-center gap-3">
+          <div className="flex flex-wrap items-center gap-2.5 shrink-0">
             <button
               type="button"
               onClick={handleDownloadZip}
               disabled={isDownloading}
-              className="px-4 py-2 rounded-xl bg-cyan-500/20 hover:bg-cyan-500/30 border border-cyan-400/50 text-cyan-200 text-xs font-mono font-bold transition-all flex items-center gap-2 shadow-lg cursor-pointer disabled:opacity-50"
+              className="px-3.5 py-2 rounded-xl bg-cyan-500/20 hover:bg-cyan-500/30 border border-cyan-400/50 text-cyan-200 text-xs font-mono font-bold transition-all flex items-center gap-2 shadow-sm cursor-pointer disabled:opacity-50 whitespace-nowrap"
             >
               {isDownloading ? (
                 <Loader2 className="h-4 w-4 text-cyan-400 animate-spin" />
               ) : (
                 <Download className="h-4 w-4 text-cyan-400" />
               )}
-              <span>{isDownloading ? 'Packaging Suite...' : 'Download Full Suite (Contracts + Rust Searcher)'}</span>
+              <span>{isDownloading ? 'Packaging Suite...' : 'Download Suite (.ZIP)'}</span>
             </button>
 
             {onOpenAiTroubleshooter && (
@@ -1677,24 +2115,19 @@ RPC_BASE_WS=wss://base-mainnet.public.blastapi.io
                     "How do Balancer V2 0% flash loans and EIP-1153 transient storage lower gas costs in our FlashArbOptimized.sol contract?"
                   )
                 }
-                className="px-4 py-2 rounded-xl bg-purple-500/20 hover:bg-purple-500/30 border border-purple-400/50 text-purple-200 text-xs font-mono font-bold transition-all flex items-center gap-2 shadow-lg cursor-pointer"
+                className="px-3.5 py-2 rounded-xl bg-purple-500/20 hover:bg-purple-500/30 border border-purple-400/50 text-purple-200 text-xs font-mono font-bold transition-all flex items-center gap-2 shadow-sm cursor-pointer whitespace-nowrap"
                 title="Open AI Diagnostics Assistant"
               >
                 <Bot className="h-4 w-4 text-purple-400" />
-                <span>Ask Gemini Gas Expert</span>
+                <span>Ask AI Expert</span>
               </button>
             )}
 
             {downloadNotice && (
-              <span className="text-[11px] font-mono text-cyan-300 animate-pulse">
+              <span className="text-[11px] font-mono text-cyan-300">
                 {downloadNotice}
               </span>
             )}
-
-            <div className="px-3.5 py-2 rounded-xl border border-emerald-500/40 bg-emerald-950/40 text-emerald-300 text-xs font-mono font-bold flex items-center gap-2 shadow-lg">
-              <span className="h-2 w-2 rounded-full bg-emerald-400 animate-ping" />
-              <span>LIVE MEV MEMPOOL RELAY (0% SANDBOX)</span>
-            </div>
           </div>
         </div>
       </div>
@@ -1724,11 +2157,11 @@ RPC_BASE_WS=wss://base-mainnet.public.blastapi.io
                 </span>
               </div>
               <div className="flex items-center gap-3 text-xs font-mono text-slate-400 mt-1 flex-wrap">
-                <span>Arbitrum Block: <strong className="text-white">#{agentLatestBlock || '519038290'}</strong></span>
+                <span>{targetChainConfig.name.split(' ')[0]} Block: <strong className="text-white">#{agentLatestBlock || '...'}</strong></span>
                 <span>•</span>
                 <span>Scans Completed: <strong className="text-cyan-300">{agentScanCount}</strong></span>
                 <span>•</span>
-                <span>Monitored Pools: <strong className="text-emerald-300">{agentMonitoredPools.length || 5} Pools Polled Live</strong></span>
+                <span>Monitored Pools: <strong className="text-emerald-300">{agentMonitoredPools.length} Pools Polled Live</strong></span>
               </div>
             </div>
           </div>
@@ -1825,39 +2258,49 @@ RPC_BASE_WS=wss://base-mainnet.public.blastapi.io
                     ))}
                   </div>
                 )}
+                {sweepAllNotice.skippedIncompatible && sweepAllNotice.skippedIncompatible.length > 0 && (
+                  <div className="pl-6 space-y-0.5 text-[11px] text-amber-300">
+                    {sweepAllNotice.skippedIncompatible.map((sk, idx) => (
+                      <div key={`skip-${idx}`}>
+                        Skipped {sk.amount ? `${sk.amount} ` : ''}{sk.asset} ({formatShortAddress(sk.source)}): {sk.reason}
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
             )}
           </div>
         )}
 
-        {/* Live Arbitrum DEX Pools Grid */}
-        <div className="pt-3 border-t border-slate-800/80">
-          <div className="flex items-center justify-between mb-2">
-            <span className="text-[11px] font-mono text-slate-400 font-bold uppercase tracking-wider flex items-center gap-1.5">
-              <Activity className="h-3 w-3 text-cyan-400 animate-pulse" />
-              Live Arbitrum Pools (Queried Direct via Node RPC slot0 / getReserves)
+        {/* Compact Live Pool Feed Summary (Full Pool Matrix lives cleanly in Monitor tab below) */}
+        <div className="pt-3 border-t border-slate-800/80 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs font-mono">
+          <div className="flex items-center gap-2 flex-wrap">
+            <span className="text-[11px] text-slate-400 font-bold uppercase tracking-wider flex items-center gap-1.5">
+              <Activity className="h-3.5 w-3.5 text-cyan-400" />
+              {targetChainConfig.name}: {agentMonitoredPools.length} Live Pools
             </span>
-            <span className="text-[10px] font-mono text-emerald-400 font-bold">
-              Continuous 3.5s Polling Active
+            <span className="text-slate-600 hidden sm:inline">·</span>
+            <span className="text-[11px] text-emerald-400">
+              {agentOpportunities.filter((o) => o.isProfitable).length} Profitable / {agentOpportunities.length} Checked Routes
             </span>
-          </div>
-
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-2 font-mono">
-            {agentMonitoredPools.map((pool) => (
-              <div key={pool.id} className="p-2.5 rounded-xl bg-slate-950 border border-slate-800 flex flex-col justify-between">
-                <div>
-                  <div className="text-[10px] text-slate-400 truncate font-sans">{pool.dex} ({pool.feeTierPercent}%)</div>
-                  <div className="text-white text-xs font-bold mt-0.5">{pool.pair}</div>
-                </div>
-                <div className="mt-2 flex items-baseline justify-between border-t border-slate-800/60 pt-1">
-                  <span className="text-emerald-400 font-bold text-xs">
-                    ${pool.pair.startsWith('ARB') ? pool.priceUsd.toFixed(4) : pool.priceUsd.toFixed(2)}
-                  </span>
-                  <span className="text-[9px] text-slate-500">Block #{pool.blockNumber}</span>
-                </div>
-              </div>
+            {agentMonitoredPools.slice(0, 3).map((pool) => (
+              <span key={pool.id} className="hidden xl:inline-flex items-center gap-1 px-2 py-0.5 rounded bg-slate-950 border border-slate-800 text-[11px] text-slate-300">
+                <span className="text-white font-semibold">{pool.pair}</span>
+                <span className="text-emerald-400">${pool.priceUsd >= 10 ? pool.priceUsd.toFixed(2) : pool.priceUsd.toFixed(4)}</span>
+              </span>
             ))}
           </div>
+
+          <button
+            type="button"
+            onClick={() => {
+              setActiveSubTab('MONITOR');
+              setTimeout(() => poolsMatrixRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 60);
+            }}
+            className="text-[11px] text-cyan-300 hover:text-cyan-200 font-bold cursor-pointer whitespace-nowrap self-start sm:self-auto"
+          >
+            View All {agentMonitoredPools.length} Pools &amp; Spreads ↓
+          </button>
         </div>
       </div>
 
@@ -1988,7 +2431,7 @@ RPC_BASE_WS=wss://base-mainnet.public.blastapi.io
                 </span>
               </div>
               <p className="text-xs text-slate-300 mt-1 leading-relaxed">
-                <strong className="text-amber-300 font-mono">0xF1d7...C966</strong> pays execution gas & sequencer tips on Arbitrum & Base. <strong className="text-emerald-300 font-mono">0x6560...CCB9</strong> (MetaMask, or the vault you set) directly receives 100% of realized arbitrage profit upon loan repayment. The smart contract holds $0 residual before and after execution.
+                <strong className="text-amber-300 font-mono">{formatShortAddress(gasWalletAddress)}</strong> pays execution gas &amp; sequencer tips across Arbitrum, Base &amp; Optimism. <strong className="text-emerald-300 font-mono">{formatShortAddress(profitWalletAddress)}</strong> ({profitWalletLabel}) directly receives 100% of realized arbitrage profit upon loan repayment.
               </p>
             </div>
           </div>
@@ -2015,7 +2458,7 @@ RPC_BASE_WS=wss://base-mainnet.public.blastapi.io
                     Gas Funder & Signer Wallet
                   </h4>
                   <span className="text-[10px] font-mono text-amber-300/80">
-                    Arbitrum One & Base L2 Gas Execution
+                    Arbitrum, Base &amp; Optimism L2 Gas Execution
                   </span>
                 </div>
               </div>
@@ -2091,36 +2534,37 @@ RPC_BASE_WS=wss://base-mainnet.public.blastapi.io
                 {/* Real-Time Live On-Chain Gas Balances */}
                 <div className="space-y-1.5">
                   <span className="text-[11px] text-slate-400 font-bold block">Live On-Chain Gas Balances:</span>
-                  <div className="grid grid-cols-2 gap-2 text-xs">
-                    {/* Arbitrum One */}
-                    <div className="p-2 rounded-xl bg-slate-950/80 border border-slate-800 space-y-1">
-                      <div className="flex items-center justify-between">
-                        <span className="text-slate-400 text-[10px] font-bold">🔵 Arbitrum One</span>
-                        <span className={`h-1.5 w-1.5 rounded-full ${gasStatus?.arbitrum?.fundedForTrading ? 'bg-emerald-400' : 'bg-amber-400'}`} />
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 text-xs">
+                    {(
+                      [
+                        { key: 'arbitrum', label: '🔵 Arbitrum One', data: gasStatus?.arbitrum },
+                        { key: 'base', label: '🟡 Base L2', data: gasStatus?.base },
+                        { key: 'optimism', label: '🔴 Optimism', data: gasStatus?.optimism },
+                      ] as const
+                    ).map((item) => (
+                      <div
+                        key={item.key}
+                        className={`p-2 rounded-xl bg-slate-950/80 border space-y-1 ${
+                          selectedChain === item.key ? 'border-cyan-500/50' : 'border-slate-800'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between">
+                          <span className="text-slate-300 text-[10px] font-bold">{item.label}</span>
+                          <span
+                            className={`h-1.5 w-1.5 rounded-full ${
+                              item.data?.fundedForTrading ? 'bg-emerald-400' : 'bg-amber-400'
+                            }`}
+                          />
+                        </div>
+                        <div className="text-white font-bold text-xs">
+                          {item.data?.balanceEthFormatted || '0.0000 ETH'}
+                        </div>
+                        <div className="flex items-center justify-between text-[10px] text-slate-500">
+                          <span>~${item.data?.balanceUsd || '0.00'}</span>
+                          <span>{item.data?.estimatedTxsRemaining || 0} txs</span>
+                        </div>
                       </div>
-                      <div className="text-white font-bold text-xs">
-                        {gasStatus?.arbitrum?.balanceEthFormatted || '0.0000 ETH'}
-                      </div>
-                      <div className="flex items-center justify-between text-[10px] text-slate-500">
-                        <span>~${gasStatus?.arbitrum?.balanceUsd || '0.00'}</span>
-                        <span>{gasStatus?.arbitrum?.estimatedTxsRemaining || 0} txs</span>
-                      </div>
-                    </div>
-
-                    {/* Base L2 */}
-                    <div className="p-2 rounded-xl bg-slate-950/80 border border-slate-800 space-y-1">
-                      <div className="flex items-center justify-between">
-                        <span className="text-slate-400 text-[10px] font-bold">🟡 Base L2</span>
-                        <span className={`h-1.5 w-1.5 rounded-full ${gasStatus?.base?.fundedForTrading ? 'bg-emerald-400' : 'bg-amber-400'}`} />
-                      </div>
-                      <div className="text-white font-bold text-xs">
-                        {gasStatus?.base?.balanceEthFormatted || '0.0000 ETH'}
-                      </div>
-                      <div className="flex items-center justify-between text-[10px] text-slate-500">
-                        <span>~${gasStatus?.base?.balanceUsd || '0.00'}</span>
-                        <span>{gasStatus?.base?.estimatedTxsRemaining || 0} txs</span>
-                      </div>
-                    </div>
+                    ))}
                   </div>
                 </div>
 
@@ -2187,7 +2631,7 @@ RPC_BASE_WS=wss://base-mainnet.public.blastapi.io
               <div className="p-3 rounded-xl bg-slate-950 border border-slate-800 space-y-3 font-mono">
                 <div className="space-y-1">
                   <label className="text-xs text-slate-300 font-bold block">
-                    Gas Funder Address (Arbitrum & Base)
+                    Gas Funder Address (Arbitrum, Base &amp; Optimism)
                   </label>
                   <input
                     type="text"
@@ -2209,7 +2653,7 @@ RPC_BASE_WS=wss://base-mainnet.public.blastapi.io
                     type="text"
                     value={gasLabelInput}
                     onChange={(e) => setGasLabelInput(e.target.value)}
-                    placeholder="e.g. Arbitrum & Base Gas Funder"
+                    placeholder="e.g. L2 Gas Funder"
                     className="w-full bg-slate-900 border border-slate-700 focus:border-amber-400 rounded-xl px-3 py-2 text-xs text-white font-mono placeholder:text-slate-600 focus:outline-none"
                   />
                 </div>
@@ -2226,7 +2670,7 @@ RPC_BASE_WS=wss://base-mainnet.public.blastapi.io
                     type="button"
                     onClick={() => {
                       setGasWalletInput(defaultGasWallet);
-                      setGasLabelInput('Arbitrum & Base Gas Funder');
+                      setGasLabelInput('L2 Gas Funder');
                     }}
                     className="text-[11px] text-amber-400 hover:underline cursor-pointer"
                   >
@@ -2264,7 +2708,7 @@ RPC_BASE_WS=wss://base-mainnet.public.blastapi.io
                 <div>
                   <h4 className="text-xs font-bold text-white font-mono uppercase tracking-wider flex items-center gap-1.5">
                     Profit Vault Destination
-                    <span className="text-[10px] px-1.5 py-0.2 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 font-bold">
+                    <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 font-bold">
                       {profitWalletAddress.toLowerCase() === defaultProfitWallet.toLowerCase() ? 'MetaMask ..cb9' : profitWalletAddress.toLowerCase().endsWith('11') ? 'OKX ..11' : formatShortAddress(profitWalletAddress)}
                     </span>
                   </h4>
@@ -2317,7 +2761,7 @@ RPC_BASE_WS=wss://base-mainnet.public.blastapi.io
 
                 <div className="p-2.5 rounded-xl bg-slate-950 border border-emerald-500/40 flex items-center justify-between gap-2">
                   <div className="flex items-center gap-2 overflow-hidden">
-                    <span className="h-2 w-2 rounded-full bg-emerald-400 animate-pulse shrink-0" />
+                    <span className="h-2 w-2 rounded-full bg-emerald-400 shrink-0" />
                     <span className="text-white text-xs font-bold tracking-wide select-all truncate">
                       {profitWalletAddress}
                     </span>
@@ -2327,12 +2771,12 @@ RPC_BASE_WS=wss://base-mainnet.public.blastapi.io
                   </span>
                 </div>
 
-                {/* Real Live On-Chain Token Balances on Arbitrum */}
-                <div className="p-3 rounded-xl bg-slate-950/95 border border-emerald-500/50 space-y-2">
+                {/* Real Live On-Chain Token Balances on Selected Chain */}
+                <div className="pt-3 border-t border-slate-800/80 space-y-2">
                   <div className="flex items-center justify-between">
                     <div className="flex items-center gap-1.5 text-emerald-400 text-xs font-bold font-mono">
-                      <span className="h-2 w-2 rounded-full bg-emerald-400 animate-ping" />
-                      <span>Live On-Chain Balance (Arbitrum One)</span>
+                      <span className="h-2 w-2 rounded-full bg-emerald-400 shrink-0" />
+                      <span>Live On-Chain Balance ({CHAIN_CONFIG_MAP[selectedChain].name})</span>
                     </div>
                     <button
                       type="button"
@@ -2345,56 +2789,295 @@ RPC_BASE_WS=wss://base-mainnet.public.blastapi.io
                   </div>
 
                   <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 pt-1 font-mono">
-                    <div className="p-2 rounded-lg bg-slate-900 border border-slate-800">
+                    <div className="p-2 rounded-lg bg-slate-950/80 border border-slate-800">
                       <div className="text-[10px] text-slate-400">ETH (Native)</div>
                       <div className="text-white text-xs font-bold truncate">{profitWalletOnChain?.ethFormatted || '0.000000 ETH'}</div>
                     </div>
-                    <div className="p-2 rounded-lg bg-slate-900 border border-slate-800">
+                    <div className="p-2 rounded-lg bg-slate-950/80 border border-slate-800">
                       <div className="text-[10px] text-slate-400">WETH Balance</div>
                       <div className="text-white text-xs font-bold truncate">{profitWalletOnChain?.wethFormatted || '0.000000 WETH'}</div>
                     </div>
-                    <div className="p-2 rounded-lg bg-slate-900 border border-slate-800">
+                    <div className="p-2 rounded-lg bg-slate-950/80 border border-slate-800">
                       <div className="text-[10px] text-slate-400">USDC Balance</div>
                       <div className="text-white text-xs font-bold truncate">{profitWalletOnChain?.usdcFormatted || '0.00 USDC'}</div>
                     </div>
-                    <div className="p-2 rounded-lg bg-slate-900 border border-slate-800">
+                    <div className="p-2 rounded-lg bg-slate-950/80 border border-slate-800">
                       <div className="text-[10px] text-slate-400">USDT Balance</div>
                       <div className="text-white text-xs font-bold truncate">{profitWalletOnChain?.usdtFormatted || '0.00 USDT'}</div>
                     </div>
                   </div>
 
-                  <div className="flex items-center justify-between pt-1 border-t border-slate-800/80 text-[11px] font-mono">
-                    <span className="text-slate-400">Verified On-Chain Value:</span>
+                  <div className="flex items-center justify-between pt-1 text-[11px] font-mono">
+                    <span className="text-slate-400">Verified On-Chain Value ({CHAIN_CONFIG_MAP[selectedChain].name}):</span>
                     <span className="text-emerald-400 font-bold">${profitWalletOnChain?.totalUsd?.toFixed(2) || '0.00'} USD</span>
                   </div>
+                  {holdingsOverview?.profitWallet?.nonZeroTokens &&
+                    holdingsOverview.profitWallet.nonZeroTokens.filter((t) => !['WETH', 'USDC', 'USDT'].includes(t.symbol)).length > 0 && (
+                      <div className="flex flex-wrap gap-1.5 pt-1">
+                        {holdingsOverview.profitWallet.nonZeroTokens
+                          .filter((t) => !['WETH', 'USDC', 'USDT'].includes(t.symbol))
+                          .map((tok) => (
+                            <span
+                              key={`vault-${tok.address}-${tok.tokenId || ''}`}
+                              className="px-2 py-0.5 rounded bg-slate-950 border border-slate-800 text-[10px] font-mono text-slate-200"
+                              title={tok.compatibilityNote}
+                            >
+                              {Number(tok.balance).toFixed(tok.ercStandard === 'ERC-721' || tok.ercStandard === 'ERC-1155' ? 0 : 4)} {tok.symbol}
+                              {tok.ercStandard ? ` · ${tok.ercStandard}` : ''}
+                              {tok.usdValue ? ` ($${tok.usdValue.toFixed(2)})` : ''}
+                            </span>
+                          ))}
+                      </div>
+                    )}
                 </div>
 
-                {/* Non-custodial Routing Guarantee + Sweep All Controls */}
-                <div className="p-3 rounded-xl bg-slate-950/80 border border-emerald-500/30 space-y-2 text-xs">
+                {/* Connected Token Holdings & Contract Compatibility + Sweep All Controls */}
+                <div className="pt-3 border-t border-slate-800/80 space-y-2.5 text-xs">
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <div className="flex items-center gap-1.5 text-emerald-300 text-[11px] font-bold">
                       <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400 shrink-0" />
-                      <span>Smart Contract Sweep All (ETH + ERC-20 Tokens)</span>
+                      <span>Connected Token Holdings &amp; Compatible Sweep</span>
                     </div>
-                    <span className="text-[10px] font-mono text-slate-400">
-                      Contract Holding: <strong className={contractOnChainStatus?.nonZeroCount ? 'text-amber-300' : 'text-emerald-400'}>
-                        {contractOnChainStatus ? `${contractOnChainStatus.eth} ETH · ${contractOnChainStatus.nonZeroTokens.length} non-zero ERC-20` : 'Checking...'}
-                      </strong>
-                    </span>
+                    <div className="flex items-center gap-2 text-[10px] font-mono">
+                      <span className="text-slate-400">
+                        {holdingsOverview
+                          ? `${holdingsOverview.summary.verifiedTokensCount} tokens · ${holdingsOverview.summary.accessibleContractsCount}/${holdingsOverview.summary.deployedContractsCount} accessible contracts`
+                          : 'Scanning contracts...'}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => fetchHoldingsOverview()}
+                        disabled={isLoadingHoldingsOverview}
+                        className="text-slate-300 hover:text-emerald-300 flex items-center gap-1 cursor-pointer disabled:opacity-50"
+                      >
+                        <RefreshCw className={`h-2.5 w-2.5 ${isLoadingHoldingsOverview ? 'animate-spin' : ''}`} />
+                        <span>Scan</span>
+                      </button>
+                    </div>
                   </div>
+
+                  {/* Per-Contract Accessibility & Non-Zero Token Holdings */}
+                  {holdingsOverview && holdingsOverview.contracts.length > 0 && (
+                    <div className="space-y-1.5">
+                      {holdingsOverview.contracts.map((c) => (
+                        <div
+                          key={c.address}
+                          className="p-2 rounded-lg bg-slate-950/70 border border-slate-800/90 space-y-1 font-mono text-[11px]"
+                        >
+                          <div className="flex flex-wrap items-center justify-between gap-1.5">
+                            <div className="flex items-center gap-1.5">
+                              <a
+                                href={c.explorerUrl}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="text-cyan-300 hover:underline font-bold flex items-center gap-1"
+                              >
+                                <span>{formatShortAddress(c.address)}</span>
+                                <ExternalLink className="h-2.5 w-2.5" />
+                              </a>
+                              {c.isPrimary && (
+                                <span className="px-1.5 py-0.5 rounded bg-cyan-500/15 text-cyan-300 border border-cyan-500/30 text-[9px]">
+                                  Primary
+                                </span>
+                              )}
+                              {!c.isDeployed ? (
+                                <span className="px-1.5 py-0.5 rounded bg-slate-800 text-slate-400 text-[9px]">Undeployed</span>
+                              ) : c.accessibleForSweep ? (
+                                <span className="px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 text-[9px]">
+                                  {c.ownerMatchesSigner ? 'Owner: Gas Signer' : 'Owner: Connected Wallet'}
+                                </span>
+                              ) : (
+                                <span className="px-1.5 py-0.5 rounded bg-rose-500/15 text-rose-300 border border-rose-500/30 text-[9px]">
+                                  Owner Mismatch ({c.owner ? formatShortAddress(c.owner) : 'None'})
+                                </span>
+                              )}
+                            </div>
+                            <span className="text-[10px] text-slate-400">
+                              {c.isDeployed
+                                ? `${Number(c.eth).toFixed(6)} ETH · ${c.nonZeroTokens.length} ERC-20 (${c.supportsRescueTokensTo ? 'rescueTokensTo' : c.supportsRescueTokens ? 'rescueTokens' : 'no rescue'})`
+                                : 'No bytecode on chain'}
+                            </span>
+                          </div>
+                          {c.nonZeroTokens.length > 0 && (
+                            <div className="flex flex-wrap gap-1.5 pt-0.5">
+                              {c.nonZeroTokens.map((tok) => (
+                                <span
+                                  key={`${c.address}-${tok.address}-${tok.tokenId || ''}`}
+                                  title={tok.compatibilityNote}
+                                  className={`px-1.5 py-0.5 rounded border text-[10px] ${
+                                    tok.sweepCompatible
+                                      ? 'bg-emerald-950/60 border-emerald-500/40 text-emerald-200'
+                                      : 'bg-rose-950/60 border-rose-500/40 text-rose-200'
+                                  }`}
+                                >
+                                  {tok.balance} {tok.symbol} ({tok.ercStandard || 'ERC-20'}) ·{' '}
+                                  {tok.arbCompatible ? 'Arb+Sweep' : tok.sweepCompatible ? 'Sweep Only' : 'Contract Incompatible'}
+                                </span>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {/* Gas Wallet & Connected Wallet Token Holdings */}
+                  {(holdingsOverview?.gasWallet?.nonZeroTokens.length || holdingsOverview?.connectedWallet?.nonZeroTokens.length) ? (
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5 font-mono text-[10px]">
+                      {holdingsOverview?.gasWallet && holdingsOverview.gasWallet.nonZeroTokens.length > 0 && (
+                        <div className="p-2 rounded-lg bg-slate-900/80 border border-slate-800 space-y-1">
+                          <div className="text-slate-300 font-bold">
+                            Gas Wallet ({formatShortAddress(holdingsOverview.gasWallet.address)}) Tokens
+                          </div>
+                          <div className="flex flex-wrap gap-1">
+                            {holdingsOverview.gasWallet.nonZeroTokens.map((tok) => (
+                              <span
+                                key={`gas-${tok.address}-${tok.tokenId || ''}`}
+                                title={tok.compatibilityNote}
+                                className={`px-1.5 py-0.5 rounded border ${
+                                  tok.sweepCompatible
+                                    ? 'bg-emerald-950/50 border-emerald-500/40 text-emerald-200'
+                                    : 'bg-rose-950/50 border-rose-500/40 text-rose-200'
+                                }`}
+                              >
+                                {Number(tok.balance).toFixed(4)} {tok.symbol} · {tok.ercStandard || 'ERC-20'}
+                              </span>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                      {holdingsOverview?.connectedWallet && holdingsOverview.connectedWallet.nonZeroTokens.length > 0 && (
+                        <div className="p-2 rounded-lg bg-slate-900/80 border border-slate-800 space-y-1">
+                          <div className="text-cyan-300 font-bold">
+                            Connected Wallet ({formatShortAddress(holdingsOverview.connectedWallet.address)}) Tokens
+                          </div>
+                          <div className="flex flex-wrap gap-1">
+                            {holdingsOverview.connectedWallet.nonZeroTokens.map((tok) => {
+                              const canSweepFromWallet = tok.walletSweepCompatible ?? tok.sweepCompatible;
+                              const isNft = tok.ercStandard === 'ERC-721' || tok.ercStandard === 'ERC-1155';
+                              return (
+                                <span
+                                  key={`conn-${tok.address}-${tok.tokenId || ''}`}
+                                  title={tok.compatibilityNote}
+                                  className={`px-1.5 py-0.5 rounded border ${
+                                    canSweepFromWallet
+                                      ? 'bg-cyan-950/50 border-cyan-500/40 text-cyan-200'
+                                      : 'bg-rose-950/50 border-rose-500/40 text-rose-200'
+                                  }`}
+                                >
+                                  {isNft ? tok.balance : Number(tok.balance).toFixed(4)} {tok.symbol} · {tok.ercStandard || 'ERC-20'}
+                                </span>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  ) : null}
+
+                  {/* Custom Token Contract Address Inspector */}
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <input
+                      type="text"
+                      value={extraTokensInput}
+                      onChange={(e) => setExtraTokensInput(e.target.value)}
+                      placeholder="Extra ERC-20/4626/2612 (0x...) or ERC-721/1155 (0x...:tokenId)"
+                      className="flex-1 min-w-[200px] px-2.5 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-[11px] font-mono text-white placeholder-slate-500 focus:outline-none focus:border-emerald-400"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => {
+                        fetchHoldingsOverview(extraTokensInput);
+                        fetchContractBalances(extraTokensInput);
+                        fetchProfitWalletBalances(extraTokensInput);
+                      }}
+                      disabled={isLoadingHoldingsOverview}
+                      className="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-600 text-slate-200 font-mono text-[11px] cursor-pointer disabled:opacity-50"
+                    >
+                      Check Compatibility
+                    </button>
+                  </div>
+
+                  {/* Inspected Custom ERC Standards Result */}
+                  {holdingsOverview?.customCheckedTokens && holdingsOverview.customCheckedTokens.length > 0 && (
+                    <div className="p-2 rounded-lg bg-slate-900/90 border border-slate-800 space-y-1 font-mono text-[10px]">
+                      <div className="text-slate-400 font-sans font-semibold">Detected Custom Contract Standards:</div>
+                      <div className="flex flex-col gap-1">
+                        {holdingsOverview.customCheckedTokens.map((ct) => {
+                          const badgeTone = ct.sweepCompatible
+                            ? 'bg-emerald-950/60 border-emerald-500/40 text-emerald-200'
+                            : ct.walletSweepCompatible
+                            ? 'bg-amber-950/60 border-amber-500/40 text-amber-200'
+                            : 'bg-rose-950/60 border-rose-500/40 text-rose-200';
+                          const statusLabel = ct.arbCompatible
+                            ? 'Arb + Contract/Wallet Sweep'
+                            : ct.sweepCompatible
+                            ? 'Contract + Wallet Sweep'
+                            : ct.walletSweepCompatible
+                            ? 'Wallet Sweep Only'
+                            : 'Incompatible';
+                          return (
+                            <div
+                              key={`checked-${ct.address}-${ct.tokenId || ''}`}
+                              className={`px-2 py-1 rounded border flex flex-wrap items-center justify-between gap-1.5 ${badgeTone}`}
+                            >
+                              <span className="font-bold">
+                                {ct.symbol} ({formatShortAddress(ct.address)}{ct.tokenId ? `:${ct.tokenId}` : ''}) · {ct.ercStandard}
+                              </span>
+                              <span className="opacity-90">{statusLabel}</span>
+                              <span className="w-full text-[10px] opacity-80 font-sans">{ct.compatibilityNote}</span>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+
                   <p className="text-[11px] text-slate-400 font-sans leading-relaxed">
-                    Profit from <code className="text-emerald-300 font-mono">executeOptimizedArbitrage</code> transfers atomically to this vault. Use <strong>Sweep All Balances</strong> to rescue any residual native ETH and ERC-20 tokens (WETH, USDC, USDT, ARB, WBTC, DAI, LINK, GMX, wstETH) from deployed contracts into <code className="text-emerald-300 font-mono">{formatShortAddress(profitWalletAddress)}</code>.
+                    Detects ERC-20, ERC-2612, ERC-4626, ERC-777, ERC-721, and ERC-1155 on-chain + <code className="text-emerald-300 font-mono">eth_estimateGas</code>. FlashArb contracts sweep fungible ERC-20/2612/4626/777 tokens only; Connected Wallet can also sweep ERC-721/1155 using <code className="text-cyan-300 font-mono">0xAddress:tokenId</code> to <code className="text-emerald-300 font-mono">{formatShortAddress(profitWalletAddress)}</code>.
                   </p>
                   <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
-                    <label className="flex items-center gap-1.5 text-[11px] text-slate-300 font-sans cursor-pointer">
-                      <input
-                        type="checkbox"
-                        checked={includeGasWalletTokensInSweep}
-                        onChange={(e) => setIncludeGasWalletTokensInSweep(e.target.checked)}
-                        className="rounded bg-slate-900 border-slate-700 text-emerald-500 focus:ring-0 cursor-pointer"
-                      />
-                      <span>Also sweep leftover ERC-20s from Gas Wallet (keeps ETH gas)</span>
-                    </label>
+                    <div className="flex flex-col gap-1">
+                      <label className="flex items-center gap-1.5 text-[11px] text-emerald-300 font-sans cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={autoSweepEndOfCycle}
+                          onChange={(e) => {
+                            const next = e.target.checked;
+                            setAutoSweepEndOfCycle(next);
+                            try {
+                              localStorage.setItem('flash_arb_auto_sweep_cycle', String(next));
+                            } catch {}
+                          }}
+                          className="rounded bg-slate-900 border-slate-700 text-emerald-500 focus:ring-0 cursor-pointer"
+                        />
+                        <span>Auto-scan &amp; sweep compatible ERC-20/1155 dust to Profit Vault at end of each cycle</span>
+                      </label>
+                      <label className="flex items-center gap-1.5 text-[11px] text-slate-300 font-sans cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={includeGasWalletTokensInSweep}
+                          onChange={(e) => setIncludeGasWalletTokensInSweep(e.target.checked)}
+                          className="rounded bg-slate-900 border-slate-700 text-emerald-500 focus:ring-0 cursor-pointer"
+                        />
+                        <span>Also sweep compatible ERC-20/1155s from Gas Wallet (keeps ETH gas)</span>
+                      </label>
+                      {okxConnectedAddress &&
+                        okxConnectedAddress.toLowerCase() !== profitWalletAddress.toLowerCase() &&
+                        okxConnectedAddress.toLowerCase() !== gasWalletAddress.toLowerCase() && (
+                          <label className="flex items-center gap-1.5 text-[11px] text-cyan-200 font-sans cursor-pointer">
+                            <input
+                              type="checkbox"
+                              checked={includeConnectedWalletTokensInSweep}
+                              onChange={(e) => setIncludeConnectedWalletTokensInSweep(e.target.checked)}
+                              className="rounded bg-slate-900 border-slate-700 text-cyan-500 focus:ring-0 cursor-pointer"
+                            />
+                            <span>
+                              Also sweep compatible ERC-20/4626/721/1155 from Connected Wallet ({formatShortAddress(okxConnectedAddress)})
+                            </span>
+                          </label>
+                        )}
+                    </div>
                     <button
                       type="button"
                       onClick={handleSweepAllBalances}
@@ -2402,7 +3085,7 @@ RPC_BASE_WS=wss://base-mainnet.public.blastapi.io
                       className="px-3 py-1.5 rounded-lg bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-400 hover:to-teal-400 text-slate-950 font-mono font-bold text-[11px] flex items-center gap-1.5 cursor-pointer shadow-md disabled:opacity-50"
                     >
                       {isSweepingAll ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <ArrowUpRight className="h-3.5 w-3.5" />}
-                      <span>{isSweepingAll ? 'Sweeping...' : 'Sweep All Balances'}</span>
+                      <span>{isSweepingAll ? 'Sweeping...' : 'Sweep Compatible Holdings'}</span>
                     </button>
                   </div>
                 </div>
@@ -3116,10 +3799,10 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
             <Activity className="h-3 w-3 text-indigo-400" />
           </div>
           <div className="text-lg sm:text-xl font-black text-indigo-300 tracking-tight">
-            {poolsScannedCount > 0 ? `${poolsScannedCount}` : '86 Active'}
+            {poolsScannedCount > 0 ? poolsScannedCount : (agentCountsByChain?.[selectedChain] ?? (selectedChain === 'base' ? 41 : selectedChain === 'optimism' ? 26 : 70))} <span className="text-xs font-bold">Pools</span>
           </div>
           <div className="text-[10px] text-slate-400 truncate font-sans">
-            Peak Spread: <strong className="text-emerald-400 font-mono">+{maxSpreadDiscoveredBps > 0 ? maxSpreadDiscoveredBps.toFixed(1) : '28.0'} bps</strong>
+            Peak Spread: <strong className="text-emerald-400 font-mono">{maxSpreadDiscoveredBps > 0 ? `+${maxSpreadDiscoveredBps.toFixed(1)} bps` : '0.0 bps'}</strong>
           </div>
         </div>
 
@@ -3166,7 +3849,7 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
             </button>
           </div>
           <div className="text-lg sm:text-xl font-black text-white tracking-tight truncate">
-            {gasStatus?.[selectedChain]?.balanceEthFormatted || '0.045 ETH'}
+            {gasStatus?.[selectedChain]?.balanceEthFormatted || '0.0000 ETH'}
           </div>
           <div className="text-[10px] text-slate-400 truncate font-sans">
             Funder: {formatShortAddress(gasWalletAddress)}
@@ -3205,67 +3888,41 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
       {activeSubTab === 'MONITOR' && (
         <div className="space-y-6">
           {/* DYNAMIC PARAMETER OPTIMIZER & STRICT PROFIT GUARD CONSOLE */}
-          <div className="p-5 rounded-2xl bg-gradient-to-br from-slate-900 via-slate-900/95 to-slate-950 border border-cyan-500/40 shadow-2xl space-y-4 font-mono">
-            {/* Header: Live Daemon Block Stream & Action Controls */}
+          <div className="p-5 rounded-2xl bg-gradient-to-br from-slate-900 via-slate-900/95 to-slate-950 border border-cyan-500/30 shadow-xl space-y-4 font-mono">
+            {/* Header: Parameter & Guard Summary (Execution controls live in top Console Bar) */}
             <div className="flex flex-wrap items-center justify-between gap-3 pb-3 border-b border-slate-800">
               <div className="flex items-center gap-3">
-                <div className="relative flex items-center justify-center">
-                  <span className={`h-3 w-3 rounded-full ${isAgentRunning ? 'bg-emerald-400 animate-ping' : 'bg-slate-500'}`} />
-                  <span className={`absolute h-2 w-2 rounded-full ${isAgentRunning ? 'bg-emerald-400' : 'bg-slate-500'}`} />
-                </div>
+                <Sliders className="h-4 w-4 text-cyan-400 shrink-0" />
                 <div>
                   <div className="flex items-center gap-2 flex-wrap">
                     <span className="text-sm font-bold text-white tracking-wide">
-                      Live Autonomous MEV Searcher Agent
+                      Searcher Parameters &amp; Strict Profit Guard
                     </span>
-                    <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-cyan-500/20 text-cyan-300 border border-cyan-500/30">
-                      Arbitrum One (Chain ID: 42161)
-                    </span>
-                    <span className={`px-2 py-0.5 rounded text-[10px] font-bold border flex items-center gap-1 ${
-                      agentState === 'EXECUTING'
-                        ? 'bg-amber-500/20 text-amber-300 border-amber-500/40 animate-pulse'
-                        : agentState === 'TRADE_CONFIRMED'
-                        ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40'
-                        : agentState === 'AWAITING_GAS_SIGNER'
-                        ? 'bg-yellow-500/20 text-yellow-300 border-yellow-500/40'
-                        : 'bg-cyan-500/20 text-cyan-300 border-cyan-500/30'
-                    }`}>
-                      <Activity className={`h-3 w-3 ${agentState === 'EXECUTING' ? 'animate-spin' : ''}`} />
-                      <span>{agentState === 'TRADE_CONFIRMED' ? 'Trade Confirmed' : agentState === 'AWAITING_GAS_SIGNER' ? 'Signer Needed' : agentState === 'EXECUTING' ? 'Broadcasting...' : 'Scanning 24 Pools'}</span>
-                    </span>
-                    <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 flex items-center gap-1">
-                      <Shield className="h-3 w-3 text-emerald-400" />
-                      <span>Strict Profit Guard Active</span>
-                    </span>
-                    {lastConfirmedTxHash && (
-                      <a
-                        href={`https://arbiscan.io/tx/${lastConfirmedTxHash}`}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 border border-emerald-500/40 flex items-center gap-1 transition-colors"
-                        title="View confirmed transaction on Arbiscan"
-                      >
-                        <CheckCircle2 className="h-3 w-3 text-emerald-400" />
-                        <span>Arbiscan: {formatShortAddress(lastConfirmedTxHash)}</span>
-                        <ExternalLink className="h-2.5 w-2.5" />
-                      </a>
-                    )}
-                  </div>
-                  <div className="text-xs text-slate-400 flex items-center gap-2 mt-0.5 flex-wrap">
-                    <span>Active Block: <strong className="text-cyan-300">#{agentLatestBlock || 519041280}</strong></span>
-                    <span>·</span>
-                    <span>Scan #{agentScanCount}</span>
-                    <span>·</span>
-                    <span>{agentMonitoredPools.length || 24} Monitored Pools</span>
-                    <span>·</span>
-                    <span className={isSignerKeyConfigured ? 'text-emerald-400 font-bold' : 'text-amber-400'}>
-                      Signer: {isSignerKeyConfigured ? 'Authorized in Memory' : 'Web3 Wallet Relay'}
+                    <span className="text-[11px] text-slate-400">
+                      {targetChainConfig.name} (ID {targetChainConfig.chainIdDec}) ·{' '}
+                      <span className={isSignerKeyConfigured ? 'text-emerald-400' : 'text-amber-400'}>
+                        {isSignerKeyConfigured ? 'Signer Authorized' : 'Wallet Relay Mode'}
+                      </span>
                     </span>
                   </div>
                 </div>
               </div>
 
               <div className="flex items-center gap-2 flex-wrap">
+                {lastConfirmedTxHash && (
+                  <a
+                    href={`${targetChainConfig.explorer}/tx/${lastConfirmedTxHash}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="px-2.5 py-1 rounded-lg text-[11px] font-bold bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 border border-emerald-500/30 flex items-center gap-1 transition-colors"
+                    title={`View confirmed transaction on ${targetChainConfig.name} explorer`}
+                  >
+                    <CheckCircle2 className="h-3 w-3 text-emerald-400" />
+                    <span>Last Tx: {formatShortAddress(lastConfirmedTxHash)}</span>
+                    <ExternalLink className="h-2.5 w-2.5" />
+                  </a>
+                )}
+
                 {!isSignerKeyConfigured && (
                   <button
                     type="button"
@@ -3282,34 +3939,6 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
                     <span>1-Click Init Signer</span>
                   </button>
                 )}
-
-                <button
-                  type="button"
-                  onClick={handleToggleAgent}
-                  className={`px-3 py-1.5 rounded-xl font-bold text-xs transition-all flex items-center gap-1.5 cursor-pointer shadow-md ${
-                    isAgentRunning
-                      ? 'bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/40 text-amber-300'
-                      : 'bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-500/40 text-emerald-300'
-                  }`}
-                >
-                  <Activity className="h-3.5 w-3.5" />
-                  <span>{isAgentRunning ? 'Pause Daemon' : 'Start Daemon'}</span>
-                </button>
-
-                <button
-                  type="button"
-                  disabled={isTriggeringAgentTrade}
-                  onClick={() => handleTriggerAgentTrade()}
-                  className="px-3.5 py-1.5 rounded-xl bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 text-slate-950 font-bold text-xs transition-all flex items-center gap-1.5 cursor-pointer shadow-lg disabled:opacity-50"
-                  title="Execute immediate live flash arb on best verified route"
-                >
-                  {isTriggeringAgentTrade ? (
-                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                  ) : (
-                    <Zap className="h-3.5 w-3.5 fill-current" />
-                  )}
-                  <span>Dispatch Best Trade</span>
-                </button>
               </div>
             </div>
 
@@ -3426,7 +4055,7 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
                   </span>
                 </div>
                 <p className="text-[11px] text-slate-300 font-sans leading-relaxed">
-                  Calibrates lowest safe gas limits and priority fees on Arbitrum One to consume the absolute minimum gas.
+                  Calibrates lowest safe gas limits and priority fees on {targetChainConfig.name} to consume the absolute minimum gas.
                 </p>
                 <div className="space-y-1">
                   <div className="text-[10px] text-slate-400">Gas Calibration Profile:</div>
@@ -3490,8 +4119,10 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
                       : 'PROFIT GUARD ENFORCED: Revert & Loss Protection Active'}
                   </span>
                   <p className="text-[11px] text-slate-300 font-sans mt-0.5">
-                    {agentOpportunities[0]?.profitGuardReason ||
-                      'Monitoring Arbitrum One pools every 3.5s. Trades are guaranteed to execute ONLY if net profit after fees and gas is positive.'}
+                    {agentScanError
+                      ? `RPC scan warning on ${targetChainConfig.name}: ${agentScanError}`
+                      : agentOpportunities[0]?.profitGuardReason ||
+                        `Monitoring ${targetChainConfig.name} pools every 6.5s via Multicall3. Trades are guaranteed to execute ONLY if net profit after fees and gas is positive.`}
                   </p>
                 </div>
               </div>
@@ -3623,64 +4254,82 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
             {[
               {
+                chainKey: 'arbitrum' as const,
                 chain: 'Arbitrum One',
                 chainId: 42161,
-                poolCount: 86,
-                dexes: 'Uniswap V3, Camelot V3/V2, Curve, Balancer V2, Trader Joe V2.1, PancakeSwap, DODO',
-                latency: '9ms',
-                status: 'STREAMING',
+                poolCount: agentCountsByChain?.arbitrum ?? 70,
+                dexes: 'Uniswap V3, PancakeSwap V3, SushiSwap V3, Sushiswap V2, Camelot V3, Camelot V2',
+                executionSupport: 'Full On-Chain Execution',
                 gasProfile: 'Hyper-Alpha (148k gas)',
               },
               {
+                chainKey: 'base' as const,
                 chain: 'Base L2',
                 chainId: 8453,
-                poolCount: 64,
-                dexes: 'Aerodrome Slipstream (CL), Aerodrome Basic, Uniswap V3, Balancer V2, PancakeSwap',
-                latency: '12ms',
-                status: 'STREAMING',
+                poolCount: agentCountsByChain?.base ?? 41,
+                dexes: 'Uniswap V3, Aerodrome Slipstream (Monitor), PancakeSwap V3, SushiSwap V3, Uniswap V2, Sushiswap V2, BaseSwap V2',
+                executionSupport: contractDeploymentStatus.base?.isDeployed ? 'Full On-Chain Execution' : 'Live Scan Ready (Deploy Contract to Exec)',
                 gasProfile: 'Hyper-Alpha (145k gas)',
               },
               {
+                chainKey: 'optimism' as const,
                 chain: 'Optimism Mainnet',
                 chainId: 10,
-                poolCount: 52,
-                dexes: 'Velodrome Slipstream (CL), Velodrome Basic, Uniswap V3, Curve, Balancer V2',
-                latency: '14ms',
-                status: 'STREAMING',
+                poolCount: agentCountsByChain?.optimism ?? 26,
+                dexes: 'Uniswap V3, Velodrome Slipstream (Monitor), SushiSwap V3, Uniswap V2, Sushiswap V2',
+                executionSupport: contractDeploymentStatus.optimism?.isDeployed ? 'Full On-Chain Execution' : 'Live Scan Ready (Deploy Contract to Exec)',
                 gasProfile: 'Hyper-Alpha (148k gas)',
               },
-            ].map((worker) => (
-              <div key={worker.chain} className="p-4 rounded-xl bg-slate-900 border border-slate-800 space-y-3">
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-2">
-                    <span className="h-2.5 w-2.5 rounded-full bg-emerald-400 animate-ping" />
-                    <span className="font-bold text-white text-sm font-mono">{worker.chain}</span>
+            ].map((worker) => {
+              const isActiveWorker = selectedChain === worker.chainKey;
+              return (
+                <button
+                  key={worker.chain}
+                  type="button"
+                  onClick={() => handleSwitchChain(worker.chainKey)}
+                  className={`p-4 rounded-xl bg-slate-900 text-left border space-y-3 transition-all cursor-pointer ${
+                    isActiveWorker
+                      ? 'border-cyan-400/70 ring-1 ring-cyan-400/30 shadow-lg'
+                      : 'border-slate-800 hover:border-slate-700'
+                  }`}
+                >
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <span className={`h-2.5 w-2.5 rounded-full ${isActiveWorker ? 'bg-cyan-400 animate-ping' : 'bg-emerald-400'}`} />
+                      <span className="font-bold text-white text-sm font-mono">{worker.chain}</span>
+                    </div>
+                    <span className={`text-[10px] font-mono px-2 py-0.5 rounded border ${
+                      isActiveWorker
+                        ? 'bg-cyan-500/20 text-cyan-300 border-cyan-500/40'
+                        : 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30'
+                    }`}>
+                      ID: {worker.chainId}
+                    </span>
                   </div>
-                  <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
-                    ID: {worker.chainId}
-                  </span>
-                </div>
 
-                <div className="space-y-1.5 text-xs font-mono">
-                  <div className="flex justify-between text-slate-400">
-                    <span>Pools Monitored:</span>
-                    <span className="text-white font-bold">{worker.poolCount} active pools</span>
+                  <div className="space-y-1.5 text-xs font-mono">
+                    <div className="flex justify-between text-slate-400">
+                      <span>Pools Monitored:</span>
+                      <span className="text-white font-bold">{worker.poolCount} live pools</span>
+                    </div>
+                    <div className="flex justify-between text-slate-400">
+                      <span>Gas Profile:</span>
+                      <span className="text-cyan-400 font-bold">{worker.gasProfile}</span>
+                    </div>
+                    <div className="flex justify-between text-slate-400">
+                      <span>Execution Status:</span>
+                      <span className={contractDeploymentStatus[worker.chainKey]?.isDeployed ? 'text-emerald-400 font-bold' : 'text-amber-300 font-bold'}>
+                        {worker.executionSupport}
+                      </span>
+                    </div>
+                    <div className="pt-1 text-[11px] text-slate-400 leading-tight">
+                      <span className="text-slate-500 block text-[10px]">Active DEX Protocols:</span>
+                      <span className="text-slate-300">{worker.dexes}</span>
+                    </div>
                   </div>
-                  <div className="flex justify-between text-slate-400">
-                    <span>Gas Profile:</span>
-                    <span className="text-cyan-400 font-bold">{worker.gasProfile}</span>
-                  </div>
-                  <div className="flex justify-between text-slate-400">
-                    <span>WebSocket Latency:</span>
-                    <span className="text-emerald-400 font-bold">{worker.latency}</span>
-                  </div>
-                  <div className="pt-1 text-[11px] text-slate-400 leading-tight">
-                    <span className="text-slate-500 block text-[10px]">Active DEX Protocols:</span>
-                    <span className="text-slate-300">{worker.dexes}</span>
-                  </div>
-                </div>
-              </div>
-            ))}
+                </button>
+              );
+            })}
           </div>
 
           {/* Real-Time Multi-Token Opportunity Stream */}
@@ -3689,14 +4338,26 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
               <div className="space-y-1">
                 <h3 className="text-sm font-bold text-white font-mono uppercase tracking-wider flex items-center gap-2">
                   <Terminal className="h-4 w-4 text-cyan-400" />
-                  Live Cross-DEX Pool Opportunity Stream
+                  Live Cross-DEX Pool Opportunity Stream ({targetChainConfig.name})
                 </h3>
                 <p className="text-xs text-slate-400 font-mono">
-                  Real price discrepancy scanner evaluating {ARB_TOKENS.length} tokens across Uniswap V3, Camelot, Curve, and Balancer.
+                  Real price discrepancy scanner evaluating {ARB_TOKENS.length} tokens across {targetChainConfig.name} DEX venues via Multicall3.
                 </p>
               </div>
 
               <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setOppProfitableOnly((v) => !v)}
+                  className={`px-2.5 py-1.5 rounded-lg border text-xs font-mono font-bold transition-colors cursor-pointer whitespace-nowrap ${
+                    oppProfitableOnly
+                      ? 'bg-emerald-500/20 border-emerald-400/50 text-emerald-300'
+                      : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-white'
+                  }`}
+                >
+                  {oppProfitableOnly ? '✓ Profitable Only' : 'All Routes'}
+                </button>
+
                 <div className="flex items-center gap-1.5 bg-slate-950 border border-slate-800 rounded-lg px-2 py-1 text-xs font-mono">
                   <Filter className="h-3 w-3 text-slate-400" />
                   <span className="text-slate-400">Token:</span>
@@ -3718,7 +4379,7 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
                   type="button"
                   onClick={handleScanLivePools}
                   disabled={isScanningPools}
-                  className="px-3.5 py-1.5 rounded-lg bg-cyan-600 hover:bg-cyan-500 text-white font-mono text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer disabled:opacity-50 shadow-md"
+                  className="px-3.5 py-1.5 rounded-lg bg-cyan-600 hover:bg-cyan-500 text-white font-mono text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer disabled:opacity-50 shadow-md whitespace-nowrap"
                 >
                   <Activity className={`h-3.5 w-3.5 ${isScanningPools ? 'animate-spin' : ''}`} />
                   <span>{isScanningPools ? 'Scanning DEX Pools...' : 'Scan Real Pool Spreads'}</span>
@@ -3727,202 +4388,231 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
             </div>
 
             <div className="overflow-x-auto">
-              <table className="w-full text-left text-xs font-mono">
-                <thead className="bg-slate-950/60 text-slate-400 text-[11px] uppercase">
-                  <tr>
-                    <th className="py-2.5 px-3">Time / Chain</th>
-                    <th className="py-2.5 px-3">Token & Category</th>
-                    <th className="py-2.5 px-3">Loan Size & Protocol</th>
-                    <th className="py-2.5 px-3">Spread</th>
-                    <th className="py-2.5 px-3">Route (DEX A → B)</th>
-                    <th className="py-2.5 px-3">Gas & Loan Fee</th>
-                    <th className="py-2.5 px-3">Net Profit</th>
-                    <th className="py-2.5 px-3">Action</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-800">
-                  {(() => {
-                    const mappedOpportunities: SimulatedOpp[] = agentOpportunities.length > 0
-                      ? agentOpportunities.map((opp) => ({
-                          id: opp.id,
-                          chain: 'Arbitrum' as const,
-                          timestamp: new Date(opp.timestamp).toLocaleTimeString(),
-                          token: opp.loanToken,
-                          tokenName: opp.pair,
-                          category: 'On-chain pool read (live RPC)',
-                          loanAmount: `${opp.optimalLoanAmount} ${opp.loanToken} ($${(opp.optimalLoanAmount * opp.buyPrice).toFixed(0)})`,
-                          loanProvider: 'n/a (chosen at execution)',
-                          spreadBps: opp.grossSpreadBps,
-                          dexA: opp.buyDex,
-                          dexB: opp.sellDex,
-                          grossProfitUsd: opp.grossSpreadUsd,
-                          loanFeeUsd: 0.0,
-                          gasCostUsd: opp.gasCostUsd,
-                          tipUsd: 0,
-                          netProfitUsd: opp.estNetProfitUsd,
-                          status: opp.isProfitable ? ('LIVE_EXECUTION_READY' as const) : ('REVERT_INSUFFICIENT_PROFIT' as const),
-                          revmGas: opp.optimalGasLimit,
-                          gasProfile: `${opp.optimalGasLimit.toLocaleString()} gas budget`,
-                          isProfitable: opp.isProfitable,
-                          profitGuardStatus: opp.profitGuardStatus,
-                          profitGuardReason: opp.profitGuardReason,
-                          gasSavingsPercent: opp.gasSavingsPercent,
-                          priceImpactBps: opp.priceImpactBps,
-                          dexFeeBps: opp.dexFeeBps,
-                        }))
-                      : opportunities;
+              {(() => {
+                const mappedOpportunities: SimulatedOpp[] = agentOpportunities.length > 0
+                  ? agentOpportunities.map((opp) => ({
+                      id: opp.id,
+                      chain: (opp.chain === 'base' ? 'Base' : opp.chain === 'optimism' ? 'Optimism' : 'Arbitrum') as 'Arbitrum' | 'Base' | 'Optimism',
+                      timestamp: new Date(opp.timestamp).toLocaleTimeString(),
+                      token: opp.loanToken,
+                      tokenName: opp.pair,
+                      category: 'On-chain pool read (live RPC)',
+                      loanAmount: `${opp.optimalLoanAmount} ${opp.loanToken} ($${(opp.optimalLoanAmount * opp.buyPrice).toFixed(0)})`,
+                      loanProvider: 'n/a (chosen at execution)',
+                      spreadBps: opp.grossSpreadBps,
+                      dexA: opp.buyDex,
+                      dexB: opp.sellDex,
+                      grossProfitUsd: opp.grossSpreadUsd,
+                      loanFeeUsd: 0.0,
+                      gasCostUsd: opp.gasCostUsd,
+                      tipUsd: 0,
+                      netProfitUsd: opp.estNetProfitUsd,
+                      status: opp.isProfitable ? ('LIVE_EXECUTION_READY' as const) : ('REVERT_INSUFFICIENT_PROFIT' as const),
+                      revmGas: opp.optimalGasLimit,
+                      gasProfile: `${opp.optimalGasLimit.toLocaleString()} gas budget`,
+                      isProfitable: opp.isProfitable,
+                      profitGuardStatus: opp.profitGuardStatus,
+                      profitGuardReason: opp.profitGuardReason,
+                      gasSavingsPercent: opp.gasSavingsPercent,
+                      priceImpactBps: opp.priceImpactBps,
+                      dexFeeBps: opp.dexFeeBps,
+                    }))
+                  : opportunities;
 
-                    const displayOpportunities = scanTokenFilter === 'ALL'
-                      ? mappedOpportunities
-                      : mappedOpportunities.filter(
-                          (o) => o.token === scanTokenFilter || o.tokenName.includes(scanTokenFilter)
-                        );
+                const filteredOpps = mappedOpportunities.filter((o) => {
+                  const matchesToken =
+                    scanTokenFilter === 'ALL' || o.token === scanTokenFilter || o.tokenName.includes(scanTokenFilter);
+                  const matchesProfit = !oppProfitableOnly || !!o.isProfitable;
+                  return matchesToken && matchesProfit;
+                });
 
-                    if (displayOpportunities.length === 0) {
-                      return (
+                const displayOpportunities = showAllOpportunities ? filteredOpps : filteredOpps.slice(0, 20);
+
+                return (
+                  <>
+                    <table className="w-full text-left text-xs font-mono">
+                      <thead className="bg-slate-950/60 text-slate-400 text-[11px] uppercase">
                         <tr>
-                          <td colSpan={8} className="py-12 text-center text-slate-400">
-                            <div className="flex flex-col items-center justify-center space-y-2">
-                              <Activity className="h-6 w-6 text-cyan-400 animate-pulse" />
-                              <span className="font-bold text-white text-xs">
-                                {scanTokenFilter === 'ALL'
-                                  ? 'Searcher Daemon Active & Listening (0 Fake Injections)'
-                                  : `No live spreads matched token filter "${scanTokenFilter}"`}
-                              </span>
-                              <span className="text-[11px] text-slate-500 max-w-md">
-                                Monitoring Arbitrum, Base, and Optimism DEX pools for real cross-venue discrepancies. Click "Scan Real Pool Spreads" to query live liquidity pools across {ARB_TOKENS.length} tokens and {agentMonitoredPools.length || 70} DEX pools.
-                              </span>
-                            </div>
-                          </td>
+                          <th className="py-2.5 px-3">Time / Chain</th>
+                          <th className="py-2.5 px-3">Token &amp; Category</th>
+                          <th className="py-2.5 px-3">Loan Size &amp; Protocol</th>
+                          <th className="py-2.5 px-3">Spread</th>
+                          <th className="py-2.5 px-3">Route (DEX A → B)</th>
+                          <th className="py-2.5 px-3">Gas &amp; Loan Fee</th>
+                          <th className="py-2.5 px-3">Net Profit</th>
+                          <th className="py-2.5 px-3">Action</th>
                         </tr>
-                      );
-                    }
-
-                    return displayOpportunities.map((opp, idx) => (
-                      <tr key={`${opp.id}-${opp.dexA}-${opp.dexB}-${idx}`} className="hover:bg-slate-800/40 transition-colors">
-                        <td className="py-3 px-3">
-                          <div className="text-white font-bold">{opp.chain}</div>
-                          <div className="text-[10px] text-slate-400">{opp.timestamp}</div>
-                        </td>
-                        <td className="py-3 px-3">
-                          <div className="text-cyan-300 font-bold flex items-center gap-1.5">
-                            <span>{opp.token}</span>
-                            <span className="text-[9px] px-1.5 py-0.2 rounded bg-slate-800 text-slate-400">
-                              {opp.category}
-                            </span>
-                          </div>
-                          <div className="text-[10px] text-slate-400">{opp.tokenName}</div>
-                        </td>
-                        <td className="py-3 px-3">
-                          <div className="text-white font-bold">{opp.loanAmount}</div>
-                          <div className="text-[10px] text-emerald-400">{opp.loanProvider}</div>
-                          {opp.priceImpactBps !== undefined && (
-                            <div className="text-[9px] text-slate-500">Slippage: ~{opp.priceImpactBps} bps</div>
-                          )}
-                        </td>
-                        <td className="py-3 px-3">
-                          <div className="text-emerald-400 font-bold">+{opp.spreadBps.toFixed(1)} bps</div>
-                          <div className="text-[9px] text-slate-500">Pool Fee: {(opp.dexFeeBps ?? 35).toFixed(1)} bps</div>
-                        </td>
-                        <td className="py-3 px-3">
-                          <div className="flex items-center gap-1 text-slate-300">
-                            <span>{opp.dexA}</span>
-                            <ArrowRight className="h-3 w-3 text-cyan-400 shrink-0" />
-                            <span>{opp.dexB}</span>
-                          </div>
-                        </td>
-                        <td className="py-3 px-3">
-                          <div className="text-slate-300 font-bold">{opp.revmGas.toLocaleString()} gas</div>
-                          <div className="text-[10px] text-cyan-400">-{opp.gasSavingsPercent}% Least Gas</div>
-                          <div className="text-[9px] text-slate-500">${opp.gasCostUsd.toFixed(3)} L2 fee</div>
-                        </td>
-                        <td className="py-3 px-3">
-                          {opp.isProfitable ? (
-                            <div>
-                              <div className="font-bold text-emerald-400">+${opp.netProfitUsd.toFixed(2)}</div>
-                              <div className="text-[10px] text-emerald-300 font-bold flex items-center gap-0.5">
-                                <CheckCircle2 className="h-3 w-3" />
-                                <span>Profit Guard Cleared</span>
+                      </thead>
+                      <tbody className="divide-y divide-slate-800">
+                        {displayOpportunities.length === 0 ? (
+                          <tr>
+                            <td colSpan={8} className="py-10 text-center text-slate-400">
+                              <div className="flex flex-col items-center justify-center space-y-2">
+                                <Activity className="h-6 w-6 text-cyan-400" />
+                                <span className="font-bold text-white text-xs">
+                                  {agentScanError
+                                    ? `${targetChainConfig.name} RPC Notice: ${agentScanError}`
+                                    : oppProfitableOnly
+                                    ? `No net-profitable spreads currently exceed fees on ${targetChainConfig.name} (${mappedOpportunities.length} total pairs monitored)`
+                                    : scanTokenFilter === 'ALL'
+                                    ? `${targetChainConfig.name} Searcher Active & Listening`
+                                    : `No live spreads matched token filter "${scanTokenFilter}" on ${targetChainConfig.name}`}
+                                </span>
+                                <span className="text-[11px] text-slate-500 max-w-md">
+                                  Monitoring {targetChainConfig.name} DEX pools via Multicall3 for real cross-venue discrepancies.
+                                </span>
                               </div>
-                            </div>
-                          ) : (
-                            <div>
-                              <div className="font-bold text-rose-400">-${Math.abs(opp.netProfitUsd).toFixed(2)}</div>
-                              <div className="text-[10px] text-amber-400 font-bold flex items-center gap-0.5" title={opp.profitGuardReason}>
-                                <Shield className="h-3 w-3" />
-                                <span>Blocked: Zero Loss</span>
-                              </div>
-                            </div>
-                          )}
-                        </td>
-                        <td className="py-3 px-3">
-                          <div className="flex items-center gap-1.5">
-                            {opp.isProfitable ? (
-                              <button
-                                type="button"
-                                disabled={isExecutingLiveTrade}
-                                onClick={() => handleExecuteLiveOnChainTrade(opp)}
-                                className="px-2.5 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-[10px] font-bold flex items-center gap-1 cursor-pointer transition-all shadow-md disabled:opacity-50"
-                                title="Broadcast live verified flash loan arbitrage on-chain now"
-                              >
-                                <Zap className="h-3 w-3 fill-current text-white" />
-                                <span>Broadcast Live</span>
-                              </button>
-                            ) : (
-                              <button
-                                type="button"
-                                disabled={!forceTestExecution || isExecutingLiveTrade}
-                                onClick={() => handleExecuteLiveOnChainTrade(opp)}
-                                className={`px-2.5 py-1 rounded-lg text-[10px] font-bold flex items-center gap-1 transition-all ${
-                                  forceTestExecution
-                                    ? 'bg-amber-600 hover:bg-amber-500 text-white cursor-pointer'
-                                    : 'bg-slate-800/90 text-slate-400 border border-amber-500/30 cursor-not-allowed opacity-90'
-                                }`}
-                                title={opp.profitGuardReason || 'Blocked by Profit Guard: Trade would lose money because pool fees exceed gross spread. Enable "Allow Test Call" in header to force test execution.'}
-                              >
-                                <Shield className="h-3 w-3 text-amber-400" />
-                                <span>{forceTestExecution ? 'Test Call' : 'Guard Blocked'}</span>
-                              </button>
-                            )}
+                            </td>
+                          </tr>
+                        ) : (
+                          displayOpportunities.map((opp, idx) => (
+                            <tr key={`${opp.id}-${opp.dexA}-${opp.dexB}-${idx}`} className="hover:bg-slate-800/40 transition-colors">
+                              <td className="py-3 px-3 whitespace-nowrap">
+                                <div className="text-white font-bold">{opp.chain}</div>
+                                <div className="text-[10px] text-slate-400">{opp.timestamp}</div>
+                              </td>
+                              <td className="py-3 px-3">
+                                <div className="text-cyan-300 font-bold flex items-center gap-1.5">
+                                  <span>{opp.token}</span>
+                                  <span className="text-[9px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">
+                                    {opp.category}
+                                  </span>
+                                </div>
+                                <div className="text-[10px] text-slate-400">{opp.tokenName}</div>
+                              </td>
+                              <td className="py-3 px-3">
+                                <div className="text-white font-bold">{opp.loanAmount}</div>
+                                <div className="text-[10px] text-emerald-400">{opp.loanProvider}</div>
+                                {opp.priceImpactBps !== undefined && (
+                                  <div className="text-[9px] text-slate-500">Slippage: ~{opp.priceImpactBps} bps</div>
+                                )}
+                              </td>
+                              <td className="py-3 px-3 whitespace-nowrap">
+                                <div className="text-emerald-400 font-bold">+{opp.spreadBps.toFixed(1)} bps</div>
+                                <div className="text-[9px] text-slate-500">Pool Fee: {(opp.dexFeeBps ?? 35).toFixed(1)} bps</div>
+                              </td>
+                              <td className="py-3 px-3">
+                                <div className="flex items-center gap-1 text-slate-300">
+                                  <span>{opp.dexA}</span>
+                                  <ArrowRight className="h-3 w-3 text-cyan-400 shrink-0" />
+                                  <span>{opp.dexB}</span>
+                                </div>
+                              </td>
+                              <td className="py-3 px-3 whitespace-nowrap">
+                                <div className="text-slate-300 font-bold">{opp.revmGas.toLocaleString()} gas</div>
+                                <div className="text-[10px] text-cyan-400">-{opp.gasSavingsPercent}% Least Gas</div>
+                                <div className="text-[9px] text-slate-500">${opp.gasCostUsd.toFixed(3)} L2 fee</div>
+                              </td>
+                              <td className="py-3 px-3 whitespace-nowrap">
+                                {opp.isProfitable ? (
+                                  <div>
+                                    <div className="font-bold text-emerald-400">+${opp.netProfitUsd.toFixed(2)}</div>
+                                    <div className="text-[10px] text-emerald-300 font-bold flex items-center gap-0.5">
+                                      <CheckCircle2 className="h-3 w-3" />
+                                      <span>Profit Guard Cleared</span>
+                                    </div>
+                                  </div>
+                                ) : (
+                                  <div>
+                                    <div className="font-bold text-rose-400">-${Math.abs(opp.netProfitUsd).toFixed(2)}</div>
+                                    <div className="text-[10px] text-amber-400 font-bold flex items-center gap-0.5" title={opp.profitGuardReason}>
+                                      <Shield className="h-3 w-3" />
+                                      <span>Blocked: Zero Loss</span>
+                                    </div>
+                                  </div>
+                                )}
+                              </td>
+                              <td className="py-3 px-3 whitespace-nowrap">
+                                <div className="flex items-center gap-1.5">
+                                  {opp.isProfitable ? (
+                                    <button
+                                      type="button"
+                                      disabled={isExecutingLiveTrade}
+                                      onClick={() => handleExecuteLiveOnChainTrade(opp)}
+                                      className="px-2.5 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-[10px] font-bold flex items-center gap-1 cursor-pointer transition-all shadow-md disabled:opacity-50 whitespace-nowrap"
+                                      title="Broadcast live verified flash loan arbitrage on-chain now"
+                                    >
+                                      <Zap className="h-3 w-3 fill-current text-white" />
+                                      <span>Broadcast Live</span>
+                                    </button>
+                                  ) : (
+                                    <button
+                                      type="button"
+                                      disabled={!forceTestExecution || isExecutingLiveTrade}
+                                      onClick={() => handleExecuteLiveOnChainTrade(opp)}
+                                      className={`px-2.5 py-1 rounded-lg text-[10px] font-bold flex items-center gap-1 transition-all whitespace-nowrap ${
+                                        forceTestExecution
+                                          ? 'bg-amber-600 hover:bg-amber-500 text-white cursor-pointer'
+                                          : 'bg-slate-800/90 text-slate-400 border border-amber-500/30 cursor-not-allowed opacity-90'
+                                      }`}
+                                      title={opp.profitGuardReason || 'Blocked by Profit Guard: Enable "Allow Test Call" above to force test execution.'}
+                                    >
+                                      <Shield className="h-3 w-3 text-amber-400" />
+                                      <span>{forceTestExecution ? 'Test Call' : 'Guard Blocked'}</span>
+                                    </button>
+                                  )}
 
-                            <button
-                              type="button"
-                              onClick={() => {
-                                setSimToken(opp.token);
-                                setSimSpreadBps(opp.spreadBps);
-                                setActiveSubTab('SIMULATOR');
-                                handleRunSimulation();
-                              }}
-                              className="px-2 py-1 rounded-lg bg-cyan-500/20 hover:bg-cyan-500/30 border border-cyan-400/40 text-cyan-300 text-[10px] font-bold flex items-center gap-1 cursor-pointer transition-all"
-                              title="Load into revm sizer"
-                            >
-                              <span>Size & Test</span>
-                            </button>
-                          </div>
-                        </td>
-                      </tr>
-                    ));
-                  })()}
-                </tbody>
-              </table>
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      setSimToken(opp.token);
+                                      setSimSpreadBps(opp.spreadBps);
+                                      setActiveSubTab('SIMULATOR');
+                                      handleRunSimulation();
+                                    }}
+                                    className="px-2 py-1 rounded-lg bg-cyan-500/20 hover:bg-cyan-500/30 border border-cyan-400/40 text-cyan-300 text-[10px] font-bold flex items-center gap-1 cursor-pointer transition-all whitespace-nowrap"
+                                    title="Load into revm sizer"
+                                  >
+                                    <span>Size &amp; Test</span>
+                                  </button>
+                                </div>
+                              </td>
+                            </tr>
+                          ))
+                        )}
+                      </tbody>
+                    </table>
+
+                    {filteredOpps.length > 20 && (
+                      <div className="flex items-center justify-between pt-3 border-t border-slate-800/80 text-xs font-mono text-slate-400">
+                        <span>
+                          Showing {displayOpportunities.length} of {filteredOpps.length} evaluated cross-DEX routes
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => setShowAllOpportunities((v) => !v)}
+                          className="px-3 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-cyan-300 font-bold cursor-pointer transition-colors"
+                        >
+                          {showAllOpportunities ? 'Show Top 20 Only' : `Show All ${filteredOpps.length} Routes`}
+                        </button>
+                      </div>
+                    )}
+                  </>
+                );
+              })()}
             </div>
           </div>
 
-          {/* Live Monitored DEX Liquidity Pools Matrix (24 On-Chain Pools Active) */}
-          <div className="p-5 rounded-2xl bg-slate-900 border border-slate-800 space-y-4">
+          {/* Live Monitored DEX Liquidity Pools Matrix */}
+          <div ref={poolsMatrixRef} className="p-5 rounded-2xl bg-slate-900 border border-slate-800 space-y-4">
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div className="space-y-1">
                 <div className="flex items-center gap-2">
                   <h3 className="text-sm font-bold text-white font-mono uppercase tracking-wider flex items-center gap-2">
                     <Database className="h-4 w-4 text-emerald-400" />
-                    Live Monitored Liquidity Pools ({agentMonitoredPools.length || 70} Pools Active)
+                    Live Monitored Liquidity Pools — {targetChainConfig.name} ({agentMonitoredPools.length} Pools Active)
                   </h3>
                   <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
-                    {agentMonitoredPools.length || 70} Pools Synchronized
+                    {agentMonitoredPools.length} Pools Synchronized
                   </span>
                 </div>
                 <p className="text-xs text-slate-400 font-mono">
-                  Real-time Arbitrum One pool reserves & slot0 prices streamed via Multicall3 across Uniswap V3, PancakeSwap V3, SushiSwap V3, Sushiswap V2, Camelot V2, and Camelot V3.
+                  Real-time {targetChainConfig.name} pool reserves &amp; slot0 prices streamed via Multicall3 across{' '}
+                  {selectedChain === 'base'
+                    ? 'Uniswap V3, Aerodrome Slipstream, PancakeSwap V3, SushiSwap V3, Uniswap V2, Sushiswap V2 & BaseSwap V2'
+                    : selectedChain === 'optimism'
+                    ? 'Uniswap V3, Velodrome Slipstream, SushiSwap V3, Uniswap V2 & Sushiswap V2'
+                    : 'Uniswap V3, PancakeSwap V3, SushiSwap V3, Sushiswap V2, Camelot V2 & Camelot V3'}.
                 </p>
               </div>
 
@@ -3955,13 +4645,12 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
                     onChange={(e) => setPoolProtocolFilter(e.target.value)}
                     className="bg-transparent text-cyan-300 font-bold focus:outline-none cursor-pointer"
                   >
-                    <option value="ALL">All Protocols (6 DEXes)</option>
-                    <option value="Uniswap V3">Uniswap V3</option>
-                    <option value="PancakeSwap V3">PancakeSwap V3</option>
-                    <option value="SushiSwap V3">SushiSwap V3</option>
-                    <option value="Sushiswap V2">Sushiswap V2</option>
-                    <option value="Camelot V2">Camelot V2</option>
-                    <option value="Camelot V3">Camelot V3 (Algebra)</option>
+                    <option value="ALL">All Protocols ({agentMonitoredPools.length} Pools)</option>
+                    {Array.from(new Set(agentMonitoredPools.map((p) => p.dex))).map((dexName) => (
+                      <option key={dexName} value={dexName}>
+                        {dexName}
+                      </option>
+                    ))}
                   </select>
                 </div>
               </div>
@@ -3969,142 +4658,137 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
 
             {/* Pools Table */}
             <div className="overflow-x-auto">
-              <table className="w-full text-left text-xs font-mono">
-                <thead className="bg-slate-950/60 text-slate-400 text-[11px] uppercase">
-                  <tr>
-                    <th className="py-2.5 px-3">Pool & Protocol</th>
-                    <th className="py-2.5 px-3">Pair</th>
-                    <th className="py-2.5 px-3">Fee Tier</th>
-                    <th className="py-2.5 px-3">Live Price / Rate</th>
-                    <th className="py-2.5 px-3">Liquidity Depth & Invariant</th>
-                    <th className="py-2.5 px-3">Verified Contract</th>
-                    <th className="py-2.5 px-3 text-right">Action</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-800">
-                  {(() => {
-                    const poolsToRender = (agentMonitoredPools.length > 0
-                      ? agentMonitoredPools
-                      : [
-                          { id: 'p1', name: 'Uniswap V3 WETH/USDC (0.05%)', dex: 'Uniswap V3', pair: 'WETH/USDC', feeTierPercent: 0.05, priceUsd: 2362.50, depthSummary: '$85.4M Liquidity (Tick Clustered)', poolAddress: '0xC6962004f452bE9203591991D15f6b388e09E8D0' },
-                          { id: 'p2', name: 'Uniswap V3 WETH/USDC (0.30%)', dex: 'Uniswap V3', pair: 'WETH/USDC', feeTierPercent: 0.30, priceUsd: 2363.45, depthSummary: '$18.2M Liquidity (Broad)', poolAddress: '0xc473e2aEE3441BF9240Be85eb122aBB059A3B57c' },
-                          { id: 'p3', name: 'Uniswap V3 WETH/USDC (0.01% Peg)', dex: 'Uniswap V3', pair: 'WETH/USDC', feeTierPercent: 0.01, priceUsd: 2362.30, depthSummary: '$31.8M Concentrated', poolAddress: '0x8fe3922B7f525593033B79d618808d63164C91f8' },
-                          { id: 'p4', name: 'Camelot V3 WETH/USDC (Algebra Dynamic)', dex: 'Camelot V3', pair: 'WETH/USDC', feeTierPercent: 0.08, priceUsd: 2364.15, depthSummary: '$24.6M Adaptive Volatility Depth', poolAddress: '0x521e2d3122c60868f7F2b1dF6f0F01B6c90866a1' },
-                          { id: 'p5', name: 'PancakeSwap V3 WETH/USDC (0.05%)', dex: 'PancakeSwap V3', pair: 'WETH/USDC', feeTierPercent: 0.05, priceUsd: 2361.90, depthSummary: '$9.2M Liquidity Depth', poolAddress: '0x6a0f0B8B082Db14032ceae251141703274bE348F' },
-                          { id: 'p6', name: 'Sushiswap V2 WETH/USDC (0.30%)', dex: 'Sushiswap V2', pair: 'WETH/USDC', feeTierPercent: 0.30, priceUsd: 2365.10, depthSummary: '$165K Reserves (Constant Product)', poolAddress: '0x905dfCD5649217c42684f23958568e533C711Aa3' },
-                          { id: 'p7', name: 'Trader Joe V2.1 WETH/USDC (LB Bins)', dex: 'Trader Joe V2.1', pair: 'WETH/USDC', feeTierPercent: 0.08, priceUsd: 2363.20, depthSummary: '$4.1M Discretized Bin Reserves', poolAddress: '0x9482759E66c28fB0be9a97b84770258CbBE4C5E3' },
-                          { id: 'p8', name: 'Uniswap V3 WETH/USDT (0.05%)', dex: 'Uniswap V3', pair: 'WETH/USDT', feeTierPercent: 0.05, priceUsd: 2362.10, depthSummary: '$12.4M Liquidity', poolAddress: '0x641C00A822e8b671738d32a431a4Fb6074E5c79d' },
-                          { id: 'p9', name: 'Sushiswap V2 WETH/USDT (0.30%)', dex: 'Sushiswap V2', pair: 'WETH/USDT', feeTierPercent: 0.30, priceUsd: 2364.50, depthSummary: '$340K Reserves (CPMM)', poolAddress: '0xcb0e14E6d3D9206eA2ff3c5B610F5570d7c66C52' },
-                          { id: 'p10', name: 'Uniswap V3 ARB/USDC (0.05%)', dex: 'Uniswap V3', pair: 'ARB/USDC', feeTierPercent: 0.05, priceUsd: 0.5820, depthSummary: '$6.8M Liquidity', poolAddress: '0xb0f6cA40411360c03d41C5fFc5F179b8403CdcF8' },
-                          { id: 'p11', name: 'Camelot V3 ARB/USDC (Dynamic)', dex: 'Camelot V3', pair: 'ARB/USDC', feeTierPercent: 0.12, priceUsd: 0.5835, depthSummary: '$8.3M Native Arbitrum Depth', poolAddress: '0x49b3100db32eeEA402Db38D17be80d34608feB1B' },
-                          { id: 'p12', name: 'Uniswap V3 ARB/WETH (0.05%)', dex: 'Uniswap V3', pair: 'ARB/WETH', feeTierPercent: 0.05, priceUsd: 0.5820, depthSummary: '$14.2M High-Velocity Pool', poolAddress: '0xc6f780497a95E246EB15C999e6047f378aa6BD0f' },
-                          { id: 'p13', name: 'Sushiswap V2 ARB/WETH (0.30%)', dex: 'Sushiswap V2', pair: 'ARB/WETH', feeTierPercent: 0.30, priceUsd: 0.5840, depthSummary: '$520K AMM Pool', poolAddress: '0xb63Cb030A6c0b3952D7Ee46808feF3F4C65306Db' },
-                          { id: 'p14', name: 'Uniswap V3 WBTC/WETH (0.05%)', dex: 'Uniswap V3', pair: 'WBTC/WETH', feeTierPercent: 0.05, priceUsd: 87058.00, depthSummary: '$48.1M Whale Pool', poolAddress: '0x2F5e87C931236685D116c6633Be839756C7423C1' },
-                          { id: 'p15', name: 'Sushiswap V2 WBTC/WETH (0.30%)', dex: 'Sushiswap V2', pair: 'WBTC/WETH', feeTierPercent: 0.30, priceUsd: 87110.00, depthSummary: '$1.2M CPMM Reserves', poolAddress: '0x0C1439e048991244e7e05Ef1a3C442e48184903F' },
-                          { id: 'p16', name: 'Uniswap V3 LINK/WETH (0.30%)', dex: 'Uniswap V3', pair: 'LINK/WETH', feeTierPercent: 0.30, priceUsd: 14.12, depthSummary: '$11.6M Oracle Anchor Pool', poolAddress: '0xaa23638fB52BA8fdE26684605B2b00f114660282' },
-                          { id: 'p17', name: 'Camelot V3 LINK/WETH (Dynamic)', dex: 'Camelot V3', pair: 'LINK/WETH', feeTierPercent: 0.25, priceUsd: 14.18, depthSummary: '$3.8M Ecosystem Pool', poolAddress: '0x8B30f5a91F163810c98f82F2540b991f9A149A70' },
-                          { id: 'p18', name: 'Uniswap V3 GMX/WETH (0.30%)', dex: 'Uniswap V3', pair: 'GMX/WETH', feeTierPercent: 0.30, priceUsd: 28.58, depthSummary: '$15.9M Perpetual Liquidity', poolAddress: '0x80a9aE39310ABf62E334124646bD211A234C2075' },
-                          { id: 'p19', name: 'Uniswap V3 wstETH/WETH (0.01%)', dex: 'Uniswap V3', pair: 'wstETH/WETH', feeTierPercent: 0.01, priceUsd: 2774.20, depthSummary: '$62.4M Lido Staked ETH Depth', poolAddress: '0x35218a1cBa37f6439907359B3466D5300B54E372' },
-                          { id: 'p20', name: 'Balancer V2 wstETH/WETH Composable (0% Flash)', dex: 'Balancer V2', pair: 'wstETH/WETH', feeTierPercent: 0.04, priceUsd: 2775.10, depthSummary: '$88.7M Zero-Fee Flash Vault', poolAddress: '0xBA12222222228d8Ba445958a75a0704d566BF2C8' },
-                          { id: 'p21', name: 'Curve 2pool USDC/USDT (Amplified A=200)', dex: 'Curve Finance', pair: 'USDC/USDT', feeTierPercent: 0.04, priceUsd: 1.0001, depthSummary: '$44.5M Stableswap Invariant', poolAddress: '0x7f90122BF0700F9E7e1F688fe926940E8839F353' },
-                          { id: 'p22', name: 'Uniswap V3 DAI/USDC (0.01%)', dex: 'Uniswap V3', pair: 'DAI/USDC', feeTierPercent: 0.01, priceUsd: 0.9998, depthSummary: '$16.2M Pegged Pool', poolAddress: '0xA7C2954DB36894C2514CDBeb6f758f6236B328a2' },
-                          { id: 'p23', name: 'Curve Tricrypto (USDT/WBTC/WETH)', dex: 'Curve Finance', pair: 'WETH/USDT', feeTierPercent: 0.04, priceUsd: 2363.90, depthSummary: '$28.3M Tricrypto Volatile Curve', poolAddress: '0x960ea3e3C7FB317332d990873d354E18d7645590' },
-                          { id: 'p24', name: 'Uniswap V3 SOL/USDC (0.30%)', dex: 'Uniswap V3', pair: 'SOL/USDC', feeTierPercent: 0.30, priceUsd: 178.40, depthSummary: '$7.4M Solana Cross-Chain Liquidity', poolAddress: '0x5E7992CB3e43ddf123D2f2D93e5066917E761Da6' },
-                        ]
-                    ).filter((p) => {
-                      const matchesSearch = !poolSearchQuery ||
-                        p.name.toLowerCase().includes(poolSearchQuery.toLowerCase()) ||
-                        p.pair.toLowerCase().includes(poolSearchQuery.toLowerCase()) ||
-                        p.dex.toLowerCase().includes(poolSearchQuery.toLowerCase());
-                      const matchesProtocol = poolProtocolFilter === 'ALL' || p.dex.toLowerCase().includes(poolProtocolFilter.toLowerCase());
-                      return matchesSearch && matchesProtocol;
-                    });
+              {(() => {
+                const poolsToRender = agentMonitoredPools.filter((p) => {
+                  const matchesSearch = !poolSearchQuery ||
+                    p.name.toLowerCase().includes(poolSearchQuery.toLowerCase()) ||
+                    p.pair.toLowerCase().includes(poolSearchQuery.toLowerCase()) ||
+                    p.dex.toLowerCase().includes(poolSearchQuery.toLowerCase());
+                  const matchesProtocol = poolProtocolFilter === 'ALL' || p.dex.toLowerCase().includes(poolProtocolFilter.toLowerCase());
+                  return matchesSearch && matchesProtocol;
+                });
 
-                    if (poolsToRender.length === 0) {
-                      return (
+                const displayedPools = showAllPools ? poolsToRender : poolsToRender.slice(0, 20);
+
+                return (
+                  <>
+                    <table className="w-full text-left text-xs font-mono">
+                      <thead className="bg-slate-950/60 text-slate-400 text-[11px] uppercase">
                         <tr>
-                          <td colSpan={7} className="py-8 text-center text-slate-500 font-mono text-xs">
-                            No pools matched your filter criteria. Try adjusting the search query or protocol filter.
-                          </td>
+                          <th className="py-2.5 px-3">Pool &amp; Protocol</th>
+                          <th className="py-2.5 px-3">Pair</th>
+                          <th className="py-2.5 px-3">Fee Tier</th>
+                          <th className="py-2.5 px-3">Live Price / Rate</th>
+                          <th className="py-2.5 px-3">Liquidity Depth &amp; Invariant</th>
+                          <th className="py-2.5 px-3">Verified Contract</th>
+                          <th className="py-2.5 px-3 text-right">Action</th>
                         </tr>
-                      );
-                    }
+                      </thead>
+                      <tbody className="divide-y divide-slate-800">
+                        {displayedPools.length === 0 ? (
+                          <tr>
+                            <td colSpan={7} className="py-8 text-center text-slate-500 font-mono text-xs">
+                              {agentMonitoredPools.length === 0
+                                ? agentScanError
+                                  ? `RPC scan warning on ${targetChainConfig.name}: ${agentScanError}`
+                                  : `Querying live ${targetChainConfig.name} pools via Multicall3...`
+                                : 'No pools matched your filter criteria. Try adjusting the search query or protocol filter.'}
+                            </td>
+                          </tr>
+                        ) : (
+                          displayedPools.map((pool, pIdx) => {
+                            const dexBadgeColor = pool.dex.includes('Uniswap')
+                              ? 'bg-pink-500/10 text-pink-300 border-pink-500/30'
+                              : pool.dex.includes('Camelot')
+                              ? 'bg-amber-500/10 text-amber-300 border-amber-500/30'
+                              : pool.dex.includes('Aerodrome') || pool.dex.includes('Velodrome')
+                              ? 'bg-sky-500/10 text-sky-300 border-sky-500/30'
+                              : pool.dex.includes('Sushi')
+                              ? 'bg-purple-500/10 text-purple-300 border-purple-500/30'
+                              : pool.dex.includes('Pancake')
+                              ? 'bg-yellow-500/10 text-yellow-300 border-yellow-500/30'
+                              : pool.dex.includes('BaseSwap')
+                              ? 'bg-blue-500/10 text-blue-300 border-blue-500/30'
+                              : 'bg-indigo-500/10 text-indigo-300 border-indigo-500/30';
 
-                    return poolsToRender.map((pool, pIdx) => {
-                      const dexBadgeColor = pool.dex.includes('Uniswap')
-                        ? 'bg-pink-500/10 text-pink-300 border-pink-500/30'
-                        : pool.dex.includes('Camelot')
-                        ? 'bg-amber-500/10 text-amber-300 border-amber-500/30'
-                        : pool.dex.includes('Sushi')
-                        ? 'bg-purple-500/10 text-purple-300 border-purple-500/30'
-                        : pool.dex.includes('Pancake')
-                        ? 'bg-yellow-500/10 text-yellow-300 border-yellow-500/30'
-                        : pool.dex.includes('Curve')
-                        ? 'bg-cyan-500/10 text-cyan-300 border-cyan-500/30'
-                        : pool.dex.includes('Balancer')
-                        ? 'bg-emerald-500/10 text-emerald-300 border-emerald-500/30'
-                        : 'bg-indigo-500/10 text-indigo-300 border-indigo-500/30';
+                            const token0 = pool.pair.split('/')[0];
 
-                      const token0 = pool.pair.split('/')[0];
+                            return (
+                              <tr key={`${pool.id || pool.poolAddress}-${pIdx}`} className="hover:bg-slate-800/40 transition-colors">
+                                <td className="py-2.5 px-3">
+                                  <div className="flex items-center gap-2">
+                                    <span className={`px-2 py-0.5 rounded text-[10px] font-bold border whitespace-nowrap ${dexBadgeColor}`}>
+                                      {pool.dex}
+                                    </span>
+                                    <span className="text-white font-bold">{pool.name.replace(` (${(pool.feeTierPercent || 0.05)}%)`, '')}</span>
+                                  </div>
+                                </td>
+                                <td className="py-2.5 px-3 whitespace-nowrap">
+                                  <span className="font-bold text-cyan-300">{pool.pair}</span>
+                                </td>
+                                <td className="py-2.5 px-3 whitespace-nowrap">
+                                  <span className="px-1.5 py-0.5 rounded bg-slate-800 text-slate-300 text-[10px] font-bold border border-slate-700">
+                                    {pool.feeTierPercent}%
+                                  </span>
+                                </td>
+                                <td className="py-2.5 px-3 whitespace-nowrap">
+                                  <span className="font-bold text-emerald-400">
+                                    ${pool.priceUsd >= 10 ? pool.priceUsd.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : pool.priceUsd.toFixed(4)}
+                                  </span>
+                                </td>
+                                <td className="py-2.5 px-3 text-slate-300 text-[11px]">
+                                  {pool.depthSummary}
+                                </td>
+                                <td className="py-2.5 px-3 whitespace-nowrap">
+                                  <a
+                                    href={`${targetChainConfig.explorer}/address/${pool.poolAddress}`}
+                                    target="_blank"
+                                    rel="noreferrer"
+                                    className="text-slate-400 hover:text-cyan-300 flex items-center gap-1 text-[11px]"
+                                    title={`View pool contract on ${targetChainConfig.name} explorer`}
+                                  >
+                                    <span>{formatShortAddress(pool.poolAddress)}</span>
+                                    <ExternalLink className="h-2.5 w-2.5 text-slate-500" />
+                                  </a>
+                                </td>
+                                <td className="py-2.5 px-3 text-right whitespace-nowrap">
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      setSimToken(token0);
+                                      setActiveSubTab('SIMULATOR');
+                                      handleRunSimulation();
+                                    }}
+                                    className="px-2 py-1 rounded bg-slate-800 hover:bg-cyan-500/20 text-slate-300 hover:text-cyan-300 border border-slate-700 text-[10px] font-bold transition-all cursor-pointer whitespace-nowrap"
+                                    title={`Inspect ${token0} in revm sizer`}
+                                  >
+                                    Inspect in Sizer
+                                  </button>
+                                </td>
+                              </tr>
+                            );
+                          })
+                        )}
+                      </tbody>
+                    </table>
 
-                      return (
-                        <tr key={`${pool.id || pool.poolAddress}-${pIdx}`} className="hover:bg-slate-800/40 transition-colors">
-                          <td className="py-2.5 px-3">
-                            <div className="flex items-center gap-2">
-                              <span className={`px-2 py-0.5 rounded text-[10px] font-bold border ${dexBadgeColor}`}>
-                                {pool.dex}
-                              </span>
-                              <span className="text-white font-bold">{pool.name.replace(` (${(pool.feeTierPercent || 0.05)}%)`, '')}</span>
-                            </div>
-                          </td>
-                          <td className="py-2.5 px-3">
-                            <span className="font-bold text-cyan-300">{pool.pair}</span>
-                          </td>
-                          <td className="py-2.5 px-3">
-                            <span className="px-1.5 py-0.5 rounded bg-slate-800 text-slate-300 text-[10px] font-bold border border-slate-700">
-                              {pool.feeTierPercent}%
-                            </span>
-                          </td>
-                          <td className="py-2.5 px-3">
-                            <span className="font-bold text-emerald-400">
-                              ${pool.priceUsd >= 1 ? pool.priceUsd.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : pool.priceUsd.toFixed(4)}
-                            </span>
-                          </td>
-                          <td className="py-2.5 px-3 text-slate-300 text-[11px]">
-                            {pool.depthSummary}
-                          </td>
-                          <td className="py-2.5 px-3">
-                            <a
-                              href={`https://arbiscan.io/address/${pool.poolAddress}`}
-                              target="_blank"
-                              rel="noreferrer"
-                              className="text-slate-400 hover:text-cyan-300 flex items-center gap-1 text-[11px]"
-                              title="View pool contract on Arbiscan"
-                            >
-                              <span>{formatShortAddress(pool.poolAddress)}</span>
-                              <ExternalLink className="h-2.5 w-2.5 text-slate-500" />
-                            </a>
-                          </td>
-                          <td className="py-2.5 px-3 text-right">
-                            <button
-                              type="button"
-                              onClick={() => {
-                                setSimToken(token0);
-                                setActiveSubTab('SIMULATOR');
-                                handleRunSimulation();
-                              }}
-                              className="px-2 py-1 rounded bg-slate-800 hover:bg-cyan-500/20 text-slate-300 hover:text-cyan-300 border border-slate-700 text-[10px] font-bold transition-all cursor-pointer"
-                              title={`Inspect ${token0} in revm sizer`}
-                            >
-                              Inspect in Sizer
-                            </button>
-                          </td>
-                        </tr>
-                      );
-                    });
-                  })()}
-                </tbody>
-              </table>
+                    {poolsToRender.length > 20 && (
+                      <div className="flex items-center justify-between pt-3 border-t border-slate-800/80 text-xs font-mono text-slate-400">
+                        <span>
+                          Showing {displayedPools.length} of {poolsToRender.length} pools on {targetChainConfig.name}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => setShowAllPools((v) => !v)}
+                          className="px-3 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-cyan-300 font-bold cursor-pointer transition-colors"
+                        >
+                          {showAllPools ? 'Show Top 20 Only' : `Show All ${poolsToRender.length} Pools`}
+                        </button>
+                      </div>
+                    )}
+                  </>
+                );
+              })()}
             </div>
           </div>
         </div>
@@ -4122,7 +4806,7 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
                   Flash Loan Sizer & Router
                 </h3>
                 <span className="text-[11px] text-slate-400 font-mono">
-                  {ARB_TOKENS.length} Tokens · 24 Pools · 4 Gas Architectures
+                  {ARB_TOKENS.length} Tokens · {agentMonitoredPools.length || (agentCountsByChain?.[selectedChain] ?? 70)} Live Pools · 4 Gas Architectures
                 </span>
               </div>
               <span className={`text-[10px] font-mono px-2 py-0.5 rounded border ${currentFlashProvider.badgeColor}`}>
@@ -4162,7 +4846,7 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
                       className={`p-1.5 rounded-xl border text-left cursor-pointer transition-all ${
                         simToken === tok.symbol
                           ? 'bg-cyan-500/20 border-cyan-400 text-cyan-300 font-bold shadow-sm'
-                          : 'bg-slate-950/60 border-slate-800 text-slate-400 hover:text-white hover:bg-slate-850'
+                          : 'bg-slate-950/60 border-slate-800 text-slate-400 hover:text-white hover:bg-slate-800/80'
                       }`}
                     >
                       <div className="text-xs font-mono flex items-center justify-between">
@@ -4234,7 +4918,7 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
                 </div>
               </div>
 
-              {/* 4. DEX Route Selectors (13 Supported Pools) */}
+              {/* 4. DEX Route Selectors */}
               <div className="grid grid-cols-2 gap-3">
                 <div>
                   <label className="text-xs font-mono text-slate-400 block mb-1">Buy DEX (Low Price)</label>
@@ -4558,7 +5242,7 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
                       <div>
                         <div className="text-xs font-bold text-white uppercase tracking-wider flex items-center gap-2">
                           <span>Live On-Chain Arbitrage Broadcast</span>
-                          <span className="px-1.5 py-0.2 rounded bg-emerald-500/20 text-emerald-300 text-[10px]">
+                          <span className="px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 text-[10px]">
                             {targetChainConfig.name}
                           </span>
                         </div>
@@ -4768,7 +5452,7 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
                   className={`w-full text-left px-3 py-2 rounded-xl text-xs font-mono transition-all flex items-center justify-between cursor-pointer ${
                     selectedFile === file
                       ? 'bg-cyan-500/20 border border-cyan-400/40 text-cyan-300 font-bold'
-                      : 'bg-slate-950/60 border border-slate-800/80 text-slate-400 hover:text-slate-200 hover:bg-slate-850'
+                      : 'bg-slate-950/60 border border-slate-800/80 text-slate-400 hover:text-slate-200 hover:bg-slate-800/80'
                   }`}
                 >
                   <div className="flex items-center gap-2 truncate">

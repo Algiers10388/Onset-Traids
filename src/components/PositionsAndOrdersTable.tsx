@@ -41,7 +41,7 @@ export const PositionsAndOrdersTable: React.FC<PositionsAndOrdersTableProps> = (
           >
             <Layers className="h-3.5 w-3.5" />
             <span>Open Positions</span>
-            <span className="ml-1 px-1.5 py-0.2 rounded-full bg-slate-900 text-[10px] font-mono text-slate-300 border border-slate-700">
+            <span className="ml-1 px-1.5 py-0.5 rounded-full bg-slate-900 text-[10px] font-mono text-slate-300 border border-slate-700">
               {positions.length}
             </span>
           </button>
@@ -56,7 +56,7 @@ export const PositionsAndOrdersTable: React.FC<PositionsAndOrdersTableProps> = (
           >
             <History className="h-3.5 w-3.5" />
             <span>Trade Execution Log</span>
-            <span className="ml-1 px-1.5 py-0.2 rounded-full bg-slate-900 text-[10px] font-mono text-slate-300 border border-slate-700">
+            <span className="ml-1 px-1.5 py-0.5 rounded-full bg-slate-900 text-[10px] font-mono text-slate-300 border border-slate-700">
               {orders.length}
             </span>
           </button>
@@ -107,7 +107,7 @@ export const PositionsAndOrdersTable: React.FC<PositionsAndOrdersTableProps> = (
                           <div className="font-bold text-white flex items-center gap-1.5">
                             {pos.symbol}
                             <span
-                              className={`text-[10px] px-1 py-0.2 rounded font-semibold ${
+                              className={`text-[10px] px-1 py-0.5 rounded font-semibold ${
                                 pos.leverage > 2
                                   ? 'bg-rose-500/20 text-rose-300'
                                   : 'bg-cyan-500/20 text-cyan-300'
@@ -115,11 +115,11 @@ export const PositionsAndOrdersTable: React.FC<PositionsAndOrdersTableProps> = (
                             >
                               {pos.leverage}x
                             </span>
-                            <span className="text-[10px] px-1.5 py-0.2 rounded bg-slate-800 text-slate-300 font-mono border border-slate-700">
+                            <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-300 font-mono border border-slate-700">
                               {pos.exchangeName || pos.exchange || 'Binance'}
                             </span>
                             {pos.isDynamicSized && (
-                              <span className="text-[9px] px-1.5 py-0.2 rounded bg-purple-500/20 text-purple-300 font-mono border border-purple-500/30">
+                              <span className="text-[9px] px-1.5 py-0.5 rounded bg-purple-500/20 text-purple-300 font-mono border border-purple-500/30">
                                 ATR Sized
                               </span>
                             )}
@@ -250,7 +250,7 @@ export const PositionsAndOrdersTable: React.FC<PositionsAndOrdersTableProps> = (
                               {ord.exchangeName || ord.exchange || 'Binance'}
                             </span>
                             {ord.savingsUsd && ord.savingsUsd > 0 && (
-                              <span className="text-[9px] px-1 py-0.2 rounded bg-emerald-500/20 text-emerald-300 font-mono">
+                              <span className="text-[9px] px-1 py-0.5 rounded bg-emerald-500/20 text-emerald-300 font-mono">
                                 +${ord.savingsUsd.toFixed(2)}
                               </span>
                             )}

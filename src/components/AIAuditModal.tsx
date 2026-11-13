@@ -42,7 +42,7 @@ export const AIAuditModal: React.FC<AIAuditModalProps> = ({
             <div>
               <h2 className="text-sm font-bold text-white tracking-wide flex items-center gap-2">
                 Gemini AI Strategy & Risk Audit
-                <span className="text-[10px] px-1.5 py-0.2 rounded bg-purple-950/60 text-purple-300 border border-purple-500/30 font-mono">
+                <span className="text-[10px] px-1.5 py-0.5 rounded bg-purple-950/60 text-purple-300 border border-purple-500/30 font-mono">
                   QUANT AUDITOR
                 </span>
               </h2>

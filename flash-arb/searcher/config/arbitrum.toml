@@ -65,6 +65,12 @@ GMX    = "0xfc5A1A6EB076a2C7aD06eD22C90d7E710E35ad0a"
 AAVE   = "0xba5DdD1f9d7F570dc94a51479a000E3BCE967196"
 PENDLE = "0x0c880f6761F1af8d9Aa9C466984b80DAb9a8c9e8"
 UNI    = "0xFa7F8980b0f1E64A2062791cc3b0871572f1F7f0"
+cbETH  = "0x1DEBd73E752bEaF79865Fd6446b0c970EaE7732f"
+ezETH  = "0x2416092f143378750bb29b79eD961ab195CcEea5"
+MAGIC  = "0x539bdE0d7Dbd336b79148AA742883198BBF60342"
+RDNT   = "0x3082CC23568eA640225c2467653dB90e9250AaA0"
+FRAX   = "0x17FC002b466eEc40DaE837Fc4bE5c67993ddBd6F"
+USDe   = "0x5d3a1Ff2b6BAb83b63cd9AD0787074081a52ef34"
 
 # Risk Controls & Circuit Breakers
 [risk]
@@ -74,7 +80,8 @@ daily_revert_loss_cap_usd = 75.00 # Kill switch if daily gas spent on reverts ex
 consecutive_failure_limit = 3      # Trip circuit breaker after 3 reverts
 simulation_engine = "revm"
 excluded_tokens = [
-    "0x5979D7b546E38E414F7E9822514be443A4800529", # wstETH (rebasing / price ratio complexities)
+    "0x5979D7b546E38E414F7E9822514be443A4800529", # wstETH (sweep-compatible only; excluded from arb swaps)
+    "0x211Cc4DD073734dA055fbF44a2b4667d5E5fE5d2", # sUSDe (ERC-4626 yield token; sweep-compatible only)
 ]
 
 # NOTE: [beneficiary]/[signer] below are informational only. The searcher reads FLASH_ARB_PROFIT_WALLET and FLASH_ARB_SIGNER_KEY from the environment.

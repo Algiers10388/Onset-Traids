@@ -420,7 +420,7 @@ export const OnChainWalletMonitor: React.FC<OnChainWalletMonitorProps> = ({
             <button
               onClick={handleExportCsv}
               disabled={!profile}
-              className="px-3.5 py-2 rounded-xl bg-slate-800/80 hover:bg-slate-750 border border-slate-700 text-slate-200 text-xs font-mono font-bold transition-all flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+              className="px-3.5 py-2 rounded-xl bg-slate-800/80 hover:bg-slate-700 border border-slate-700 text-slate-200 text-xs font-mono font-bold transition-all flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
             >
               <FileSpreadsheet className="h-3.5 w-3.5 text-emerald-400" />
               <span>Export CSV</span>
@@ -622,7 +622,7 @@ export const OnChainWalletMonitor: React.FC<OnChainWalletMonitorProps> = ({
               <button
                 onClick={handleToggleBookmark}
                 title={user ? (isBookmarked ? 'Remove from Firestore' : 'Save to Firestore') : 'Sign in to Bookmark'}
-                className="flex items-center gap-1 text-xs font-mono text-slate-300 hover:text-white cursor-pointer px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-750 border border-slate-700"
+                className="flex items-center gap-1 text-xs font-mono text-slate-300 hover:text-white cursor-pointer px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 border border-slate-700"
               >
                 {isBookmarked ? (
                   <>
@@ -712,7 +712,7 @@ export const OnChainWalletMonitor: React.FC<OnChainWalletMonitorProps> = ({
         >
           <ShieldCheck className="w-4 h-4 text-emerald-400" />
           <span>Privacy Asset Processor (XMR · XLA · QRL · TARI)</span>
-          <span className="ml-1 px-1.5 py-0.2 rounded-full bg-emerald-500/20 text-emerald-300 text-[10px] font-bold border border-emerald-500/30">
+          <span className="ml-1 px-1.5 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 text-[10px] font-bold border border-emerald-500/30">
             RingCT / XMSS
           </span>
         </button>
@@ -1001,7 +1001,7 @@ export const OnChainWalletMonitor: React.FC<OnChainWalletMonitorProps> = ({
                     {tx.direction === 'IN' ? '+' : '-'}{formatCurrency(tx.valueUsd)}
                   </div>
                   <div className="text-[11px] text-slate-400">Gas Paid: ${tx.feeUsd.toFixed(2)}</div>
-                  <span className="inline-block mt-1 px-1.5 py-0.2 rounded bg-emerald-950 text-emerald-300 text-[10px] font-bold border border-emerald-500/40">
+                  <span className="inline-block mt-1 px-1.5 py-0.5 rounded bg-emerald-950 text-emerald-300 text-[10px] font-bold border border-emerald-500/40">
                     Confirmed
                   </span>
                 </div>

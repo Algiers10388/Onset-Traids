@@ -321,7 +321,7 @@ export const SentimentAnalysisPanel: React.FC<SentimentAnalysisPanelProps> = ({
                   <div className="flex items-center justify-between">
                     <div className="flex items-center gap-2">
                       <strong className="text-sm font-sans text-white">{sym}</strong>
-                      <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-slate-900 border border-slate-800 text-slate-400">
+                      <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-slate-900 border border-slate-800 text-slate-400">
                         {item.sampleCount} signals
                       </span>
                     </div>

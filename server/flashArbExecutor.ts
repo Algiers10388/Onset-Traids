@@ -1,26 +1,78 @@
 import { ethers } from 'ethers';
 
+export type ErcStandard =
+  | 'ERC-20'
+  | 'ERC-2612'
+  | 'ERC-4626'
+  | 'ERC-777'
+  | 'ERC-721'
+  | 'ERC-1155'
+  | 'UNKNOWN';
+
 export interface ArbitrumTokenInfo {
   sym: string;
   addr: string;
   dec: number;
+  ercStandard?: ErcStandard;
+  tokenId?: string;
+  arbCompatible?: boolean;
+  sweepCompatible?: boolean;
+  walletSweepCompatible?: boolean;
+  compatibilityNote?: string;
 }
 
+export type SupportedArbChain = 'arbitrum' | 'base' | 'optimism';
+
 export const ARBITRUM_TOKENS: Record<string, ArbitrumTokenInfo> = {
-  WETH: { sym: 'WETH', addr: '0x82aF49447D8a07e3bd95BD0d56f35241523fBab1', dec: 18 },
-  USDC: { sym: 'USDC', addr: '0xaf88d065e77c8cC2239327C5EDb3A432268e5831', dec: 6 },
-  USDCe: { sym: 'USDC.e', addr: '0xFF970A61A04b1cA14834A43f5dE4533eBDDB5CC8', dec: 6 },
-  USDT: { sym: 'USDT', addr: '0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9', dec: 6 },
-  DAI: { sym: 'DAI', addr: '0xDA10009cBd5D07dd0CeCc66161FC93D7c9000da1', dec: 18 },
-  ARB: { sym: 'ARB', addr: '0x912CE59144191C1204E64559FE8253a0e49E6548', dec: 18 },
-  WBTC: { sym: 'WBTC', addr: '0x2f2a2543B76A4166549F7aaB2e75Bef0aefC5B0f', dec: 8 },
-  LINK: { sym: 'LINK', addr: '0xf97f4df75117a78c1A5a0DBb814Af92458539FB4', dec: 18 },
-  GMX: { sym: 'GMX', addr: '0xfc5A1A6EB076a2C7aD06eD22C90d7E710E35ad0a', dec: 18 },
-  AAVE: { sym: 'AAVE', addr: '0xba5DdD1f9d7F570dc94a51479a000E3BCE967196', dec: 18 },
-  PENDLE: { sym: 'PENDLE', addr: '0x0c880f6761F1af8d9Aa9C466984b80DAb9a8c9e8', dec: 18 },
-  UNI: { sym: 'UNI', addr: '0xFa7F8980b0f1E64A2062791cc3b0871572f1F7f0', dec: 18 },
-  wstETH: { sym: 'wstETH', addr: '0x5979D7b546E38E414F7E9822514be443A4800529', dec: 18 },
+  WETH: { sym: 'WETH', addr: '0x82aF49447D8a07e3bd95BD0d56f35241523fBab1', dec: 18, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 (WETH9) · FlashArb & Sweep Compatible' },
+  USDC: { sym: 'USDC', addr: '0xaf88d065e77c8cC2239327C5EDb3A432268e5831', dec: 6, ercStandard: 'ERC-2612', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 + ERC-2612 Permit · FlashArb & Sweep Compatible' },
+  USDCe: { sym: 'USDC.e', addr: '0xFF970A61A04b1cA14834A43f5dE4533eBDDB5CC8', dec: 6, ercStandard: 'ERC-2612', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 + ERC-2612 Permit · FlashArb & Sweep Compatible' },
+  USDT: { sym: 'USDT', addr: '0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9', dec: 6, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 (SafeERC20) · FlashArb & Sweep Compatible' },
+  DAI: { sym: 'DAI', addr: '0xDA10009cBd5D07dd0CeCc66161FC93D7c9000da1', dec: 18, ercStandard: 'ERC-2612', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 + ERC-2612 Permit · FlashArb & Sweep Compatible' },
+  ARB: { sym: 'ARB', addr: '0x912CE59144191C1204E64559FE8253a0e49E6548', dec: 18, ercStandard: 'ERC-2612', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 + ERC-2612 Permit · FlashArb & Sweep Compatible' },
+  WBTC: { sym: 'WBTC', addr: '0x2f2a2543B76A4166549F7aaB2e75Bef0aefC5B0f', dec: 8, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 · FlashArb & Sweep Compatible' },
+  LINK: { sym: 'LINK', addr: '0xf97f4df75117a78c1A5a0DBb814Af92458539FB4', dec: 18, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 · FlashArb & Sweep Compatible' },
+  GMX: { sym: 'GMX', addr: '0xfc5A1A6EB076a2C7aD06eD22C90d7E710E35ad0a', dec: 18, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 · FlashArb & Sweep Compatible' },
+  AAVE: { sym: 'AAVE', addr: '0xba5DdD1f9d7F570dc94a51479a000E3BCE967196', dec: 18, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 · FlashArb & Sweep Compatible' },
+  PENDLE: { sym: 'PENDLE', addr: '0x0c880f6761F1af8d9Aa9C466984b80DAb9a8c9e8', dec: 18, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 · FlashArb & Sweep Compatible' },
+  UNI: { sym: 'UNI', addr: '0xFa7F8980b0f1E64A2062791cc3b0871572f1F7f0', dec: 18, ercStandard: 'ERC-2612', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 + ERC-2612 Permit · FlashArb & Sweep Compatible' },
+  cbETH: { sym: 'cbETH', addr: '0x1DEBd73E752bEaF79865Fd6446b0c970EaE7732f', dec: 18, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 LST · FlashArb & Sweep Compatible' },
+  ezETH: { sym: 'ezETH', addr: '0x2416092f143378750bb29b79eD961ab195CcEea5', dec: 18, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 LRT · FlashArb & Sweep Compatible' },
+  MAGIC: { sym: 'MAGIC', addr: '0x539bdE0d7Dbd336b79148AA742883198BBF60342', dec: 18, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 · FlashArb & Sweep Compatible' },
+  RDNT: { sym: 'RDNT', addr: '0x3082CC23568eA640225c2467653dB90e9250AaA0', dec: 18, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 · FlashArb & Sweep Compatible' },
+  FRAX: { sym: 'FRAX', addr: '0x17FC002b466eEc40DaE837Fc4bE5c67993ddBd6F', dec: 18, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 · FlashArb & Sweep Compatible' },
+  USDe: { sym: 'USDe', addr: '0x5d3a1Ff2b6BAb83b63cd9AD0787074081a52ef34', dec: 18, ercStandard: 'ERC-2612', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 + ERC-2612 Permit · FlashArb & Sweep Compatible' },
+  sUSDe: { sym: 'sUSDe', addr: '0x211Cc4DD073734dA055fbF44a2b4667d5E5fE5d2', dec: 18, ercStandard: 'ERC-4626', arbCompatible: false, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-4626 Tokenized Vault (ERC-20) · Sweep Compatible (excluded from arb swaps)' },
+  wstETH: { sym: 'wstETH', addr: '0x5979D7b546E38E414F7E9822514be443A4800529', dec: 18, ercStandard: 'ERC-2612', arbCompatible: false, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 + ERC-2612 Non-rebasing LST · Sweep Compatible (excluded in arbitrum.toml)' },
 };
+
+export const CHAIN_TOKENS: Record<SupportedArbChain, Record<string, ArbitrumTokenInfo>> = {
+  arbitrum: ARBITRUM_TOKENS,
+  base: {
+    WETH: { sym: 'WETH', addr: '0x4200000000000000000000000000000000000006', dec: 18, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 (WETH9) · FlashArb & Sweep Compatible' },
+    USDC: { sym: 'USDC', addr: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913', dec: 6, ercStandard: 'ERC-2612', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 + ERC-2612 Permit · FlashArb & Sweep Compatible' },
+    USDbC: { sym: 'USDbC', addr: '0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA', dec: 6, ercStandard: 'ERC-2612', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 + ERC-2612 Permit · FlashArb & Sweep Compatible' },
+    cbETH: { sym: 'cbETH', addr: '0x2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22', dec: 18, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 LST · FlashArb & Sweep Compatible' },
+    AERO: { sym: 'AERO', addr: '0x940181a94A35A4569E4529A3CDfB74e38FD98631', dec: 18, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 · FlashArb & Sweep Compatible' },
+    DAI: { sym: 'DAI', addr: '0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb', dec: 18, ercStandard: 'ERC-2612', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 + ERC-2612 Permit · FlashArb & Sweep Compatible' },
+    cbBTC: { sym: 'cbBTC', addr: '0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf', dec: 8, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 · FlashArb & Sweep Compatible' },
+  },
+  optimism: {
+    WETH: { sym: 'WETH', addr: '0x4200000000000000000000000000000000000006', dec: 18, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 (WETH9) · FlashArb & Sweep Compatible' },
+    USDC: { sym: 'USDC', addr: '0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85', dec: 6, ercStandard: 'ERC-2612', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 + ERC-2612 Permit · FlashArb & Sweep Compatible' },
+    USDCe: { sym: 'USDC.e', addr: '0x7F5c764cBc14f9669B88837ca1490cCa17c31607', dec: 6, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 · FlashArb & Sweep Compatible' },
+    USDT: { sym: 'USDT', addr: '0x94b008aA00579c1307B0EF2c499aD98a8ce58e58', dec: 6, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 (SafeERC20) · FlashArb & Sweep Compatible' },
+    DAI: { sym: 'DAI', addr: '0xDA10009cBd5D07dd0CeCc66161FC93D7c9000da1', dec: 18, ercStandard: 'ERC-2612', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 + ERC-2612 Permit · FlashArb & Sweep Compatible' },
+    OP: { sym: 'OP', addr: '0x4200000000000000000000000000000000000042', dec: 18, ercStandard: 'ERC-2612', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 + ERC-2612 Permit · FlashArb & Sweep Compatible' },
+    WBTC: { sym: 'WBTC', addr: '0x68f180fcCe6836688e9084f035309E29Bf0A2095', dec: 8, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 · FlashArb & Sweep Compatible' },
+    wstETH: { sym: 'wstETH', addr: '0x1F32b1c2345538c0c6f582fCB022739c4A194Ebb', dec: 18, ercStandard: 'ERC-2612', arbCompatible: false, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 + ERC-2612 Non-rebasing LST · Sweep Compatible (excluded from arb swaps)' },
+  },
+};
+
+export function getChainTokens(chain: string): ArbitrumTokenInfo[] {
+  const key = (chain || 'arbitrum').toLowerCase() as SupportedArbChain;
+  return Object.values(CHAIN_TOKENS[key] || CHAIN_TOKENS.arbitrum);
+}
 
 export interface DexRouterSpec {
   router: string | null;
@@ -63,6 +115,82 @@ export const ARBITRUM_DEX_ROUTERS: Record<string, DexRouterSpec> = {
     supported: false,
   },
 };
+
+export const CHAIN_DEX_ROUTERS: Record<SupportedArbChain, Record<string, DexRouterSpec>> = {
+  arbitrum: ARBITRUM_DEX_ROUTERS,
+  base: {
+    'Uniswap V3': {
+      // Uniswap V3 SwapRouter02 on Base (supported via FlashArbOptimized._swapV3 ISwapRouter02 fallback)
+      router: '0x2626664c2603336E57B271c5C0b26F421741e481',
+      isV3: true,
+      supported: true,
+    },
+    'PancakeSwap V3': {
+      router: '0x1b81D678ffb9C0263b24A97847620C99d213eB14',
+      isV3: true,
+      supported: true,
+    },
+    'SushiSwap V3': {
+      router: '0xFB7eF66a7e61224DD6FcD0D7d9C3be5C8B049b9f',
+      isV3: true,
+      supported: true,
+    },
+    'Uniswap V2': {
+      router: '0x4752ba5dbc23f44d87826276bf6fd6b1c372ad24',
+      isV3: false,
+      supported: true,
+    },
+    'Sushiswap V2': {
+      router: '0x6BDED42c6DA8FBf0d2bA55B2fa120C5e0c8D7891',
+      isV3: false,
+      supported: true,
+    },
+    'BaseSwap V2': {
+      router: '0x327Df1E6de05895d2ab08513aaDD9313Fe505d86',
+      isV3: false,
+      supported: true,
+    },
+    'Aerodrome Slipstream': {
+      // Slipstream router exactInputSingle takes `int24 tickSpacing` rather than `uint24 fee`; monitor-only.
+      router: null,
+      isV3: true,
+      supported: false,
+    },
+  },
+  optimism: {
+    'Uniswap V3': {
+      router: '0xE592427A0AEce92De3Edee1F18E0157C05861564',
+      isV3: true,
+      supported: true,
+    },
+    'SushiSwap V3': {
+      router: '0xFB7eF66a7e61224DD6FcD0D7d9C3be5C8B049b9f',
+      isV3: true,
+      supported: true,
+    },
+    'Uniswap V2': {
+      router: '0x4A7b5Da61326A6379179b40d00F57E5bbDC962c2',
+      isV3: false,
+      supported: true,
+    },
+    'Sushiswap V2': {
+      router: '0x2ABf469074dc0b54d793850807E6eb5Faf2625b1',
+      isV3: false,
+      supported: true,
+    },
+    'Velodrome Slipstream': {
+      // Slipstream router exactInputSingle takes `int24 tickSpacing` rather than `uint24 fee`; monitor-only.
+      router: null,
+      isV3: true,
+      supported: false,
+    },
+  },
+};
+
+export function getChainDexRouters(chain?: string): Record<string, DexRouterSpec> {
+  const key = (chain || 'arbitrum').toLowerCase() as SupportedArbChain;
+  return CHAIN_DEX_ROUTERS[key] || ARBITRUM_DEX_ROUTERS;
+}
 
 export const FLASH_ARB_OPTIMIZED_ABI = [
   'function owner() view returns (address)',
@@ -108,6 +236,7 @@ export function toTokenUnits(humanAmount: number, decimals: number): bigint {
 }
 
 export interface RouteExecutionInput {
+  chain?: SupportedArbChain;
   baseToken: ArbitrumTokenInfo;
   quoteToken: ArbitrumTokenInfo;
   buyDex: string;
@@ -139,8 +268,9 @@ export function resolveArbitrageCandidates(
   input: RouteExecutionInput,
   recipient: string
 ): EncodedArbitrageCandidate[] {
-  const buySpec = ARBITRUM_DEX_ROUTERS[input.buyDex];
-  const sellSpec = ARBITRUM_DEX_ROUTERS[input.sellDex];
+  const routers = getChainDexRouters(input.chain);
+  const buySpec = routers[input.buyDex];
+  const sellSpec = routers[input.sellDex];
   if (!buySpec?.supported || !buySpec.router || !sellSpec?.supported || !sellSpec.router) {
     return [];
   }
@@ -343,4 +473,130 @@ export function decodeFlashArbRevertError(err: any): string {
 
   const msg = String(err?.shortMessage || err?.reason || err?.message || 'Execution reverted');
   return msg;
+}
+
+export interface ExtraTokenSpec {
+  address: string;
+  tokenId?: string;
+}
+
+export function parseExtraTokenSpec(raw: unknown): ExtraTokenSpec | null {
+  const s = String(raw || '').trim();
+  const m = s.match(/^(0x[a-fA-F0-9]{40})(?::(\d+))?$/);
+  if (!m) return null;
+  return {
+    address: ethers.getAddress(m[1]),
+    tokenId: m[2],
+  };
+}
+
+export const ERC165_INTERFACE_IDS = {
+  ERC721: '0x80ac58cd',
+  ERC1155: '0xd9b67a26',
+} as const;
+
+const multiErcTransferIface = new ethers.Interface([
+  'function safeTransferFrom(address from, address to, uint256 tokenId)',
+  'function safeTransferFrom(address from, address to, uint256 id, uint256 value, bytes data)',
+]);
+
+export function encodeErc721SafeTransferFrom(from: string, to: string, tokenId: string | bigint): string {
+  return multiErcTransferIface.encodeFunctionData(
+    'safeTransferFrom(address,address,uint256)',
+    [ethers.getAddress(from), ethers.getAddress(to), BigInt(tokenId)]
+  );
+}
+
+export function encodeErc1155SafeTransferFrom(
+  from: string,
+  to: string,
+  tokenId: string | bigint,
+  amount: bigint,
+  data = '0x'
+): string {
+  return multiErcTransferIface.encodeFunctionData(
+    'safeTransferFrom(address,address,uint256,uint256,bytes)',
+    [ethers.getAddress(from), ethers.getAddress(to), BigInt(tokenId), amount, data]
+  );
+}
+
+export function classifyDetectedErcStandard(flags: {
+  isErc1155: boolean;
+  isErc721: boolean;
+  isErc4626: boolean;
+  isErc777: boolean;
+  isErc2612: boolean;
+  hasErc20TotalSupply: boolean;
+}): {
+  ercStandard: ErcStandard;
+  sweepCompatible: boolean;
+  walletSweepCompatible: boolean;
+  arbCompatible: boolean;
+  compatibilityNote: string;
+} {
+  if (flags.isErc1155) {
+    return {
+      ercStandard: 'ERC-1155',
+      sweepCompatible: false,
+      walletSweepCompatible: true,
+      arbCompatible: false,
+      compatibilityNote:
+        'ERC-1155 Multi-Token · Incompatible with FlashArbOptimized & Balancer/Uniswap swaps; sweepable from Connected Wallet using 0xAddr:tokenId',
+    };
+  }
+  if (flags.isErc721) {
+    return {
+      ercStandard: 'ERC-721',
+      sweepCompatible: false,
+      walletSweepCompatible: true,
+      arbCompatible: false,
+      compatibilityNote:
+        'ERC-721 NFT · Incompatible with FlashArbOptimized & DEX swaps; sweepable from Connected Wallet using 0xAddr:tokenId',
+    };
+  }
+  if (flags.isErc4626) {
+    return {
+      ercStandard: 'ERC-4626',
+      sweepCompatible: true,
+      walletSweepCompatible: true,
+      arbCompatible: false,
+      compatibilityNote:
+        'ERC-4626 Tokenized Vault (inherits ERC-20) · Contract & Wallet Sweep Compatible (excluded from flash-arb swaps)',
+    };
+  }
+  if (flags.isErc777) {
+    return {
+      ercStandard: 'ERC-777',
+      sweepCompatible: true,
+      walletSweepCompatible: true,
+      arbCompatible: false,
+      compatibilityNote:
+        'ERC-777 Hook Token (ERC-20 compatible) · Sweep Compatible (excluded from flash-arb swaps due to send/receive hooks)',
+    };
+  }
+  if (flags.isErc2612) {
+    return {
+      ercStandard: 'ERC-2612',
+      sweepCompatible: true,
+      walletSweepCompatible: true,
+      arbCompatible: false,
+      compatibilityNote: 'ERC-20 + ERC-2612 Permit · Sweep Compatible (pending pre-flight gas check)',
+    };
+  }
+  if (flags.hasErc20TotalSupply) {
+    return {
+      ercStandard: 'ERC-20',
+      sweepCompatible: true,
+      walletSweepCompatible: true,
+      arbCompatible: false,
+      compatibilityNote: 'Custom ERC-20 · Sweep Compatible (pending pre-flight gas check)',
+    };
+  }
+  return {
+    ercStandard: 'UNKNOWN',
+    sweepCompatible: false,
+    walletSweepCompatible: false,
+    arbCompatible: false,
+    compatibilityNote: 'Incompatible: contract does not expose ERC-20, ERC-4626, ERC-721, or ERC-1155 interfaces',
+  };
 }

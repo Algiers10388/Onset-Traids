@@ -4,18 +4,12 @@ import {
   ArrowUpFromLine,
   Bot,
   BrainCircuit,
-  ChevronDown,
-  CreditCard,
   Eye,
   Key,
   Landmark,
-  Lock,
-  MessageSquare,
   MoreVertical,
   Radar,
-  Radio,
   RotateCcw,
-  ShieldCheck,
   Sparkles,
   Wallet,
   Zap,
@@ -86,11 +80,10 @@ export const Header: React.FC<HeaderProps> = ({
 
   return (
     <header className="border-b border-slate-800/90 bg-[#090D16]/95 backdrop-blur-md sticky top-0 z-40">
-      <div className="max-w-7xl mx-auto px-3 sm:px-4 h-14 flex items-center justify-between gap-2 sm:gap-4">
-        {/* LEFT: Brand + Main Page Tabs */}
-        <div className="flex items-center gap-2 sm:gap-4 shrink-0">
-          {/* Logo & Brand */}
-          <div className="flex items-center gap-2">
+      <div className="max-w-7xl mx-auto px-3 sm:px-4 h-14 flex items-center justify-between gap-2 sm:gap-3">
+        {/* LEFT: Brand + Primary Navigation */}
+        <div className="flex items-center gap-2 sm:gap-3 min-w-0">
+          <div className="flex items-center gap-2 shrink-0">
             <div
               className={`flex h-8 w-8 items-center justify-center rounded-lg border shadow-sm ${
                 isLiveTrading
@@ -100,8 +93,8 @@ export const Header: React.FC<HeaderProps> = ({
             >
               <Bot className="h-4 w-4" />
             </div>
-            <div className="hidden xl:flex flex-col leading-none">
-              <span className="text-sm font-bold tracking-tight text-white font-mono flex items-center gap-1.5">
+            <div className="hidden 2xl:flex flex-col leading-none">
+              <span className="text-sm font-bold tracking-tight text-white font-mono">
                 APEX<span className="text-cyan-400">QUANT</span>
               </span>
               <span className="text-[9px] text-slate-500 font-mono mt-0.5">
@@ -110,35 +103,36 @@ export const Header: React.FC<HeaderProps> = ({
             </div>
           </div>
 
-          {/* Primary View Navigation Tabs */}
           {onSelectTab && (
-            <nav className="flex items-center p-0.5 rounded-lg bg-slate-950/80 border border-slate-800 text-xs font-mono">
+            <nav className="flex items-center p-0.5 rounded-lg bg-slate-950/80 border border-slate-800 text-xs font-mono overflow-x-auto no-scrollbar">
               <button
+                type="button"
                 onClick={() => onSelectTab('TRADING_DESK')}
-                className={`flex items-center gap-1 px-2.5 py-1 rounded-md transition-colors cursor-pointer text-xs ${
+                className={`flex items-center gap-1 px-2.5 py-1 rounded-md transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
                   activeTab === 'TRADING_DESK'
                     ? 'bg-slate-800 text-white font-semibold shadow-sm'
                     : 'text-slate-400 hover:text-slate-200'
                 }`}
               >
-                <Zap className="h-3 w-3 text-cyan-400" />
+                <Zap className="h-3 w-3 text-cyan-400 shrink-0" />
                 <span>Desk</span>
               </button>
 
               <button
+                type="button"
                 onClick={() => onSelectTab('SENTIMENT_RADAR')}
-                className={`flex items-center gap-1 px-2.5 py-1 rounded-md transition-colors cursor-pointer text-xs ${
+                className={`flex items-center gap-1 px-2.5 py-1 rounded-md transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
                   activeTab === 'SENTIMENT_RADAR'
                     ? 'bg-pink-600/30 text-pink-200 font-semibold shadow-sm border border-pink-500/40'
                     : 'text-slate-400 hover:text-slate-200'
                 }`}
                 title="AI Sentiment Analysis & Social Media Radar"
               >
-                <BrainCircuit className="h-3 w-3 text-pink-400" />
+                <BrainCircuit className="h-3 w-3 text-pink-400 shrink-0" />
                 <span>Sentiment</span>
                 {sentimentScore !== undefined && (
                   <span
-                    className={`text-[10px] ml-0.5 px-1 rounded font-bold ${
+                    className={`text-[10px] ml-0.5 px-1 rounded font-bold tabular-nums ${
                       sentimentScore > 0
                         ? 'text-emerald-400 bg-emerald-950/60'
                         : sentimentScore < 0
@@ -152,58 +146,62 @@ export const Header: React.FC<HeaderProps> = ({
               </button>
 
               <button
+                type="button"
                 onClick={() => onSelectTab('ETHERSCAN_INTELLIGENCE')}
-                className={`flex items-center gap-1 px-2.5 py-1 rounded-md transition-colors cursor-pointer text-xs ${
+                className={`flex items-center gap-1 px-2.5 py-1 rounded-md transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
                   activeTab === 'ETHERSCAN_INTELLIGENCE'
                     ? 'bg-indigo-600/30 text-indigo-200 font-semibold shadow-sm'
                     : 'text-slate-400 hover:text-slate-200'
                 }`}
               >
-                <Radar className="h-3 w-3 text-indigo-400" />
-                <span className="hidden sm:inline">Etherscan</span> Radar
-                <span className="text-[10px] text-emerald-400 ml-0.5">({onChainSignalsCount})</span>
+                <Radar className="h-3 w-3 text-indigo-400 shrink-0" />
+                <span className="hidden xl:inline">Etherscan</span>
+                <span>Radar</span>
+                <span className="text-[10px] text-emerald-400 tabular-nums">({onChainSignalsCount})</span>
               </button>
 
               <button
+                type="button"
                 onClick={() => onSelectTab('FLASH_ARB_BOT')}
-                className={`flex items-center gap-1 px-2.5 py-1 rounded-md transition-colors cursor-pointer text-xs ${
+                className={`flex items-center gap-1 px-2.5 py-1 rounded-md transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
                   activeTab === 'FLASH_ARB_BOT'
                     ? 'bg-cyan-500/20 text-cyan-200 font-semibold shadow-sm'
                     : 'text-slate-400 hover:text-slate-200'
                 }`}
               >
-                <Zap className="h-3 w-3 text-cyan-400" />
+                <Zap className="h-3 w-3 text-cyan-400 shrink-0" />
                 <span>Flash Arb</span>
               </button>
 
               <button
+                type="button"
                 onClick={() => onSelectTab('WALLET_MONITOR')}
-                className={`hidden md:flex items-center gap-1 px-2.5 py-1 rounded-md transition-colors cursor-pointer text-xs ${
+                className={`hidden md:flex items-center gap-1 px-2.5 py-1 rounded-md transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
                   activeTab === 'WALLET_MONITOR'
                     ? 'bg-emerald-500/20 text-emerald-200 font-semibold shadow-sm'
                     : 'text-slate-400 hover:text-slate-200'
                 }`}
               >
-                <Eye className="h-3 w-3 text-emerald-400" />
+                <Eye className="h-3 w-3 text-emerald-400 shrink-0" />
                 <span>Monitor</span>
               </button>
             </nav>
           )}
         </div>
 
-        {/* CENTER: Portfolio Telemetry & Mode Switch */}
-        <div className="hidden lg:flex items-center gap-3 bg-slate-950/70 border border-slate-800/80 px-3 py-1 rounded-lg text-xs font-mono">
-          <div className="flex items-center gap-1.5">
+        {/* CENTER: Compact Portfolio Telemetry */}
+        <div className="hidden xl:flex items-center gap-2.5 bg-slate-950/70 border border-slate-800/80 px-3 py-1 rounded-lg text-xs font-mono shrink-0 whitespace-nowrap">
+          <div className="flex items-center gap-1">
             <span className="text-slate-500 text-[11px]">Equity:</span>
-            <span className="text-white font-bold">{formatCurrency(totalEquity)}</span>
+            <span className="text-white font-bold tabular-nums">{formatCurrency(totalEquity)}</span>
           </div>
 
           <span className="text-slate-700">·</span>
 
-          <div className="flex items-center gap-1.5">
+          <div className="flex items-center gap-1">
             <span className="text-slate-500 text-[11px]">PnL:</span>
             <span
-              className={`font-semibold ${totalPnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}
+              className={`font-semibold tabular-nums ${totalPnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}
             >
               {totalPnl >= 0 ? '+' : ''}
               {formatCurrency(totalPnl)} ({formatPercent(totalPnlPercent)})
@@ -212,58 +210,40 @@ export const Header: React.FC<HeaderProps> = ({
 
           <span className="text-slate-700">·</span>
 
-          <div className="flex items-center gap-1.5">
-            <span className="text-slate-500 text-[11px]">Positions:</span>
-            <span className="text-cyan-400 font-semibold">{activePositionsCount}</span>
+          <div className="flex items-center gap-1">
+            <span className="text-slate-500 text-[11px]">Pos:</span>
+            <span className="text-cyan-400 font-semibold tabular-nums">{activePositionsCount}</span>
           </div>
 
           <span className="text-slate-700">·</span>
 
-          {/* Connected Vault: Cake Wallet ..5d */}
-          <button
-            type="button"
-            onClick={onOpenCakeWallet}
-            className="flex items-center gap-1.5 px-2 py-0.5 rounded-lg bg-emerald-950/70 hover:bg-emerald-900/80 border border-emerald-500/40 text-emerald-300 font-mono text-[10px] font-bold cursor-pointer transition-colors"
-            title="Click to view Cake Wallet (0xc102...f15d) WalletConnect pairing & live balance"
-          >
-            <span className="text-[10px]">🍰</span>
-            <span>Cake ..5d</span>
-            <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
-          </button>
-
-          <span className="text-slate-700">·</span>
-
-          {/* Live Execution Mode Badge - 100% Real Infrastructure */}
-          <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-rose-950/60 border border-rose-500/50 text-rose-300 font-bold text-[10px] tracking-wide shadow-sm shadow-rose-950/40">
-            <span className="relative flex h-2 w-2">
-              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-rose-400 opacity-75" />
-              <span className="relative inline-flex rounded-full h-2 w-2 bg-rose-500" />
-            </span>
-            <span className="font-mono uppercase">LIVE REAL TRADING</span>
+          <div className="flex items-center gap-1.5 text-rose-300 font-bold text-[10px] tracking-wide">
+            <span className="h-1.5 w-1.5 rounded-full bg-rose-500 shrink-0" />
+            <span className="font-mono uppercase">LIVE</span>
           </div>
         </div>
 
-        {/* RIGHT: Bot Toggle, Treasury, Quick Tools & Profile */}
-        <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
-          {/* Master Bot Toggle Button */}
+        {/* RIGHT: Primary Action Controls */}
+        <div className="flex items-center gap-1.5 shrink-0">
           <button
+            type="button"
             onClick={onToggleBot}
-            className={`flex items-center gap-1.5 px-2.5 sm:px-3 py-1 rounded-lg text-xs font-bold transition-all cursor-pointer shadow-sm ${
+            className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-bold transition-all cursor-pointer shadow-sm whitespace-nowrap shrink-0 ${
               botRunning
                 ? isLiveTrading
                   ? 'bg-rose-500 hover:bg-rose-400 text-white shadow-rose-500/20'
                   : 'bg-emerald-500 hover:bg-emerald-400 text-slate-950 shadow-emerald-500/20'
-                : 'bg-slate-850 hover:bg-slate-800 text-slate-300 border border-slate-700'
+                : 'bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700'
             }`}
             title={botRunning ? 'Click to Pause Trading Bot' : 'Click to Activate Trading Bot'}
           >
             <span
-              className={`h-2 w-2 rounded-full ${
+              className={`h-2 w-2 rounded-full shrink-0 ${
                 botRunning
                   ? isLiveTrading
-                    ? 'bg-white animate-ping'
+                    ? 'bg-white animate-pulse'
                     : 'bg-slate-950 animate-pulse'
-                  : 'bg-slate-500'
+                  : 'bg-slate-400'
               }`}
             />
             <span className="font-mono text-[11px] hidden sm:inline">
@@ -271,122 +251,101 @@ export const Header: React.FC<HeaderProps> = ({
             </span>
           </button>
 
-          {/* Treasury Vault Button */}
           <button
+            type="button"
             onClick={onOpenFiatAccount}
-            className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 border border-emerald-500/30 text-emerald-300 text-xs font-mono transition-colors cursor-pointer"
+            className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 border border-emerald-500/30 text-emerald-300 text-xs font-mono transition-colors cursor-pointer whitespace-nowrap shrink-0"
             title="Open Treasury & Bank/Card Funding Rail"
           >
-            <Landmark className="h-3.5 w-3.5 text-emerald-400" />
-            <span className="hidden md:inline text-slate-400 text-[10px]">Treasury:</span>
-            <span className="font-bold text-white text-[11px]">
+            <Landmark className="h-3.5 w-3.5 text-emerald-400 shrink-0" />
+            <span className="font-bold text-white text-[11px] tabular-nums">
               {formatCurrency(fiatAccountAvailableBalance)}
             </span>
           </button>
 
-          {/* Exchange Wallets Button */}
-          <button
-            onClick={onOpenExchanges}
-            className="flex items-center gap-1 px-2 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-700 text-slate-300 hover:text-white text-xs font-mono transition-colors cursor-pointer"
-            title="Manage Connected Exchange Wallets (Binance, Kraken, Coinbase, Bybit, NonKYC)"
-          >
-            <Wallet className="h-3.5 w-3.5 text-cyan-400" />
-            <span className="hidden xl:inline text-[11px]">Exchanges</span>
-          </button>
-
-          {/* OKX Web3 Wallet Direct Button */}
           {onOpenOkxWallet && (
             <button
+              type="button"
               onClick={onOpenOkxWallet}
-              className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg border text-xs font-mono transition-all cursor-pointer ${
+              className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg border text-xs font-mono transition-all cursor-pointer whitespace-nowrap shrink-0 ${
                 okxConnectedAddress
                   ? 'bg-neutral-900 border-white/40 text-white hover:border-white shadow-sm'
                   : 'bg-slate-900 hover:bg-slate-800 border-slate-700 text-slate-300 hover:text-white'
               }`}
-              title={okxConnectedAddress ? `Connected OKX Wallet: ${okxConnectedAddress}` : 'Connect OKX Web3 Wallet (..11)'}
+              title={
+                okxConnectedAddress
+                  ? `Connected OKX Wallet: ${okxConnectedAddress}`
+                  : 'Connect OKX Web3 Wallet (..11)'
+              }
             >
               <div className="w-3 h-3 rounded-[2px] bg-black border border-white/40 grid grid-cols-2 gap-0.5 p-0.5 shrink-0">
                 <div className="bg-white rounded-[0.5px]" />
                 <div className="bg-black" />
               </div>
               <span className="hidden sm:inline text-[11px] font-bold">
-                {okxConnectedAddress ? `OKX ${okxConnectedAddress.toLowerCase().endsWith('11') ? '(..11)' : `(${okxConnectedAddress.slice(0, 4)}..${okxConnectedAddress.slice(-2)})`}` : 'OKX ..11'}
+                {okxConnectedAddress
+                  ? `OKX ${
+                      okxConnectedAddress.toLowerCase().endsWith('11')
+                        ? '..11'
+                        : `${okxConnectedAddress.slice(0, 4)}..${okxConnectedAddress.slice(-2)}`
+                    }`
+                  : 'OKX ..11'}
               </span>
-              <span className={`h-1.5 w-1.5 rounded-full ${okxConnectedAddress ? 'bg-cyan-400' : 'bg-amber-400 animate-pulse'}`} />
+              <span
+                className={`h-1.5 w-1.5 rounded-full shrink-0 ${
+                  okxConnectedAddress ? 'bg-cyan-400' : 'bg-amber-400'
+                }`}
+              />
             </button>
           )}
 
-          {/* AI Copilot Button */}
           {onOpenAiTroubleshooter && (
             <button
+              type="button"
               onClick={onOpenAiTroubleshooter}
-              className="flex items-center gap-1 px-2 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 border border-cyan-500/40 text-cyan-300 text-xs font-mono transition-colors cursor-pointer relative"
+              className="flex items-center gap-1 px-2 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 border border-cyan-500/40 text-cyan-300 text-xs font-mono transition-colors cursor-pointer whitespace-nowrap shrink-0"
               title="AI Strategy Copilot & Quant Diagnostics"
             >
-              <Bot className="h-3.5 w-3.5 text-cyan-400" />
-              <span className="hidden xl:inline text-[11px]">AI Copilot</span>
-              <span className="h-1.5 w-1.5 rounded-full bg-cyan-400 animate-ping absolute -top-0.5 -right-0.5" />
+              <Bot className="h-3.5 w-3.5 text-cyan-400 shrink-0" />
+              <span className="hidden lg:inline text-[11px]">Copilot</span>
             </button>
           )}
 
           {/* Tools & Utilities Dropdown Menu */}
-          <div className="relative">
+          <div className="relative shrink-0">
             <button
+              type="button"
               onClick={() => setShowToolsMenu(!showToolsMenu)}
               className={`p-1.5 rounded-lg border transition-colors cursor-pointer flex items-center justify-center ${
                 showToolsMenu
                   ? 'bg-slate-800 text-white border-slate-600'
                   : 'bg-slate-900 text-slate-400 hover:text-white border-slate-800 hover:border-slate-700'
               }`}
-              title="More Tools: Backtest Lab, AI Risk Audit, Withdrawals, Web3 Wallet"
+              title="More Tools: Exchanges, Cake Wallet, Backtest Lab, AI Risk Audit, Withdrawals"
               aria-label="More tools menu"
             >
               <MoreVertical className="h-4 w-4" />
             </button>
 
-            {/* Dropdown Popover */}
             {showToolsMenu && (
               <>
-                <div
-                  className="fixed inset-0 z-40"
-                  onClick={() => setShowToolsMenu(false)}
-                />
-                <div className="absolute right-0 mt-1.5 w-56 rounded-xl bg-slate-900 border border-slate-800 shadow-2xl p-1.5 z-50 text-xs font-mono flex flex-col gap-0.5 animate-in fade-in-50 duration-150">
+                <div className="fixed inset-0 z-40" onClick={() => setShowToolsMenu(false)} />
+                <div className="absolute right-0 mt-1.5 w-60 rounded-xl bg-slate-900 border border-slate-800 shadow-2xl p-1.5 z-50 text-xs font-mono flex flex-col gap-0.5 animate-in fade-in-50 duration-150">
                   <button
+                    type="button"
                     onClick={() => {
                       setShowToolsMenu(false);
-                      onOpenBacktest();
+                      onOpenExchanges();
                     }}
                     className="flex items-center gap-2.5 px-3 py-2 rounded-lg text-slate-300 hover:text-white hover:bg-slate-800 transition-colors w-full text-left cursor-pointer"
                   >
-                    <Activity className="h-3.5 w-3.5 text-cyan-400" />
-                    <span>Backtest Lab</span>
-                  </button>
-
-                  <button
-                    onClick={() => {
-                      setShowToolsMenu(false);
-                      onOpenAudit();
-                    }}
-                    className="flex items-center gap-2.5 px-3 py-2 rounded-lg text-slate-300 hover:text-white hover:bg-slate-800 transition-colors w-full text-left cursor-pointer"
-                  >
-                    <Sparkles className="h-3.5 w-3.5 text-purple-400" />
-                    <span>AI Risk Audit</span>
-                  </button>
-
-                  <button
-                    onClick={() => {
-                      setShowToolsMenu(false);
-                      onOpenWithdraw();
-                    }}
-                    className="flex items-center gap-2.5 px-3 py-2 rounded-lg text-slate-300 hover:text-white hover:bg-slate-800 transition-colors w-full text-left cursor-pointer"
-                  >
-                    <ArrowUpFromLine className="h-3.5 w-3.5 text-rose-400" />
-                    <span>Withdraw Capital</span>
+                    <Wallet className="h-3.5 w-3.5 text-cyan-400" />
+                    <span>Exchange Wallets & Keys</span>
                   </button>
 
                   {onOpenCakeWallet && (
                     <button
+                      type="button"
                       onClick={() => {
                         setShowToolsMenu(false);
                         onOpenCakeWallet();
@@ -394,12 +353,13 @@ export const Header: React.FC<HeaderProps> = ({
                       className="flex items-center gap-2.5 px-3 py-2 rounded-lg text-slate-300 hover:text-white hover:bg-slate-800 transition-colors w-full text-left cursor-pointer"
                     >
                       <span className="text-xs">🍰</span>
-                      <span>Cake Wallet (WalletConnect)</span>
+                      <span>Cake Wallet (..5d)</span>
                     </button>
                   )}
 
                   {onOpenOkxWallet && (
                     <button
+                      type="button"
                       onClick={() => {
                         setShowToolsMenu(false);
                         onOpenOkxWallet();
@@ -418,6 +378,45 @@ export const Header: React.FC<HeaderProps> = ({
                   <div className="h-px bg-slate-800 my-1" />
 
                   <button
+                    type="button"
+                    onClick={() => {
+                      setShowToolsMenu(false);
+                      onOpenBacktest();
+                    }}
+                    className="flex items-center gap-2.5 px-3 py-2 rounded-lg text-slate-300 hover:text-white hover:bg-slate-800 transition-colors w-full text-left cursor-pointer"
+                  >
+                    <Activity className="h-3.5 w-3.5 text-cyan-400" />
+                    <span>Backtest Lab</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShowToolsMenu(false);
+                      onOpenAudit();
+                    }}
+                    className="flex items-center gap-2.5 px-3 py-2 rounded-lg text-slate-300 hover:text-white hover:bg-slate-800 transition-colors w-full text-left cursor-pointer"
+                  >
+                    <Sparkles className="h-3.5 w-3.5 text-purple-400" />
+                    <span>AI Risk Audit</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShowToolsMenu(false);
+                      onOpenWithdraw();
+                    }}
+                    className="flex items-center gap-2.5 px-3 py-2 rounded-lg text-slate-300 hover:text-white hover:bg-slate-800 transition-colors w-full text-left cursor-pointer"
+                  >
+                    <ArrowUpFromLine className="h-3.5 w-3.5 text-rose-400" />
+                    <span>Withdraw Capital</span>
+                  </button>
+
+                  <div className="h-px bg-slate-800 my-1" />
+
+                  <button
+                    type="button"
                     onClick={() => {
                       setShowToolsMenu(false);
                       onResetPortfolio();
@@ -434,7 +433,7 @@ export const Header: React.FC<HeaderProps> = ({
 
           {/* User Profile / Auth */}
           {user ? (
-            <div className="flex items-center gap-1.5 pl-1">
+            <div className="flex items-center gap-1.5 pl-1 shrink-0">
               {user.photoURL ? (
                 <img
                   src={user.photoURL}
@@ -447,8 +446,9 @@ export const Header: React.FC<HeaderProps> = ({
                 </div>
               )}
               <button
+                type="button"
                 onClick={signOutUser}
-                className="text-[10px] text-slate-400 hover:text-rose-400 font-mono transition-colors cursor-pointer hidden sm:inline"
+                className="text-[10px] text-slate-400 hover:text-rose-400 font-mono transition-colors cursor-pointer hidden sm:inline whitespace-nowrap"
                 title="Sign Out"
               >
                 Sign Out
@@ -456,11 +456,12 @@ export const Header: React.FC<HeaderProps> = ({
             </div>
           ) : (
             <button
+              type="button"
               onClick={signInWithGoogle}
-              className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-700 text-slate-200 text-xs font-mono font-medium cursor-pointer transition-colors"
+              className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-700 text-slate-200 text-xs font-mono font-medium cursor-pointer transition-colors whitespace-nowrap shrink-0"
               title="Sign in with Google to synchronize configurations"
             >
-              <svg className="w-3 h-3" viewBox="0 0 24 24">
+              <svg className="w-3 h-3 shrink-0" viewBox="0 0 24 24">
                 <path
                   fill="#4285F4"
                   d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"

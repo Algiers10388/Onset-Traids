@@ -650,7 +650,7 @@ export const EtherscanIntelligencePage: React.FC<EtherscanIntelligencePageProps>
               </thead>
               <tbody className="divide-y divide-slate-800/60 font-mono">
                 {filteredTxs.map((tx) => (
-                  <tr key={tx.hash} className="hover:bg-slate-850/50 transition-colors">
+                  <tr key={tx.hash} className="hover:bg-slate-800/50 transition-colors">
                     <td className="py-3 px-3">
                       <div className="flex items-center gap-1.5">
                         <span className="font-bold text-white">

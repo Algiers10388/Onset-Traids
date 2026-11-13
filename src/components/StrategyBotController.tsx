@@ -187,7 +187,7 @@ export const StrategyBotController: React.FC<StrategyBotControllerProps> = ({
             <div className="text-[10px] uppercase font-mono text-slate-400 flex items-center gap-1.5">
               <Wallet className="h-3 w-3 text-cyan-400" />
               <span>Available Bot Margin</span>
-              <span className="text-[9px] bg-emerald-500/20 text-emerald-300 px-1.5 py-0.2 rounded font-bold font-mono">
+              <span className="text-[9px] bg-emerald-500/20 text-emerald-300 px-1.5 py-0.5 rounded font-bold font-mono">
                 Active Margin
               </span>
             </div>
@@ -252,13 +252,13 @@ export const StrategyBotController: React.FC<StrategyBotControllerProps> = ({
                 className={`px-2.5 py-2 rounded-xl text-left border transition-all cursor-pointer text-xs relative ${
                   isActive
                     ? 'bg-cyan-500/15 border-cyan-500/60 text-cyan-200 font-semibold shadow-md ring-1 ring-cyan-500/30'
-                    : 'bg-slate-950/60 border-slate-800 text-slate-400 hover:bg-slate-850 hover:text-slate-200'
+                    : 'bg-slate-950/60 border-slate-800 text-slate-400 hover:bg-slate-800/80 hover:text-slate-200'
                 }`}
               >
                 <div className="flex items-center justify-between gap-1 mb-0.5">
                   <div className="font-medium truncate">{preset.name}</div>
                   {isDefault && (
-                    <span className="text-[9px] px-1 py-0.2 rounded bg-amber-400/20 text-amber-300 border border-amber-400/40 uppercase tracking-tighter shrink-0 font-mono font-bold">
+                    <span className="text-[9px] px-1 py-0.5 rounded bg-amber-400/20 text-amber-300 border border-amber-400/40 uppercase tracking-tighter shrink-0 font-mono font-bold">
                       DEFAULT
                     </span>
                   )}
@@ -981,7 +981,7 @@ export const StrategyBotController: React.FC<StrategyBotControllerProps> = ({
               <div className="font-bold text-slate-200 flex items-center gap-2">
                 <span>Daily Max Loss Circuit Breaker</span>
                 <span
-                  className={`text-[9px] px-1.5 py-0.2 rounded font-mono ${
+                  className={`text-[9px] px-1.5 py-0.5 rounded font-mono ${
                     strategy.circuitBreakerActive
                       ? 'bg-rose-500/20 text-rose-300 border border-rose-500/40'
                       : 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'

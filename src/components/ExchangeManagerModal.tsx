@@ -455,7 +455,7 @@ export const ExchangeManagerModal: React.FC<ExchangeManagerModalProps> = ({
               <span>API Health & Scopes</span>
               {healthSummary && (
                 <span
-                  className={`text-[10px] px-1.5 py-0.2 rounded-full font-mono ${
+                  className={`text-[10px] px-1.5 py-0.5 rounded-full font-mono ${
                     healthSummary.healthyCount > 0
                       ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
                       : 'bg-slate-800 text-slate-400'
@@ -552,7 +552,7 @@ export const ExchangeManagerModal: React.FC<ExchangeManagerModalProps> = ({
                     <Activity className="h-3.5 w-3.5 text-cyan-400" />
                     <span>API Health & Scopes</span>
                     {healthSummary && (
-                      <span className="text-[10px] px-1.5 py-0.2 rounded bg-slate-900 text-slate-300 font-mono">
+                      <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-900 text-slate-300 font-mono">
                         {healthSummary.healthyCount}/{healthSummary.totalConfigured || 0}
                       </span>
                     )}
@@ -851,7 +851,7 @@ export const ExchangeManagerModal: React.FC<ExchangeManagerModalProps> = ({
                         style={{ backgroundColor: ex.tagColor }}
                       />
                       <strong className="text-white text-sm font-sans">{ex.name}</strong>
-                      <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-slate-900 border border-slate-700 text-slate-300">
+                      <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-slate-900 border border-slate-700 text-slate-300">
                         {ex.tier}
                       </span>
                     </div>
@@ -1303,7 +1303,7 @@ export const ExchangeManagerModal: React.FC<ExchangeManagerModalProps> = ({
 
       {/* MODAL: LINK EXCHANGE WALLET */}
       {linkingExchange && (
-        <div className="fixed inset-0 z-60 flex items-center justify-center bg-black/85 backdrop-blur-md p-4 animate-in fade-in duration-150">
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/85 backdrop-blur-md p-4 animate-in fade-in duration-150">
           <div className="w-full max-w-lg rounded-2xl bg-[#0B0F1A] border border-cyan-500/40 shadow-2xl p-6 space-y-5">
             <div className="flex items-center justify-between border-b border-slate-800 pb-3">
               <div className="flex items-center gap-2">
@@ -1495,7 +1495,7 @@ export const ExchangeManagerModal: React.FC<ExchangeManagerModalProps> = ({
 
       {/* MODAL: MAKE WALLET TRANSACTION */}
       {txExchange && (
-        <div className="fixed inset-0 z-60 flex items-center justify-center bg-black/85 backdrop-blur-md p-4 animate-in fade-in duration-150">
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/85 backdrop-blur-md p-4 animate-in fade-in duration-150">
           <div className="w-full max-w-lg rounded-2xl bg-[#0B0F1A] border border-emerald-500/40 shadow-2xl p-6 space-y-5">
             <div className="flex items-center justify-between border-b border-slate-800 pb-3">
               <div className="flex items-center gap-2">

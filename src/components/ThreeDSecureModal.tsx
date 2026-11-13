@@ -206,7 +206,7 @@ export const ThreeDSecureModal: React.FC<ThreeDSecureModalProps> = ({
         return (
           <div className="flex items-center gap-2 px-2.5 py-1 rounded-lg bg-blue-600/20 border border-blue-500/40 text-blue-300 font-bold text-xs tracking-wider">
             <span className="font-serif italic font-extrabold text-white text-sm">VISA</span>
-            <span className="text-[11px] font-mono uppercase bg-blue-500 text-white px-1.5 py-0.2 rounded font-semibold">
+            <span className="text-[11px] font-mono uppercase bg-blue-500 text-white px-1.5 py-0.5 rounded font-semibold">
               Secure
             </span>
           </div>

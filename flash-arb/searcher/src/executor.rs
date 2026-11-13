@@ -217,85 +217,106 @@ impl TxExecutor {
                 continue;
             }
 
+            let code_bytes = code.as_ref();
+            let has_direct_sweep = code_bytes.windows(4).any(|w| w == [0x78, 0x04, 0xd9, 0xac]);
+            let has_rescue_to = code_bytes.windows(4).any(|w| w == [0xa7, 0x07, 0x06, 0x92]);
+            let has_rescue = code_bytes.windows(3).any(|w| w == [0xae, 0x3b, 0xf8]);
+
             // 1a. Native ETH sitting on vault contract
             let eth_bal = provider.get_balance(contract_addr, None).await.unwrap_or_default();
             if !eth_bal.is_zero() {
-                let label = format!("vault {:?} ETH ({} wei) -> {:?}", contract_addr, eth_bal, profit_recipient);
-                match self
-                    .send_verified_sweep_tx(
-                        &provider,
-                        &client,
-                        signer_address,
-                        contract_addr,
-                        encode_direct_sweep_call(profit_recipient),
-                        &label,
-                    )
-                    .await
-                {
-                    Ok(SweepTxOutcome::Confirmed(_)) => {
-                        report.contract_eth_swept_wei = report.contract_eth_swept_wei.saturating_add(eth_bal);
-                        report.txs_confirmed += 1;
+                if !has_direct_sweep {
+                    warn!(
+                        "[{}] Vault {:?} lacks executeDirectFlashArb(address) selector; skipping {} wei ETH sweep",
+                        self.config.chain_name, contract_addr, eth_bal
+                    );
+                } else {
+                    let label = format!("vault {:?} ETH ({} wei) -> {:?}", contract_addr, eth_bal, profit_recipient);
+                    match self
+                        .send_verified_sweep_tx(
+                            &provider,
+                            &client,
+                            signer_address,
+                            contract_addr,
+                            encode_direct_sweep_call(profit_recipient),
+                            &label,
+                        )
+                        .await
+                    {
+                        Ok(SweepTxOutcome::Confirmed(_)) => {
+                            report.contract_eth_swept_wei = report.contract_eth_swept_wei.saturating_add(eth_bal);
+                            report.txs_confirmed += 1;
+                        }
+                        Ok(other) => warn!("[{}] Vault ETH sweep skipped ({}): {:?}", self.config.chain_name, label, other),
+                        Err(e) => warn!("[{}] Vault ETH sweep error ({}): {:?}", self.config.chain_name, label, e),
                     }
-                    Ok(other) => warn!("[{}] Vault ETH sweep skipped ({}): {:?}", self.config.chain_name, label, other),
-                    Err(e) => warn!("[{}] Vault ETH sweep error ({}): {:?}", self.config.chain_name, label, e),
                 }
             }
 
             // 1b. Non-ETH ERC-20 dust sitting on vault contract
             let vault_tokens = self.query_token_balances(&provider, contract_addr, &tokens, block).await;
             for (sym, token_addr, bal) in vault_tokens {
-                let label_direct = format!("rescueTokensTo {} ({}) from {:?} -> {:?}", sym, bal, contract_addr, profit_recipient);
-                match self
-                    .send_verified_sweep_tx(
-                        &provider,
-                        &client,
-                        signer_address,
-                        contract_addr,
-                        encode_rescue_tokens_to_call(token_addr, profit_recipient),
-                        &label_direct,
-                    )
-                    .await
-                {
-                    Ok(SweepTxOutcome::Confirmed(_)) => {
-                        report.contract_tokens_swept += 1;
-                        report.txs_confirmed += 1;
-                    }
-                    Ok(SweepTxOutcome::SimulationReverted(_)) => {
-                        // Legacy deployments only expose `rescueTokens(address)` which transfers to `owner()` (= signer_address).
-                        // Run it first, then Phase 2 below forwards the balance from signer_address to `profit_recipient`.
-                        let label_legacy = format!("rescueTokens {} ({}) from {:?} -> owner {:?}", sym, bal, contract_addr, signer_address);
-                        match self
-                            .send_verified_sweep_tx(
-                                &provider,
-                                &client,
-                                signer_address,
-                                contract_addr,
-                                encode_rescue_tokens_call(token_addr),
-                                &label_legacy,
-                            )
-                            .await
-                        {
-                            Ok(SweepTxOutcome::Confirmed(_)) => {
-                                report.contract_tokens_swept += 1;
-                                report.txs_confirmed += 1;
-                            }
-                            Ok(other) => {
-                                warn!("[{}] Legacy vault token rescue skipped ({}): {:?}", self.config.chain_name, label_legacy, other);
-                                report.skipped_tokens += 1;
-                            }
-                            Err(e) => {
-                                warn!("[{}] Legacy vault token rescue error ({}): {:?}", self.config.chain_name, label_legacy, e);
-                                report.skipped_tokens += 1;
-                            }
+                if !has_rescue_to && !has_rescue {
+                    warn!(
+                        "[{}] Vault {:?} lacks rescueTokensTo/rescueTokens selectors; skipping {} ({})",
+                        self.config.chain_name, contract_addr, sym, bal
+                    );
+                    report.skipped_tokens += 1;
+                    continue;
+                }
+                if has_rescue_to {
+                    let label_direct = format!("rescueTokensTo {} ({}) from {:?} -> {:?}", sym, bal, contract_addr, profit_recipient);
+                    match self
+                        .send_verified_sweep_tx(
+                            &provider,
+                            &client,
+                            signer_address,
+                            contract_addr,
+                            encode_rescue_tokens_to_call(token_addr, profit_recipient),
+                            &label_direct,
+                        )
+                        .await
+                    {
+                        Ok(SweepTxOutcome::Confirmed(_)) => {
+                            report.contract_tokens_swept += 1;
+                            report.txs_confirmed += 1;
+                        }
+                        Ok(other) => {
+                            warn!("[{}] Vault token rescue skipped ({}): {:?}", self.config.chain_name, label_direct, other);
+                            report.skipped_tokens += 1;
+                        }
+                        Err(e) => {
+                            warn!("[{}] Vault token rescue error ({}): {:?}", self.config.chain_name, label_direct, e);
+                            report.skipped_tokens += 1;
                         }
                     }
-                    Ok(other) => {
-                        warn!("[{}] Vault token rescue skipped ({}): {:?}", self.config.chain_name, label_direct, other);
-                        report.skipped_tokens += 1;
-                    }
-                    Err(e) => {
-                        warn!("[{}] Vault token rescue error ({}): {:?}", self.config.chain_name, label_direct, e);
-                        report.skipped_tokens += 1;
+                } else {
+                    // Legacy deployments only expose `rescueTokens(address)` which transfers to `owner()` (= signer_address).
+                    // Run it first, then Phase 2 below forwards the balance from signer_address to `profit_recipient`.
+                    let label_legacy = format!("rescueTokens {} ({}) from {:?} -> owner {:?}", sym, bal, contract_addr, signer_address);
+                    match self
+                        .send_verified_sweep_tx(
+                            &provider,
+                            &client,
+                            signer_address,
+                            contract_addr,
+                            encode_rescue_tokens_call(token_addr),
+                            &label_legacy,
+                        )
+                        .await
+                    {
+                        Ok(SweepTxOutcome::Confirmed(_)) => {
+                            report.contract_tokens_swept += 1;
+                            report.txs_confirmed += 1;
+                        }
+                        Ok(other) => {
+                            warn!("[{}] Legacy vault token rescue skipped ({}): {:?}", self.config.chain_name, label_legacy, other);
+                            report.skipped_tokens += 1;
+                        }
+                        Err(e) => {
+                            warn!("[{}] Legacy vault token rescue error ({}): {:?}", self.config.chain_name, label_legacy, e);
+                            report.skipped_tokens += 1;
+                        }
                     }
                 }
             }

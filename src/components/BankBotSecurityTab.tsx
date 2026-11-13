@@ -308,7 +308,7 @@ export const BankBotSecurityTab: React.FC<BankBotSecurityTabProps> = ({
             <div className="flex-1">
               <div className="flex items-center gap-2">
                 <span className="font-bold text-white block">3D Secure 2.2 Strong Customer Authentication (SCA)</span>
-                <span className="px-1.5 py-0.2 rounded bg-cyan-500/20 text-cyan-300 text-[10px] font-mono border border-cyan-500/40">
+                <span className="px-1.5 py-0.5 rounded bg-cyan-500/20 text-cyan-300 text-[10px] font-mono border border-cyan-500/40">
                   Verified by Visa / Mastercard ID Check
                 </span>
               </div>

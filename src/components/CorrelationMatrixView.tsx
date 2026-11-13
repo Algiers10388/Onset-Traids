@@ -300,7 +300,7 @@ export const CorrelationMatrixView: React.FC<CorrelationMatrixViewProps> = ({
               </thead>
               <tbody>
                 {matrixData.symbols.map((symA, i) => (
-                  <tr key={symA} className="hover:bg-slate-850/50 transition-colors">
+                  <tr key={symA} className="hover:bg-slate-800/50 transition-colors">
                     {/* Row Header */}
                     <td className="p-2 font-bold text-white whitespace-nowrap sticky left-0 bg-slate-900 z-10 border-r border-slate-800">
                       <button

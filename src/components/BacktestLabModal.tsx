@@ -373,7 +373,7 @@ export const BacktestLabModal: React.FC<BacktestLabModalProps> = ({
                     <div key={idx} className="flex items-center justify-between py-1 border-b border-slate-900 last:border-0">
                       <div className="flex items-center gap-2">
                         <span
-                          className={`px-1.5 py-0.2 rounded font-bold text-[9px] ${
+                          className={`px-1.5 py-0.5 rounded font-bold text-[9px] ${
                             t.side === 'BUY'
                               ? 'bg-emerald-500/20 text-emerald-300'
                               : 'bg-rose-500/20 text-rose-300'
