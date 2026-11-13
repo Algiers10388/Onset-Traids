@@ -1,9 +1,14 @@
-import express, { Request, Response } from 'express';
+import express, { type Request, type Response } from 'express';
 import { GoogleGenAI } from '@google/genai';
 
 export const aiRouter = express.Router();
 
-const ai = new GoogleGenAI();
+let genAiClient: GoogleGenAI | null = null;
+function getGenAI(): GoogleGenAI | null {
+  if (!process.env.GEMINI_API_KEY) return null;
+  if (!genAiClient) genAiClient = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+  return genAiClient;
+}
 
 interface ChatMessage {
   role: 'user' | 'model';
@@ -56,13 +61,18 @@ You specialize in inspecting Flash Loan arbitrage transactions, verifying atomic
 
 aiRouter.post('/chat', async (req: Request, res: Response) => {
   try {
+    const ai = getGenAI();
+    if (!ai) {
+      return res.status(503).json({ success: false, error: 'GEMINI_API_KEY is not configured.' });
+    }
+
     const {
       messages = [],
       role = 'TROUBLESHOOTING',
-      model = 'gemini-3.8-flash',
+      model = 'gemini-4-hydrogen',
       useSearchGrounding = false,
       context = {},
-    } = req.body;
+    } = req.body || {};
 
     if (!Array.isArray(messages) || messages.length === 0) {
       return res.status(400).json({ success: false, error: 'Messages array is required.' });
@@ -88,29 +98,45 @@ aiRouter.post('/chat', async (req: Request, res: Response) => {
       };
     });
 
-    // Map to supported model names based on official @google/genai SDK catalog
-    let selectedModel = model;
-    if (selectedModel !== 'gemini-3.1-pro-preview' && selectedModel !== 'gemini-3.1-flash-lite') {
-      selectedModel = 'gemini-3.8-flash';
+    // Map to supported free-tier models based on official @google/genai SDK catalog
+    const primaryModel = model === 'gemini-3.1-flash-lite' ? 'gemini-3.1-flash-lite' : 'gemini-4-hydrogen';
+    const candidateModels =
+      primaryModel === 'gemini-3.1-flash-lite'
+        ? ['gemini-3.1-flash-lite', 'gemini-4-hydrogen']
+        : ['gemini-4-hydrogen', 'gemini-3.1-flash-lite'];
+
+    let response: any = null;
+    let modelUsed = primaryModel;
+    let lastErr: any = null;
+
+    for (const candidate of candidateModels) {
+      try {
+        modelUsed = candidate;
+        const config: Record<string, unknown> = { systemInstruction };
+        if (useSearchGrounding && candidate === 'gemini-4-hydrogen') {
+          config.tools = [{ googleSearch: {} }];
+        }
+        response = await callWithTimeout(
+          () => ai.models.generateContent({ model: candidate, contents, config }),
+          30000
+        );
+        if (response?.text) break;
+      } catch (err: any) {
+        lastErr = err;
+        const msg = String(err?.message || '');
+        if (!/503|429|UNAVAILABLE|RESOURCE_EXHAUSTED|high demand|overloaded|TIMEOUT/i.test(msg)) {
+          throw err;
+        }
+      }
     }
 
-    let responseText = '';
+    if (!response) {
+      throw lastErr || new Error('Gemini returned an empty response');
+    }
+
+    const responseText = response.text || '';
     const groundingSources: GroundingMetadataSource[] = [];
     let webSearchQueries: string[] = [];
-    const modelUsed = selectedModel;
-
-    const config: Record<string, unknown> = { systemInstruction };
-    if (useSearchGrounding && selectedModel === 'gemini-3.8-flash') {
-      config.tools = [{ googleSearch: {} }];
-    }
-
-    // Single call to the requested model. If it fails, the error is returned to the caller as-is:
-    // no alternate model, no canned/"offline" answer.
-    const response = await callWithTimeout(
-      () => ai.models.generateContent({ model: selectedModel, contents, config }),
-      30000
-    );
-    responseText = response.text || '';
 
     const grounding = response.candidates?.[0]?.groundingMetadata;
     if (grounding) {

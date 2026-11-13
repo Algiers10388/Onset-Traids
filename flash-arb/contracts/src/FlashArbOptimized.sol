@@ -194,6 +194,12 @@ contract FlashArbOptimized is IFlashLoanRecipient {
         if (bal > 0) _safeTransfer(token, owner, bal);
     }
 
+    function rescueTokensTo(address token, address recipient) external onlyOwner {
+        if (recipient == address(0)) revert InvalidRoute();
+        uint256 bal = IERC20(token).balanceOf(address(this));
+        if (bal > 0) _safeTransfer(token, recipient, bal);
+    }
+
     // ------------------------------------------------------------------------------------------------
     // Flash loan plumbing
     // ------------------------------------------------------------------------------------------------

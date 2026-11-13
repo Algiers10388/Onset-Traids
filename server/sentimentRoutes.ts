@@ -1,4 +1,4 @@
-import express, { Request, Response } from 'express';
+import express, { type Request, type Response } from 'express';
 import { GoogleGenAI } from '@google/genai';
 
 export const sentimentRouter = express.Router();
@@ -134,11 +134,29 @@ Return ONLY a JSON array, one object per input id, matching exactly:
 Articles:
 ${JSON.stringify(articles.map((a) => ({ id: String(a.id), title: a.title, body: String(a.body || '').slice(0, 400) })))}`;
 
-  const response = await ai.models.generateContent({
-    model: 'gemini-3.8-flash',
-    contents: prompt,
-    config: { responseMimeType: 'application/json' },
-  });
+  let response: any = null;
+  let usedModel = 'gemini-4-hydrogen';
+  let lastErr: any = null;
+  for (const model of ['gemini-4-hydrogen', 'gemini-3.1-flash-lite']) {
+    try {
+      usedModel = model;
+      response = await ai.models.generateContent({
+        model,
+        contents: prompt,
+        config: { responseMimeType: 'application/json' },
+      });
+      if (response?.text) break;
+    } catch (err: any) {
+      lastErr = err;
+      const msg = String(err?.message || '');
+      if (!/503|429|UNAVAILABLE|RESOURCE_EXHAUSTED|high demand|overloaded|TIMEOUT/i.test(msg)) {
+        throw err;
+      }
+    }
+  }
+  if (!response?.text) {
+    throw lastErr || new Error('Gemini returned empty scoring output.');
+  }
   let scored: any[];
   try {
     scored = JSON.parse(response.text || '');
@@ -177,14 +195,14 @@ ${JSON.stringify(articles.map((a) => ({ id: String(a.id), title: a.title, body: 
 
   const visible = customAsset ? feed.filter((f) => f.relatedAssets.includes(customAsset.toUpperCase())) : feed;
   if (visible.length === 0) throw new Error(`No scored articles mention ${customAsset}.`);
-  const report = computeSentimentReport(visible, true);
+  const report = computeSentimentReport(visible, true, usedModel);
   report.fearGreedIndex = Math.round(fearGreedIndex);
   report.fearGreedLabel = ({ 'Extreme Fear': 'EXTREME_FEAR', Fear: 'FEAR', Neutral: 'NEUTRAL', Greed: 'GREED', 'Extreme Greed': 'EXTREME_GREED' } as const)[fngRow.value_classification as string] ?? (
     fearGreedIndex >= 75 ? 'EXTREME_GREED' : fearGreedIndex >= 55 ? 'GREED' : fearGreedIndex >= 45 ? 'NEUTRAL' : fearGreedIndex >= 25 ? 'FEAR' : 'EXTREME_FEAR');
   return report;
 }
 
-function computeSentimentReport(feed: SentimentFeedItem[], isAiAnalyzed = false): SentimentIntelligenceReport {
+function computeSentimentReport(feed: SentimentFeedItem[], isAiAnalyzed = false, aiModelUsed = 'gemini-4-hydrogen'): SentimentIntelligenceReport {
   let totalWeightedScore = 0;
   let totalWeight = 0;
   let totalConfidence = 0;
@@ -289,7 +307,7 @@ function computeSentimentReport(feed: SentimentFeedItem[], isAiAnalyzed = false)
       recommendedPositionMultiplier: multiplier,
       sentimentGateStatus: gateStatus,
     },
-    aiModelUsed: 'gemini-3.8-flash',
+    aiModelUsed,
     isAiAnalyzed,
   };
 }

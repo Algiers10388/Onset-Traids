@@ -1,15 +1,15 @@
-import express, { Request, Response } from "express";
+import express, { type Request, type Response } from "express";
 import crypto from "crypto";
 import fs from "fs";
 import path from "path";
-import { plaidConfig, plaidRequest, plaidStore } from "./plaidClient";
-import { paypalConfig, paypalRequest } from "./paypalClient";
-import {
+import { plaidConfig, plaidRequest, plaidStore } from "./plaidClient.ts";
+import { paypalConfig, paypalRequest } from "./paypalClient.ts";
+import type {
   FiatAccount,
   FiatTransaction,
   BotSecuritySettings,
   SecurityAuditReport,
-} from "../src/types";
+} from "../src/types.ts";
 
 /**
  * Fiat ledger + routes (LIVE MONEY ONLY).

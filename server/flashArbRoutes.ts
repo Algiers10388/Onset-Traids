@@ -1,14 +1,20 @@
-import { Router, Request, Response } from 'express';
-import { sizeArbitrage, MAX_DEPTH_FRACTION } from './arbSizing';
+import { Router, type Request, type Response } from 'express';
+import { ethers } from 'ethers';
+import { sizeArbitrage, MAX_DEPTH_FRACTION } from './arbSizing.ts';
+import {
+  ARBITRUM_TOKENS,
+  ARBITRUM_DEX_ROUTERS,
+  resolveArbitrageCandidates,
+  encodeExecuteDirectFlashArb,
+  encodeRescueTokens,
+  encodeRescueTokensTo,
+  encodeErc20Transfer,
+  decodeArbitrageSwapsExecutedLogs,
+  decodeFlashArbRevertError,
+  type RouteExecutionInput,
+} from './flashArbExecutor.ts';
 
 export const flashArbRouter = Router();
-
-// Default addresses specified by user
-// The server-side "agent" only models prices heuristically and its broadcast path calls executeDirectFlashArb(),
-// which just sweeps ETH (no arbitrage). Real execution is done by the Rust searcher (flash-arb/searcher), which
-// verifies every trade with eth_estimateGas. Server broadcasting of agent "trades" is therefore disabled.
-const SERVER_EXECUTION_DISABLED_MSG =
-  'Server-side agent execution is disabled: it only sweeps ETH and does not perform arbitrage. Run flash-arb/searcher (Rust) for verified execution.';
 
 // Wallet addresses come ONLY from env (FLASH_ARB_GAS_WALLET / FLASH_ARB_PROFIT_WALLET); no built-in defaults.
 const gasWalletEnv = () => (process.env.FLASH_ARB_GAS_WALLET || '').trim();
@@ -19,6 +25,15 @@ export const ARBITRUM_RPC_POOL = [
   'https://arbitrum-one-rpc.publicnode.com',
   'https://1rpc.io/arb',
   'https://arb1.arbitrum.io/rpc',
+  'https://arbitrum.meowrpc.com',
+].filter(Boolean) as string[];
+
+// PublicNode rejects eth_getTransactionReceipt with -32602 ("Archive requests require a personal token"),
+// so tx submission, deployment, and receipt verification use receipt-capable endpoints first.
+export const ARBITRUM_TX_RPC_POOL = [
+  process.env.ARBITRUM_RPC_URL,
+  'https://arb1.arbitrum.io/rpc',
+  'https://1rpc.io/arb',
   'https://arbitrum.meowrpc.com',
 ].filter(Boolean) as string[];
 
@@ -46,7 +61,7 @@ const RPC_ENDPOINTS: Record<string, {
 }> = {
   arbitrum: {
     name: 'Arbitrum One',
-    rpc: ARBITRUM_RPC_POOL[0],
+    rpc: ARBITRUM_TX_RPC_POOL[0],
     explorer: 'https://arbiscan.io',
     chainId: 42161,
     balancerVault: '0xBA12222222228d8Ba445958a75a0704d566BF2C8',
@@ -125,6 +140,117 @@ async function fetchRpcBatchWithFailover(chain: 'arbitrum' | 'base' | 'optimism'
   }
 
   throw lastError || new Error(`All ${chain} RPC endpoints failed`);
+}
+
+function getRpcPool(chain: string, txCapable = false): string[] {
+  const c = chain.toLowerCase();
+  if (c === 'base') return BASE_RPC_POOL;
+  if (c === 'optimism') return OPTIMISM_RPC_POOL;
+  return txCapable ? ARBITRUM_TX_RPC_POOL : ARBITRUM_RPC_POOL;
+}
+
+async function fetchRpcSingleWithFailover(
+  chain: string,
+  method: string,
+  params: any[],
+  txCapable = false
+): Promise<{ result: any; rpcUrl: string }> {
+  const pool = getRpcPool(chain, txCapable);
+  const candidates = [...pool].sort((a, b) => (rpcCooldowns.get(a) || 0) - (rpcCooldowns.get(b) || 0));
+  let lastError: Error | null = null;
+
+  for (const url of candidates) {
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 7000);
+      const resp = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', method, params, id: Date.now() }),
+        signal: controller.signal,
+      });
+      clearTimeout(timeout);
+
+      if (resp.status === 429 || resp.status === 403) {
+        rpcCooldowns.set(url, Date.now() + 45000);
+        lastError = new Error(`${chain} RPC HTTP ${resp.status} on ${url}`);
+        continue;
+      }
+
+      const json: any = await resp.json();
+      if (json?.error) {
+        const errMsg = String(json.error.message || `RPC error ${json.error.code} on ${url}`);
+        const errCode = Number(json.error.code);
+        const isEvmRevert =
+          errCode === 3 ||
+          typeof json.error.data === 'string' ||
+          /revert|insufficient|execution reverted/i.test(errMsg);
+
+        if (isEvmRevert) {
+          rpcCooldowns.delete(url);
+          const revertErr: any = new Error(errMsg);
+          revertErr.code = errCode;
+          revertErr.data = json.error.data;
+          throw revertErr;
+        }
+
+        rpcCooldowns.set(url, Date.now() + 30000);
+        lastError = new Error(errMsg);
+        continue;
+      }
+
+      if (!resp.ok) {
+        rpcCooldowns.set(url, Date.now() + 15000);
+        lastError = new Error(`${chain} RPC HTTP ${resp.status} on ${url}`);
+        continue;
+      }
+
+      rpcCooldowns.delete(url);
+      return { result: json.result, rpcUrl: url };
+    } catch (err: any) {
+      if (err?.code === 3 || typeof err?.data === 'string' || /revert|execution reverted/i.test(String(err?.message || ''))) {
+        throw err;
+      }
+      rpcCooldowns.set(url, Date.now() + 20000);
+      lastError = err;
+    }
+  }
+
+  throw lastError || new Error(`All ${chain} RPC endpoints failed for ${method}`);
+}
+
+async function waitForReceiptWithFailover(
+  chain: string,
+  txHash: string,
+  timeoutMs = 45000
+): Promise<{
+  status: number;
+  blockNumber: number;
+  gasUsed: bigint;
+  effectiveGasPrice: bigint | null;
+  contractAddress?: string | null;
+  logs: Array<{ address?: string; topics: string[]; data: string }>;
+}> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const { result } = await fetchRpcSingleWithFailover(chain, 'eth_getTransactionReceipt', [txHash], true);
+      if (result && result.blockNumber) {
+        return {
+          status: result.status === '0x1' || result.status === 1 ? 1 : 0,
+          blockNumber: parseInt(result.blockNumber, 16),
+          gasUsed: result.gasUsed ? BigInt(result.gasUsed) : 0n,
+          effectiveGasPrice: result.effectiveGasPrice ? BigInt(result.effectiveGasPrice) : null,
+          contractAddress: result.contractAddress || null,
+          logs: Array.isArray(result.logs) ? result.logs : [],
+        };
+      }
+    } catch {
+      // Transient RPC error; keep polling across remaining pool endpoints until deadline
+    }
+    await new Promise((r) => setTimeout(r, 1500));
+  }
+  throw new Error(`Timed out waiting for transaction receipt (${txHash}) on ${chain}`);
 }
 
 /**
@@ -360,6 +486,33 @@ flashArbRouter.post('/signer-config', (req: Request, res: Response) => {
 });
 
 /**
+ * POST /api/flash-arb/profit-wallet
+ * Syncs the configured profit recipient wallet (and optional gas wallet) into server runtime memory
+ */
+flashArbRouter.post('/profit-wallet', (req: Request, res: Response) => {
+  try {
+    const { profitWallet, gasWallet } = req.body || {};
+    if (!profitWallet || typeof profitWallet !== 'string' || !/^0x[a-fA-F0-9]{40}$/i.test(profitWallet.trim())) {
+      return res.status(400).json({
+        success: false,
+        error: 'Valid 42-character EVM address (0x...) is required for profitWallet.',
+      });
+    }
+    process.env.FLASH_ARB_PROFIT_WALLET = profitWallet.trim();
+    if (gasWallet && typeof gasWallet === 'string' && /^0x[a-fA-F0-9]{40}$/i.test(gasWallet.trim())) {
+      process.env.FLASH_ARB_GAS_WALLET = gasWallet.trim();
+    }
+    return res.json({
+      success: true,
+      profitWallet: process.env.FLASH_ARB_PROFIT_WALLET,
+      gasWallet: gasWalletEnv(),
+    });
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+/**
  * DELETE /api/flash-arb/signer-config
  * Clears signer key from server memory
  */
@@ -425,18 +578,8 @@ flashArbRouter.get('/contract-status', async (req: Request, res: Response) => {
       return res.status(400).json({ success: false, error: 'Invalid EVM contract address' });
     }
 
-    const resp = await fetch(rpcInfo.rpc, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        jsonrpc: '2.0',
-        method: 'eth_getCode',
-        params: [address, 'latest'],
-        id: 1,
-      }),
-    });
-    const data = await resp.json();
-    const code = data?.result || '0x';
+    const { result: codeRaw } = await fetchRpcSingleWithFailover(chain, 'eth_getCode', [address, 'latest'], true);
+    const code = codeRaw || '0x';
     const isDeployed = code !== '0x' && code.length > 2;
 
     return res.json({
@@ -469,19 +612,9 @@ flashArbRouter.post('/broadcast', async (req: Request, res: Response) => {
       });
     }
 
-    // Verify target contract code
-    const codeCheck = await fetch(rpcInfo.rpc, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        jsonrpc: '2.0',
-        method: 'eth_getCode',
-        params: [to, 'latest'],
-        id: 1,
-      }),
-    });
-    const codeData = await codeCheck.json();
-    const code = codeData?.result || '0x';
+    // Verify target contract code using failover RPC pool
+    const { result: codeRaw } = await fetchRpcSingleWithFailover(targetChain, 'eth_getCode', [to, 'latest'], true);
+    const code = codeRaw || '0x';
     if (code === '0x' || code.length <= 2) {
       return res.status(400).json({
         success: false,
@@ -491,24 +624,67 @@ flashArbRouter.post('/broadcast', async (req: Request, res: Response) => {
     }
 
     const { ethers } = await import('ethers');
-    const provider = new ethers.JsonRpcProvider(rpcInfo.rpc);
-    const wallet = new ethers.Wallet(process.env.FLASH_ARB_SIGNER_KEY, provider);
+    const txPool = getRpcPool(targetChain, true);
+    let tx: any = null;
+    let lastSendErr: any = null;
+    const callData = typeof data === 'string' && data ? data : '0x';
+    const isDirectSweepSelector = callData.toLowerCase().startsWith('0x7804d9ac');
 
-    const balanceWei = await provider.getBalance(wallet.address);
-    if (balanceWei < 100000000000000n) { // 0.0001 ETH
-      return res.status(400).json({
-        success: false,
-        error: `Insufficient gas balance: ${wallet.address} holds ${ethers.formatEther(balanceWei)} ETH on ${rpcInfo.name}, which is below required gas threshold.`,
-      });
+    // Pre-check contract owner() so non-owner signers fail fast before burning gas on an Unauthorized() revert
+    try {
+      const { result: ownerRaw } = await fetchRpcSingleWithFailover(
+        targetChain,
+        'eth_call',
+        [{ to, data: '0x8da5cb5b' }, 'latest'],
+        true
+      );
+      if (typeof ownerRaw === 'string' && ownerRaw.length >= 66) {
+        const contractOwner = ethers.getAddress(`0x${ownerRaw.slice(-40)}`);
+        const signerAddr = new ethers.Wallet(process.env.FLASH_ARB_SIGNER_KEY).address;
+        if (contractOwner.toLowerCase() !== signerAddr.toLowerCase()) {
+          return res.status(400).json({
+            success: false,
+            error: `Signer wallet ${signerAddr} is not the owner of contract ${to} (owner is ${contractOwner}). Deploy your own contract with this signer or switch to the owner key so onlyOwner sweep/arb calls do not revert.`,
+          });
+        }
+      }
+    } catch {
+      // Contract may not expose owner(); proceed to tx send
     }
 
-    const tx = await wallet.sendTransaction({
-      to,
-      data: data || '0x',
-      gasLimit: gasLimit ? BigInt(gasLimit) : 300000n,
-    });
+    for (const rpcUrl of txPool) {
+      try {
+        const provider = new ethers.JsonRpcProvider(rpcUrl);
+        const wallet = new ethers.Wallet(process.env.FLASH_ARB_SIGNER_KEY, provider);
 
-    const receipt = await tx.wait(1);
+        const balanceWei = await provider.getBalance(wallet.address);
+        if (balanceWei < 100000000000000n) { // 0.0001 ETH
+          return res.status(400).json({
+            success: false,
+            error: `Insufficient gas balance: ${wallet.address} holds ${ethers.formatEther(balanceWei)} ETH on ${rpcInfo.name}, which is below required gas threshold.`,
+          });
+        }
+
+        tx = await wallet.sendTransaction({
+          to,
+          data: callData,
+          gasLimit: gasLimit ? BigInt(gasLimit) : 300000n,
+        });
+        break;
+      } catch (err: any) {
+        lastSendErr = err;
+        const msg = String(err?.message || '');
+        if (!/429|403|timeout|fetch|coalesce|archive|network|ECONN|socket/i.test(msg)) {
+          throw err;
+        }
+      }
+    }
+
+    if (!tx) {
+      throw lastSendErr || new Error(`Failed to broadcast transaction on ${rpcInfo.name}`);
+    }
+
+    const receipt = await waitForReceiptWithFailover(targetChain, tx.hash, 45000);
     if (!receipt || receipt.status !== 1) {
       return res.status(500).json({
         success: false,
@@ -523,6 +699,7 @@ flashArbRouter.post('/broadcast', async (req: Request, res: Response) => {
       chain: rpcInfo.name,
       blockNumber: receipt.blockNumber,
       gasUsed: receipt.gasUsed.toString(),
+      isEthSweepOnly: isDirectSweepSelector,
       explorerUrl: `${rpcInfo.explorer}/tx/${tx.hash}`,
     });
   } catch (err: any) {
@@ -577,7 +754,7 @@ flashArbRouter.get('/deploy-payload', async (req: Request, res: Response) => {
 
 // In-memory registry of active FlashArb contract addresses per chain
 const DEPLOYED_CONTRACTS: Record<string, string> = {
-  arbitrum: '0x19359c6C418669FCfC46196970814353b8766BE0',
+  arbitrum: '0xeee31ff9e69904b43c124095b6f33aa61505bcc2',
   base: '0x29B35c83955146Ba8fd754B4b96956D245A5661e',
   optimism: '0x738C8Eb31316B23d9b8A68B0c2658B456c932598',
 };
@@ -653,29 +830,60 @@ flashArbRouter.post('/deploy-contract', async (req: Request, res: Response) => {
       });
     }
 
-    const provider = new ethers.JsonRpcProvider(rpcInfo.rpc);
+    const txPool = getRpcPool(targetChain, true);
     const cleanKey = signerKey.startsWith('0x') ? signerKey : `0x${signerKey}`;
-    const wallet = new ethers.Wallet(cleanKey, provider);
+    let deployedAddress: string | null = null;
+    let txHash = '';
+    let walletAddress = '';
+    let lastDeployErr: any = null;
 
-    const balanceWei = await provider.getBalance(wallet.address);
-    const minRequiredWei = 100000000000000n; // 0.0001 ETH
-    if (balanceWei < minRequiredWei) {
-      return res.status(400).json({
-        success: false,
-        error: `Deployer wallet ${wallet.address} has ${ethers.formatEther(balanceWei)} ETH on ${rpcInfo.name}. Contract deployment requires ~0.0003 ETH for L2 gas. Please fund ${wallet.address} or deploy with your connected wallet.`,
-        deployerAddress: wallet.address,
-        balanceEth: ethers.formatEther(balanceWei),
-      });
+    for (const rpcUrl of txPool) {
+      try {
+        const provider = new ethers.JsonRpcProvider(rpcUrl);
+        const wallet = new ethers.Wallet(cleanKey, provider);
+        walletAddress = wallet.address;
+
+        const balanceWei = await provider.getBalance(wallet.address);
+        const minRequiredWei = 100000000000000n; // 0.0001 ETH
+        if (balanceWei < minRequiredWei) {
+          return res.status(400).json({
+            success: false,
+            error: `Deployer wallet ${wallet.address} has ${ethers.formatEther(balanceWei)} ETH on ${rpcInfo.name}. Contract deployment requires ~0.0003 ETH for L2 gas. Please fund ${wallet.address} or deploy with your connected wallet.`,
+            deployerAddress: wallet.address,
+            balanceEth: ethers.formatEther(balanceWei),
+          });
+        }
+
+        const factory = new ethers.ContractFactory(artifact.abi, artifact.bytecode, wallet);
+        const contract = await factory.deploy(rpcInfo.balancerVault, rpcInfo.aavePool);
+        const deployTx = contract.deploymentTransaction();
+        txHash = deployTx ? deployTx.hash : '';
+
+        if (txHash) {
+          const receipt = await waitForReceiptWithFailover(targetChain, txHash, 60000);
+          if (receipt.status !== 1) {
+            throw new Error('Contract deployment transaction reverted on-chain.');
+          }
+          deployedAddress = receipt.contractAddress || (await contract.getAddress());
+        } else {
+          await contract.waitForDeployment();
+          deployedAddress = await contract.getAddress();
+        }
+        break;
+      } catch (err: any) {
+        lastDeployErr = err;
+        const msg = String(err?.message || '');
+        if (!/429|403|timeout|fetch|coalesce|archive|network|ECONN|socket/i.test(msg)) {
+          throw err;
+        }
+      }
     }
 
-    const factory = new ethers.ContractFactory(artifact.abi, artifact.bytecode, wallet);
-    const contract = await factory.deploy(rpcInfo.balancerVault, rpcInfo.aavePool);
-
-    const deployTx = contract.deploymentTransaction();
-    const txHash = deployTx ? deployTx.hash : '';
-
-    await contract.waitForDeployment();
-    const contractAddress = await contract.getAddress();
+    if (!deployedAddress) {
+      throw lastDeployErr || new Error(`Contract deployment failed on ${rpcInfo.name}`);
+    }
+    const contractAddress = deployedAddress;
+    const wallet = { address: walletAddress };
 
     // Register into active deployed contracts store
     DEPLOYED_CONTRACTS[targetChain] = contractAddress;
@@ -745,6 +953,7 @@ export interface LiveArbitrageOpportunity {
   gasSavingsPercent: number;
   priceImpactBps: number;
   routeType: number;
+  contractExecutable?: boolean;
 }
 
 export interface ExecutedAgentTrade {
@@ -764,19 +973,22 @@ export interface ExecutedAgentTrade {
 }
 
 // In-Memory Live Agent State with Dynamic Parameter Optimizer & Strict Profit Guard
-// ---- Monitored Arbitrum One pools -------------------------------------------------------------
-// Token addresses are the canonical Arbitrum One tokens. Orientation (token0/token1) is derived from the
-// addresses, never assumed. Pool addresses come from the original project config.
+// ---- Monitored Arbitrum One pools (60 verified on-chain pools across 16 pairs & 6 DEXes) ----
+// Every pool address was verified on Arbitrum One via factory getPool / getPair / poolByPair.
 interface Tok { sym: string; addr: string; dec: number }
 const T = {
   WETH: { sym: 'WETH', addr: '0x82aF49447D8a07e3bd95BD0d56f35241523fBab1', dec: 18 },
   USDC: { sym: 'USDC', addr: '0xaf88d065e77c8cC2239327C5EDb3A432268e5831', dec: 6 },
+  USDCe: { sym: 'USDC.e', addr: '0xFF970A61A04b1cA14834A43f5dE4533eBDDB5CC8', dec: 6 },
   USDT: { sym: 'USDT', addr: '0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9', dec: 6 },
   DAI: { sym: 'DAI', addr: '0xDA10009cBd5D07dd0CeCc66161FC93D7c9000da1', dec: 18 },
   ARB: { sym: 'ARB', addr: '0x912CE59144191C1204E64559FE8253a0e49E6548', dec: 18 },
   WBTC: { sym: 'WBTC', addr: '0x2f2a2543B76A4166549F7aaB2e75Bef0aefC5B0f', dec: 8 },
   LINK: { sym: 'LINK', addr: '0xf97f4df75117a78c1A5a0DBb814Af92458539FB4', dec: 18 },
   GMX: { sym: 'GMX', addr: '0xfc5A1A6EB076a2C7aD06eD22C90d7E710E35ad0a', dec: 18 },
+  AAVE: { sym: 'AAVE', addr: '0xba5DdD1f9d7F570dc94a51479a000E3BCE967196', dec: 18 },
+  PENDLE: { sym: 'PENDLE', addr: '0x0c880f6761F1af8d9Aa9C466984b80DAb9a8c9e8', dec: 18 },
+  UNI: { sym: 'UNI', addr: '0xFa7F8980b0f1E64A2062791cc3b0871572f1F7f0', dec: 18 },
   wstETH: { sym: 'wstETH', addr: '0x5979D7b546E38E414F7E9822514be443A4800529', dec: 18 },
 } satisfies Record<string, Tok>;
 
@@ -785,26 +997,111 @@ interface PoolSpec {
   kind: 'v3' | 'algebra' | 'v2'; base: Tok; quote: Tok;
 }
 const POOL_SPECS: PoolSpec[] = [
+  // WETH / USDC (8 pools across 5 DEXes)
   { id: 'univ3_weth_usdc_005', name: 'Uniswap V3 WETH/USDC (0.05%)', dex: 'Uniswap V3', pair: 'WETH/USDC', address: '0xC6962004f452bE9203591991D15f6b388e09E8D0', fee: 0.05, kind: 'v3', base: T.WETH, quote: T.USDC },
   { id: 'univ3_weth_usdc_030', name: 'Uniswap V3 WETH/USDC (0.30%)', dex: 'Uniswap V3', pair: 'WETH/USDC', address: '0xc473e2aEE3441BF9240Be85eb122aBB059A3B57c', fee: 0.30, kind: 'v3', base: T.WETH, quote: T.USDC },
-  { id: 'univ3_weth_usdc_001', name: 'Uniswap V3 WETH/USDC (0.01%)', dex: 'Uniswap V3', pair: 'WETH/USDC', address: '0x8fe3922B7f525593033B79d618808d63164C91f8', fee: 0.01, kind: 'v3', base: T.WETH, quote: T.USDC },
-  { id: 'sushi_weth_usdc', name: 'Sushiswap V2 WETH/USDC (0.30%)', dex: 'Sushiswap V2', pair: 'WETH/USDC', address: '0x905dfCD5649217c42684f23958568e533C711Aa3', fee: 0.30, kind: 'v2', base: T.WETH, quote: T.USDC },
-  { id: 'camelot_v3_weth_usdc', name: 'Camelot V3 WETH/USDC', dex: 'Camelot V3', pair: 'WETH/USDC', address: '0x521e2d3122c60868f7F2b1dF6f0F01B6c90866a1', fee: 0.08, kind: 'algebra', base: T.WETH, quote: T.USDC },
-  { id: 'pancake_v3_weth_usdc', name: 'PancakeSwap V3 WETH/USDC (0.05%)', dex: 'PancakeSwap V3', pair: 'WETH/USDC', address: '0x6a0f0B8B082Db14032ceae251141703274bE348F', fee: 0.05, kind: 'v3', base: T.WETH, quote: T.USDC },
+  { id: 'univ3_weth_usdc_001', name: 'Uniswap V3 WETH/USDC (0.01%)', dex: 'Uniswap V3', pair: 'WETH/USDC', address: '0x6f38e884725a116C9C7fBF208e79FE8828a2595F', fee: 0.01, kind: 'v3', base: T.WETH, quote: T.USDC },
+  { id: 'univ3_weth_usdc_100', name: 'Uniswap V3 WETH/USDC (1.00%)', dex: 'Uniswap V3', pair: 'WETH/USDC', address: '0x42FC852A750BA93D5bf772ecdc857e87a86403a9', fee: 1.00, kind: 'v3', base: T.WETH, quote: T.USDC },
+  { id: 'pancake_v3_weth_usdc_005', name: 'PancakeSwap V3 WETH/USDC (0.05%)', dex: 'PancakeSwap V3', pair: 'WETH/USDC', address: '0xd9e2a1a61B6E61b275cEc326465d417e52C1b95c', fee: 0.05, kind: 'v3', base: T.WETH, quote: T.USDC },
+  { id: 'pancake_v3_weth_usdc_001', name: 'PancakeSwap V3 WETH/USDC (0.01%)', dex: 'PancakeSwap V3', pair: 'WETH/USDC', address: '0x7fCDC35463E3770c2fB992716Cd070B63540b947', fee: 0.01, kind: 'v3', base: T.WETH, quote: T.USDC },
+  { id: 'sushiv3_weth_usdc_005', name: 'SushiSwap V3 WETH/USDC (0.05%)', dex: 'SushiSwap V3', pair: 'WETH/USDC', address: '0xf3Eb87C1F6020982173C908E7eB31aA66c1f0296', fee: 0.05, kind: 'v3', base: T.WETH, quote: T.USDC },
+  { id: 'sushi_weth_usdc', name: 'Sushiswap V2 WETH/USDC (0.30%)', dex: 'Sushiswap V2', pair: 'WETH/USDC', address: '0x57b85FEf094e10b5eeCDF350Af688299E9553378', fee: 0.30, kind: 'v2', base: T.WETH, quote: T.USDC },
+  { id: 'camelot_v3_weth_usdc', name: 'Camelot V3 WETH/USDC', dex: 'Camelot V3', pair: 'WETH/USDC', address: '0xB1026b8e7276e7AC75410F1fcbbe21796e8f7526', fee: 0.01, kind: 'algebra', base: T.WETH, quote: T.USDC },
+
+  // WETH / USDT (7 pools across 5 DEXes)
   { id: 'univ3_weth_usdt_005', name: 'Uniswap V3 WETH/USDT (0.05%)', dex: 'Uniswap V3', pair: 'WETH/USDT', address: '0x641C00A822e8b671738d32a431a4Fb6074E5c79d', fee: 0.05, kind: 'v3', base: T.WETH, quote: T.USDT },
-  { id: 'sushi_weth_usdt', name: 'Sushiswap V2 WETH/USDT (0.30%)', dex: 'Sushiswap V2', pair: 'WETH/USDT', address: '0xcb0e14E6d3D9206eA2ff3c5B610F5570d7c66C52', fee: 0.30, kind: 'v2', base: T.WETH, quote: T.USDT },
+  { id: 'univ3_weth_usdt_030', name: 'Uniswap V3 WETH/USDT (0.30%)', dex: 'Uniswap V3', pair: 'WETH/USDT', address: '0xc82819F72A9e77E2c0c3A69B3196478f44303cf4', fee: 0.30, kind: 'v3', base: T.WETH, quote: T.USDT },
+  { id: 'univ3_weth_usdt_001', name: 'Uniswap V3 WETH/USDT (0.01%)', dex: 'Uniswap V3', pair: 'WETH/USDT', address: '0x42161084d0672e1d3F26a9B53E653bE2084ff19C', fee: 0.01, kind: 'v3', base: T.WETH, quote: T.USDT },
+  { id: 'pancake_v3_weth_usdt_005', name: 'PancakeSwap V3 WETH/USDT (0.05%)', dex: 'PancakeSwap V3', pair: 'WETH/USDT', address: '0x0BaCc7a9717e70EA0DA5Ac075889Bd87d4C81197', fee: 0.05, kind: 'v3', base: T.WETH, quote: T.USDT },
+  { id: 'pancake_v3_weth_usdt_001', name: 'PancakeSwap V3 WETH/USDT (0.01%)', dex: 'PancakeSwap V3', pair: 'WETH/USDT', address: '0x389938CF14Be379217570D8e4619E51fBDafaa21', fee: 0.01, kind: 'v3', base: T.WETH, quote: T.USDT },
+  { id: 'pancake_v3_weth_usdt_025', name: 'PancakeSwap V3 WETH/USDT (0.25%)', dex: 'PancakeSwap V3', pair: 'WETH/USDT', address: '0xAEaB1336Efc2bf74bC89FCf0E33E6013f3C8587E', fee: 0.25, kind: 'v3', base: T.WETH, quote: T.USDT },
+  { id: 'sushiv3_weth_usdt_005', name: 'SushiSwap V3 WETH/USDT (0.05%)', dex: 'SushiSwap V3', pair: 'WETH/USDT', address: '0x96aDA81328abCe21939A51D971A63077e16db26E', fee: 0.05, kind: 'v3', base: T.WETH, quote: T.USDT },
+  { id: 'sushiv3_weth_usdt_030', name: 'SushiSwap V3 WETH/USDT (0.30%)', dex: 'SushiSwap V3', pair: 'WETH/USDT', address: '0x92d543A8a158A6bC2C7018ae17803819Cb9150B2', fee: 0.30, kind: 'v3', base: T.WETH, quote: T.USDT },
+  { id: 'sushi_weth_usdt', name: 'Sushiswap V2 WETH/USDT (0.30%)', dex: 'Sushiswap V2', pair: 'WETH/USDT', address: '0xCB0E5bFa72bBb4d16AB5aA0c60601c438F04b4ad', fee: 0.30, kind: 'v2', base: T.WETH, quote: T.USDT },
+
+  // WETH / USDC.e (5 pools across 4 DEXes)
+  { id: 'univ3_weth_usdce_005', name: 'Uniswap V3 WETH/USDC.e (0.05%)', dex: 'Uniswap V3', pair: 'WETH/USDC.e', address: '0xC31E54c7a869B9FcBEcc14363CF510d1c41fa443', fee: 0.05, kind: 'v3', base: T.WETH, quote: T.USDCe },
+  { id: 'univ3_weth_usdce_030', name: 'Uniswap V3 WETH/USDC.e (0.30%)', dex: 'Uniswap V3', pair: 'WETH/USDC.e', address: '0x17c14D2c404D167802b16C450d3c99F88F2c4F4d', fee: 0.30, kind: 'v3', base: T.WETH, quote: T.USDCe },
+  { id: 'sushiv3_weth_usdce_030', name: 'SushiSwap V3 WETH/USDC.e (0.30%)', dex: 'SushiSwap V3', pair: 'WETH/USDC.e', address: '0x4d1576158518dD61924218446C1057CF03138D57', fee: 0.30, kind: 'v3', base: T.WETH, quote: T.USDCe },
+  { id: 'sushi_weth_usdce', name: 'Sushiswap V2 WETH/USDC.e (0.30%)', dex: 'Sushiswap V2', pair: 'WETH/USDC.e', address: '0x905dfCD5649217c42684f23958568e533C711Aa3', fee: 0.30, kind: 'v2', base: T.WETH, quote: T.USDCe },
+  { id: 'camelot_v2_weth_usdce', name: 'Camelot V2 WETH/USDC.e (0.30%)', dex: 'Camelot V2', pair: 'WETH/USDC.e', address: '0x84652bb2539513BAf36e225c930Fdd8eaa63CE27', fee: 0.30, kind: 'v2', base: T.WETH, quote: T.USDCe },
+
+  // USDC / USDT (4 pools across 3 DEXes)
+  { id: 'univ3_usdc_usdt_001', name: 'Uniswap V3 USDC/USDT (0.01%)', dex: 'Uniswap V3', pair: 'USDC/USDT', address: '0xbE3aD6a5669Dc0B8b12FeBC03608860C31E2eef6', fee: 0.01, kind: 'v3', base: T.USDC, quote: T.USDT },
+  { id: 'univ3_usdc_usdt_005', name: 'Uniswap V3 USDC/USDT (0.05%)', dex: 'Uniswap V3', pair: 'USDC/USDT', address: '0xbcE73c2e5A623054B0e8e2428E956f4b9d0412a5', fee: 0.05, kind: 'v3', base: T.USDC, quote: T.USDT },
+  { id: 'pancake_v3_usdc_usdt_001', name: 'PancakeSwap V3 USDC/USDT (0.01%)', dex: 'PancakeSwap V3', pair: 'USDC/USDT', address: '0x7e928afb59f5dE9D2f4d162f754C6eB40c88aA8E', fee: 0.01, kind: 'v3', base: T.USDC, quote: T.USDT },
+  { id: 'camelot_v3_usdc_usdt', name: 'Camelot V3 USDC/USDT', dex: 'Camelot V3', pair: 'USDC/USDT', address: '0xa17aFCAb059F3C6751F5B64347b5a503C3291868', fee: 0.01, kind: 'algebra', base: T.USDC, quote: T.USDT },
+
+  // DAI / USDC (3 pools across 3 DEXes)
+  { id: 'univ3_dai_usdc_001', name: 'Uniswap V3 DAI/USDC (0.01%)', dex: 'Uniswap V3', pair: 'DAI/USDC', address: '0x7CF803e8d82A50504180f417B8bC7a493C0a0503', fee: 0.01, kind: 'v3', base: T.DAI, quote: T.USDC },
+  { id: 'pancake_v3_dai_usdc_001', name: 'PancakeSwap V3 DAI/USDC (0.01%)', dex: 'PancakeSwap V3', pair: 'DAI/USDC', address: '0xd5d1F85E65Ce58a4782852F4A845b1d6Ca71F1a2', fee: 0.01, kind: 'v3', base: T.DAI, quote: T.USDC },
+  { id: 'camelot_v3_dai_usdc', name: 'Camelot V3 DAI/USDC', dex: 'Camelot V3', pair: 'DAI/USDC', address: '0x45FaE8D0D2acE73544baab452f9020925AfCCC75', fee: 0.01, kind: 'algebra', base: T.DAI, quote: T.USDC },
+
+  // ARB / USDC (3 pools across 2 DEXes)
   { id: 'univ3_arb_usdc_005', name: 'Uniswap V3 ARB/USDC (0.05%)', dex: 'Uniswap V3', pair: 'ARB/USDC', address: '0xb0f6cA40411360c03d41C5fFc5F179b8403CdcF8', fee: 0.05, kind: 'v3', base: T.ARB, quote: T.USDC },
-  { id: 'camelot_arb_usdc', name: 'Camelot V3 ARB/USDC', dex: 'Camelot V3', pair: 'ARB/USDC', address: '0x49b3100db32eeEA402Db38D17be80d34608feB1B', fee: 0.12, kind: 'algebra', base: T.ARB, quote: T.USDC },
-  { id: 'univ3_arb_weth_005', name: 'Uniswap V3 ARB/WETH (0.05%)', dex: 'Uniswap V3', pair: 'ARB/WETH', address: '0xc6f780497a95E246EB15C999e6047f378aa6BD0f', fee: 0.05, kind: 'v3', base: T.ARB, quote: T.WETH },
-  { id: 'sushi_arb_weth', name: 'Sushiswap V2 ARB/WETH (0.30%)', dex: 'Sushiswap V2', pair: 'ARB/WETH', address: '0xb63Cb030A6c0b3952D7Ee46808feF3F4C65306Db', fee: 0.30, kind: 'v2', base: T.ARB, quote: T.WETH },
-  { id: 'univ3_wbtc_weth_005', name: 'Uniswap V3 WBTC/WETH (0.05%)', dex: 'Uniswap V3', pair: 'WBTC/WETH', address: '0x2F5e87C931236685D116c6633Be839756C7423C1', fee: 0.05, kind: 'v3', base: T.WBTC, quote: T.WETH },
-  { id: 'sushi_wbtc_weth', name: 'Sushiswap V2 WBTC/WETH (0.30%)', dex: 'Sushiswap V2', pair: 'WBTC/WETH', address: '0x0C1439e048991244e7e05Ef1a3C442e48184903F', fee: 0.30, kind: 'v2', base: T.WBTC, quote: T.WETH },
-  { id: 'univ3_link_weth_030', name: 'Uniswap V3 LINK/WETH (0.30%)', dex: 'Uniswap V3', pair: 'LINK/WETH', address: '0xaa23638fB52BA8fdE26684605B2b00f114660282', fee: 0.30, kind: 'v3', base: T.LINK, quote: T.WETH },
-  { id: 'camelot_link_weth', name: 'Camelot V3 LINK/WETH', dex: 'Camelot V3', pair: 'LINK/WETH', address: '0x8B30f5a91F163810c98f82F2540b991f9A149A70', fee: 0.25, kind: 'algebra', base: T.LINK, quote: T.WETH },
-  { id: 'univ3_gmx_weth_030', name: 'Uniswap V3 GMX/WETH (0.30%)', dex: 'Uniswap V3', pair: 'GMX/WETH', address: '0x80a9aE39310ABf62E334124646bD211A234C2075', fee: 0.30, kind: 'v3', base: T.GMX, quote: T.WETH },
-  { id: 'univ3_wsteth_weth_001', name: 'Uniswap V3 wstETH/WETH (0.01%)', dex: 'Uniswap V3', pair: 'wstETH/WETH', address: '0x35218a1cBa37f6439907359B3466D5300B54E372', fee: 0.01, kind: 'v3', base: T.wstETH, quote: T.WETH },
-  { id: 'univ3_dai_usdc_001', name: 'Uniswap V3 DAI/USDC (0.01%)', dex: 'Uniswap V3', pair: 'DAI/USDC', address: '0xA7C2954DB36894C2514CDBeb6f758f6236B328a2', fee: 0.01, kind: 'v3', base: T.DAI, quote: T.USDC },
+  { id: 'univ3_arb_usdc_030', name: 'Uniswap V3 ARB/USDC (0.30%)', dex: 'Uniswap V3', pair: 'ARB/USDC', address: '0xaEBDcA1Bc8d89177EbE2308d62af5e74885DcCc3', fee: 0.30, kind: 'v3', base: T.ARB, quote: T.USDC },
+  { id: 'camelot_arb_usdc', name: 'Camelot V3 ARB/USDC', dex: 'Camelot V3', pair: 'ARB/USDC', address: '0xfaE2AE0a9f87FD35b5b0E24B47BAC796A7EEfEa1', fee: 0.05, kind: 'algebra', base: T.ARB, quote: T.USDC },
+
+  // ARB / WETH (6 pools across 4 DEXes)
+  { id: 'univ3_arb_weth_005', name: 'Uniswap V3 ARB/WETH (0.05%)', dex: 'Uniswap V3', pair: 'ARB/WETH', address: '0xC6F780497A95e246EB9449f5e4770916DCd6396A', fee: 0.05, kind: 'v3', base: T.ARB, quote: T.WETH },
+  { id: 'univ3_arb_weth_030', name: 'Uniswap V3 ARB/WETH (0.30%)', dex: 'Uniswap V3', pair: 'ARB/WETH', address: '0x92c63d0e701CAAe670C9415d91C474F686298f00', fee: 0.30, kind: 'v3', base: T.ARB, quote: T.WETH },
+  { id: 'univ3_arb_weth_100', name: 'Uniswap V3 ARB/WETH (1.00%)', dex: 'Uniswap V3', pair: 'ARB/WETH', address: '0x92fd143A8FA0C84e016C2765648B9733b0aa519e', fee: 1.00, kind: 'v3', base: T.ARB, quote: T.WETH },
+  { id: 'sushi_arb_weth', name: 'Sushiswap V2 ARB/WETH (0.30%)', dex: 'Sushiswap V2', pair: 'ARB/WETH', address: '0xBF6CBb1F40a542aF50839CaD01b0dc1747F11e18', fee: 0.30, kind: 'v2', base: T.ARB, quote: T.WETH },
+  { id: 'camelot_v2_arb_weth', name: 'Camelot V2 ARB/WETH (0.30%)', dex: 'Camelot V2', pair: 'ARB/WETH', address: '0xa6c5C7D189fA4eB5Af8ba34E63dCDD3a635D433f', fee: 0.30, kind: 'v2', base: T.ARB, quote: T.WETH },
+  { id: 'camelot_v3_arb_weth', name: 'Camelot V3 ARB/WETH', dex: 'Camelot V3', pair: 'ARB/WETH', address: '0xe51635ae8136aBAc44906A8f230C2D235E9c195F', fee: 0.03, kind: 'algebra', base: T.ARB, quote: T.WETH },
+
+  // WBTC / WETH (8 pools across 5 DEXes)
+  { id: 'univ3_wbtc_weth_005', name: 'Uniswap V3 WBTC/WETH (0.05%)', dex: 'Uniswap V3', pair: 'WBTC/WETH', address: '0x2f5e87C9312fa29aed5c179E456625D79015299c', fee: 0.05, kind: 'v3', base: T.WBTC, quote: T.WETH },
+  { id: 'univ3_wbtc_weth_030', name: 'Uniswap V3 WBTC/WETH (0.30%)', dex: 'Uniswap V3', pair: 'WBTC/WETH', address: '0x149e36E72726e0BceA5c59d40df2c43F60f5A22D', fee: 0.30, kind: 'v3', base: T.WBTC, quote: T.WETH },
+  { id: 'univ3_wbtc_weth_100', name: 'Uniswap V3 WBTC/WETH (1.00%)', dex: 'Uniswap V3', pair: 'WBTC/WETH', address: '0x99dFc0126ED31E0169fc32dB6B89adF9FeE9a77e', fee: 1.00, kind: 'v3', base: T.WBTC, quote: T.WETH },
+  { id: 'pancake_v3_wbtc_weth_001', name: 'PancakeSwap V3 WBTC/WETH (0.01%)', dex: 'PancakeSwap V3', pair: 'WBTC/WETH', address: '0x4bfc22A4dA7f31F8a912a79A7e44a822398b4390', fee: 0.01, kind: 'v3', base: T.WBTC, quote: T.WETH },
+  { id: 'pancake_v3_wbtc_weth_005', name: 'PancakeSwap V3 WBTC/WETH (0.05%)', dex: 'PancakeSwap V3', pair: 'WBTC/WETH', address: '0x54076C901D4fDF76C1fA1F77FAFC3FC1022ADBE5', fee: 0.05, kind: 'v3', base: T.WBTC, quote: T.WETH },
+  { id: 'sushiv3_wbtc_weth_030', name: 'SushiSwap V3 WBTC/WETH (0.30%)', dex: 'SushiSwap V3', pair: 'WBTC/WETH', address: '0x6F10667F314498649eb2f80da244e8c6E9f031d5', fee: 0.30, kind: 'v3', base: T.WBTC, quote: T.WETH },
+  { id: 'sushi_wbtc_weth', name: 'Sushiswap V2 WBTC/WETH (0.30%)', dex: 'Sushiswap V2', pair: 'WBTC/WETH', address: '0x515e252b2b5c22b4b2b6Df66c2eBeeA871AA4d69', fee: 0.30, kind: 'v2', base: T.WBTC, quote: T.WETH },
+  { id: 'camelot_v3_wbtc_weth', name: 'Camelot V3 WBTC/WETH', dex: 'Camelot V3', pair: 'WBTC/WETH', address: '0xd845f7D4f4DeB9Ff5bCf09D140Ef13718F6f6C71', fee: 0.01, kind: 'algebra', base: T.WBTC, quote: T.WETH },
+
+  // WBTC / USDC (3 pools across 2 DEXes)
+  { id: 'univ3_wbtc_usdc_005', name: 'Uniswap V3 WBTC/USDC (0.05%)', dex: 'Uniswap V3', pair: 'WBTC/USDC', address: '0x0E4831319A50228B9e450861297aB92dee15B44F', fee: 0.05, kind: 'v3', base: T.WBTC, quote: T.USDC },
+  { id: 'univ3_wbtc_usdc_030', name: 'Uniswap V3 WBTC/USDC (0.30%)', dex: 'Uniswap V3', pair: 'WBTC/USDC', address: '0x6985cb98CE393FCE8d6272127F39013f61e36166', fee: 0.30, kind: 'v3', base: T.WBTC, quote: T.USDC },
+  { id: 'pancake_v3_wbtc_usdc_005', name: 'PancakeSwap V3 WBTC/USDC (0.05%)', dex: 'PancakeSwap V3', pair: 'WBTC/USDC', address: '0x843aC8dc6D34AEB07a56812b8b36429eE46BDd07', fee: 0.05, kind: 'v3', base: T.WBTC, quote: T.USDC },
+
+  // LINK / WETH (4 pools across 3 DEXes)
+  { id: 'univ3_link_weth_030', name: 'Uniswap V3 LINK/WETH (0.30%)', dex: 'Uniswap V3', pair: 'LINK/WETH', address: '0x468b88941e7Cc0B88c1869d68ab6b570bCEF62Ff', fee: 0.30, kind: 'v3', base: T.LINK, quote: T.WETH },
+  { id: 'univ3_link_weth_005', name: 'Uniswap V3 LINK/WETH (0.05%)', dex: 'Uniswap V3', pair: 'LINK/WETH', address: '0x91308bC9Ce8Ca2db82aA30C65619856cC939d907', fee: 0.05, kind: 'v3', base: T.LINK, quote: T.WETH },
+  { id: 'sushi_link_weth', name: 'Sushiswap V2 LINK/WETH (0.30%)', dex: 'Sushiswap V2', pair: 'LINK/WETH', address: '0x7050A8908E2a60899D8788015148241f0993a3FD', fee: 0.30, kind: 'v2', base: T.LINK, quote: T.WETH },
+  { id: 'camelot_link_weth', name: 'Camelot V3 LINK/WETH', dex: 'Camelot V3', pair: 'LINK/WETH', address: '0xe8795cF9c2309eCfe05Df028eB0F21D5D6e3a951', fee: 0.21, kind: 'algebra', base: T.LINK, quote: T.WETH },
+
+  // GMX / WETH & GMX / USDC (5 pools across 2 DEXes)
+  { id: 'univ3_gmx_weth_030', name: 'Uniswap V3 GMX/WETH (0.30%)', dex: 'Uniswap V3', pair: 'GMX/WETH', address: '0x1aEEdD3727A6431b8F070C0aFaA81Cc74f273882', fee: 0.30, kind: 'v3', base: T.GMX, quote: T.WETH },
+  { id: 'univ3_gmx_weth_100', name: 'Uniswap V3 GMX/WETH (1.00%)', dex: 'Uniswap V3', pair: 'GMX/WETH', address: '0x80A9ae39310abf666A87C743d6ebBD0E8C42158E', fee: 1.00, kind: 'v3', base: T.GMX, quote: T.WETH },
+  { id: 'camelot_v3_gmx_weth', name: 'Camelot V3 GMX/WETH', dex: 'Camelot V3', pair: 'GMX/WETH', address: '0xC99be44383BC8d82357F5A1D9ae9976EE9d75bee', fee: 0.72, kind: 'algebra', base: T.GMX, quote: T.WETH },
+  { id: 'univ3_gmx_usdc_030', name: 'Uniswap V3 GMX/USDC (0.30%)', dex: 'Uniswap V3', pair: 'GMX/USDC', address: '0x135E49cC315fED87F989e072ee11132686CF84F3', fee: 0.30, kind: 'v3', base: T.GMX, quote: T.USDC },
+  { id: 'univ3_gmx_usdc_100', name: 'Uniswap V3 GMX/USDC (1.00%)', dex: 'Uniswap V3', pair: 'GMX/USDC', address: '0x0A36952Fb8C8dc6daeFB2fADb07C5212f560880e', fee: 1.00, kind: 'v3', base: T.GMX, quote: T.USDC },
+
+  // AAVE / WETH (3 pools across 2 DEXes)
+  { id: 'univ3_aave_weth_030', name: 'Uniswap V3 AAVE/WETH (0.30%)', dex: 'Uniswap V3', pair: 'AAVE/WETH', address: '0xDD672b3B768A16b9BcB4eE1060d3e8221435BeAa', fee: 0.30, kind: 'v3', base: T.AAVE, quote: T.WETH },
+  { id: 'univ3_aave_weth_005', name: 'Uniswap V3 AAVE/WETH (0.05%)', dex: 'Uniswap V3', pair: 'AAVE/WETH', address: '0x263f7B865DE80355F91C00dFb975A821Effbea24', fee: 0.05, kind: 'v3', base: T.AAVE, quote: T.WETH },
+  { id: 'pancake_v3_aave_weth_005', name: 'PancakeSwap V3 AAVE/WETH (0.05%)', dex: 'PancakeSwap V3', pair: 'AAVE/WETH', address: '0x80Ceb98632409080924DCE50C26aCC25458DDe17', fee: 0.05, kind: 'v3', base: T.AAVE, quote: T.WETH },
+
+  // PENDLE / WETH (4 pools across 3 DEXes)
+  { id: 'univ3_pendle_weth_030', name: 'Uniswap V3 PENDLE/WETH (0.30%)', dex: 'Uniswap V3', pair: 'PENDLE/WETH', address: '0xdbaeB7f0DFe3a0AAFD798CCECB5b22E708f7852c', fee: 0.30, kind: 'v3', base: T.PENDLE, quote: T.WETH },
+  { id: 'univ3_pendle_weth_005', name: 'Uniswap V3 PENDLE/WETH (0.05%)', dex: 'Uniswap V3', pair: 'PENDLE/WETH', address: '0xB08a8794A5D3cCCA3725D92964696858d3201909', fee: 0.05, kind: 'v3', base: T.PENDLE, quote: T.WETH },
+  { id: 'camelot_v2_pendle_weth', name: 'Camelot V2 PENDLE/WETH (0.30%)', dex: 'Camelot V2', pair: 'PENDLE/WETH', address: '0xBfCa4230115DE8341F3A3d5e8845fFb3337B2Be3', fee: 0.30, kind: 'v2', base: T.PENDLE, quote: T.WETH },
+  { id: 'camelot_v3_pendle_weth', name: 'Camelot V3 PENDLE/WETH', dex: 'Camelot V3', pair: 'PENDLE/WETH', address: '0xE461f84C3fE6BCDd1162Eb0Ef4284F3bB6e4CAD3', fee: 0.30, kind: 'algebra', base: T.PENDLE, quote: T.WETH },
+
+  // UNI / WETH (2 pools across 2 DEXes)
+  { id: 'univ3_uni_weth_030', name: 'Uniswap V3 UNI/WETH (0.30%)', dex: 'Uniswap V3', pair: 'UNI/WETH', address: '0xC24f7d8E51A64dc1238880BD00bb961D54cbeb29', fee: 0.30, kind: 'v3', base: T.UNI, quote: T.WETH },
+  { id: 'pancake_v3_uni_weth_005', name: 'PancakeSwap V3 UNI/WETH (0.05%)', dex: 'PancakeSwap V3', pair: 'UNI/WETH', address: '0xaD198aD5f32cBa24bcafA6E9FfECe312C2dDCD6F', fee: 0.05, kind: 'v3', base: T.UNI, quote: T.WETH },
+
+  // wstETH / WETH (2 pools across 2 DEXes; excludes Camelot V2 stable-curve pair)
+  { id: 'univ3_wsteth_weth_001', name: 'Uniswap V3 wstETH/WETH (0.01%)', dex: 'Uniswap V3', pair: 'wstETH/WETH', address: '0x35218a1cbaC5Bbc3E57fd9Bd38219D37571b3537', fee: 0.01, kind: 'v3', base: T.wstETH, quote: T.WETH },
+  { id: 'camelot_v3_wsteth_weth', name: 'Camelot V3 wstETH/WETH', dex: 'Camelot V3', pair: 'wstETH/WETH', address: '0xdEb89DE4bb6ecf5BFeD581EB049308b52d9b2Da7', fee: 0.01, kind: 'algebra', base: T.wstETH, quote: T.WETH },
 ];
+
+const MULTICALL3_ADDRESS = '0xcA11bde05977b3631167028862bE2a173976CA11';
+const multicallIface = new ethers.Interface([
+  'function aggregate3(tuple(address target, bool allowFailure, bytes callData)[] calls) view returns (tuple(bool success, bytes returnData)[])',
+]);
 
 class LiveMevAgent {
   public isRunning: boolean = true;
@@ -829,6 +1126,8 @@ class LiveMevAgent {
   public autoOptimizeSize: boolean = true; // Dynamically scale loan amount to pool liquidity
   public isAutonomousExecutionEnabled: boolean = false; // Auto-executes live on-chain when profit guard cleared
   public lastExecutionTimestamp: number = 0;
+  public lastExecutionNotice: string | null = null;
+  private routeInputsByOppId = new Map<string, RouteExecutionInput>();
 
   constructor() {
     this.start();
@@ -952,6 +1251,8 @@ class LiveMevAgent {
     const cleanBuy = params.buyDex.toLowerCase().replace(/[^a-z0-9]/g, '');
     const cleanSell = params.sellDex.toLowerCase().replace(/[^a-z0-9]/g, '');
     const cleanPair = params.pair.toLowerCase().replace(/[^a-z0-9]/g, '-');
+    const priceDecimals = params.buyPrice < 10 ? 4 : 2;
+    const spreadDecimals = grossSpreadUsd < 1 ? 4 : 2;
 
     return {
       id: `opp-${cleanPair}-${cleanBuy}-${cleanSell}-${this.latestBlock}-${params.routeType}`,
@@ -960,11 +1261,11 @@ class LiveMevAgent {
       pair: params.pair,
       buyDex: params.buyDex,
       buyPool: params.buyPool,
-      buyPrice: Number(params.buyPrice.toFixed(2)),
+      buyPrice: Number(params.buyPrice.toFixed(priceDecimals)),
       sellDex: params.sellDex,
       sellPool: params.sellPool,
-      sellPrice: Number(params.sellPrice.toFixed(2)),
-      grossSpreadUsd: Number(grossSpreadUsd.toFixed(2)),
+      sellPrice: Number(params.sellPrice.toFixed(priceDecimals)),
+      grossSpreadUsd: Number(grossSpreadUsd.toFixed(spreadDecimals)),
       grossSpreadBps,
       dexFeeBps,
       estNetProfitUsd: netProfitUsd,
@@ -984,8 +1285,295 @@ class LiveMevAgent {
   }
 
   /**
+   * Simulates an opportunity against live Arbitrum chain state via eth_estimateGas and,
+   * only when simulation proves non-revert + positive profit >= minProfit, signs and
+   * broadcasts FlashArbOptimized.executeOptimizedArbitrage(...) with 100% profit swept
+   * to FLASH_ARB_PROFIT_WALLET.
+   */
+  public async verifyAndExecuteOpportunity(
+    opp: LiveArbitrageOpportunity,
+    options?: { forceTestExecution?: boolean; chain?: 'arbitrum' | 'base' | 'optimism' }
+  ): Promise<{
+    ok: boolean;
+    statusCode: number;
+    blockedByProfitGuard?: boolean;
+    simulationFailed?: boolean;
+    requiresWallet?: boolean;
+    error?: string;
+    txHash?: string;
+    explorerUrl?: string;
+    trade?: ExecutedAgentTrade;
+    txPayload?: { to: string; data: string; gas: string };
+    candidateLabel?: string;
+    gasEstimate?: string;
+    sweptAmount?: string;
+    sweptToken?: string;
+    recipient?: string;
+  }> {
+    const chain = options?.chain || 'arbitrum';
+    const rpcInfo = RPC_ENDPOINTS[chain] || RPC_ENDPOINTS.arbitrum;
+    const contractAddr = DEPLOYED_CONTRACTS[chain];
+
+    if (!contractAddr || !/^0x[a-fA-F0-9]{40}$/.test(contractAddr)) {
+      return {
+        ok: false,
+        statusCode: 400,
+        error: `No valid deployed FlashArbOptimized contract configured for ${rpcInfo.name}.`,
+      };
+    }
+
+    const profitWallet = profitWalletEnv();
+    if (!profitWallet || !/^0x[a-fA-F0-9]{40}$/.test(profitWallet)) {
+      return {
+        ok: false,
+        statusCode: 400,
+        error: 'Profit Vault destination address is missing or invalid. Configure your 42-char EVM Profit Vault address first.',
+      };
+    }
+
+    if (!opp.isProfitable && !options?.forceTestExecution) {
+      return {
+        ok: false,
+        statusCode: 400,
+        blockedByProfitGuard: true,
+        error: opp.profitGuardReason || 'Execution blocked by Profit Guard: net profit below configured threshold.',
+      };
+    }
+
+    const routeInput = this.routeInputsByOppId.get(opp.id);
+    if (!routeInput) {
+      return {
+        ok: false,
+        statusCode: 400,
+        error: 'Opportunity expired or route parameters unavailable. Trigger a fresh scan and retry.',
+      };
+    }
+
+    const candidates = resolveArbitrageCandidates(routeInput, profitWallet);
+    if (candidates.length === 0) {
+      return {
+        ok: false,
+        statusCode: 422,
+        simulationFailed: true,
+        error: `Route ${routeInput.buyDex} -> ${routeInput.sellDex} uses an unsupported router (FlashArbOptimized supports Uniswap V3, PancakeSwap V3, SushiSwap V3, and Sushiswap V2). Pick an executable pool pair.`,
+      };
+    }
+
+    const { ethers } = await import('ethers');
+
+    // Verify deployed contract exists and actually implements executeOptimizedArbitrage (0x23b3aa6b)
+    const { result: codeRaw } = await fetchRpcSingleWithFailover(chain, 'eth_getCode', [contractAddr, 'latest'], true);
+    const code = String(codeRaw || '0x').toLowerCase();
+    if (code === '0x' || code.length <= 2) {
+      return {
+        ok: false,
+        statusCode: 400,
+        error: `Contract ${contractAddr} is not deployed on ${rpcInfo.name}. Deploy FlashArbOptimized first.`,
+      };
+    }
+    if (!code.includes('23b3aa6b')) {
+      return {
+        ok: false,
+        statusCode: 400,
+        error: `Contract ${contractAddr} is an older sweep-only deployment without executeOptimizedArbitrage(). Switch to 0xeee31ff9e69904b43c124095b6f33aa61505bcc2 or redeploy FlashArbOptimized.sol.`,
+      };
+    }
+
+    // Read contract owner()
+    let contractOwner: string | null = null;
+    try {
+      const { result: ownerRaw } = await fetchRpcSingleWithFailover(
+        chain,
+        'eth_call',
+        [{ to: contractAddr, data: '0x8da5cb5b' }, 'latest'],
+        true
+      );
+      if (typeof ownerRaw === 'string' && ownerRaw.length >= 66) {
+        contractOwner = ethers.getAddress(`0x${ownerRaw.slice(-40)}`);
+      }
+    } catch {
+      // ignore if owner() call fails
+    }
+
+    const signerKey = (process.env.FLASH_ARB_SIGNER_KEY || '').trim();
+    if (!signerKey) {
+      return {
+        ok: false,
+        statusCode: 409,
+        requiresWallet: true,
+        error: 'No server signer key configured. Configure FLASH_ARB_SIGNER_KEY or approve the executeOptimizedArbitrage transaction in your connected owner wallet.',
+        txPayload: {
+          to: contractAddr,
+          data: candidates[0].calldata,
+          gas: '0x7a120', // 500k gas ceiling
+        },
+      };
+    }
+
+    const cleanKey = signerKey.startsWith('0x') ? signerKey : `0x${signerKey}`;
+    const signerAddress = new ethers.Wallet(cleanKey).address;
+    if (contractOwner && contractOwner.toLowerCase() !== signerAddress.toLowerCase()) {
+      return {
+        ok: false,
+        statusCode: 400,
+        error: `Signer wallet ${signerAddress} is not the owner of contract ${contractAddr} (owner is ${contractOwner}). Switch signer key or deploy a new contract with this signer.`,
+      };
+    }
+
+    // Pre-flight eth_estimateGas verification across candidate borrow directions (0 gas spent on revert)
+    let verifiedCandidate: (typeof candidates)[0] | null = null;
+    let estimatedGas = 0n;
+    let lastRevertReason = 'Pool price converged / insufficient on-chain arbitrage margin';
+
+    for (const candidate of candidates) {
+      try {
+        const { result: gasHex } = await fetchRpcSingleWithFailover(
+          chain,
+          'eth_estimateGas',
+          [{ from: signerAddress, to: contractAddr, data: candidate.calldata }, 'latest'],
+          true
+        );
+        if (typeof gasHex === 'string' && gasHex.startsWith('0x')) {
+          estimatedGas = BigInt(gasHex);
+          verifiedCandidate = candidate;
+          break;
+        }
+      } catch (simErr: any) {
+        lastRevertReason = decodeFlashArbRevertError(simErr);
+      }
+    }
+
+    if (!verifiedCandidate || estimatedGas <= 0n) {
+      this.agentState = 'SCANNING';
+      this.lastExecutionNotice = `Pre-flight eth_estimateGas aborted tx (0 gas spent): ${lastRevertReason}`;
+      return {
+        ok: false,
+        statusCode: 422,
+        simulationFailed: true,
+        error: `Pre-flight eth_estimateGas reverted on-chain (0 gas spent, zero-loss protection worked): ${lastRevertReason}`,
+      };
+    }
+
+    this.agentState = 'EXECUTING';
+    const gasLimitWithHeadroom = (estimatedGas * 125n) / 100n;
+    const txPool = getRpcPool(chain, true);
+    let sentTxHash = '';
+    let lastBroadcastErr: any = null;
+
+    for (const rpcUrl of txPool) {
+      try {
+        const provider = new ethers.JsonRpcProvider(rpcUrl);
+        const wallet = new ethers.Wallet(cleanKey, provider);
+        const balWei = await provider.getBalance(wallet.address);
+        if (balWei < 100000000000000n) {
+          this.agentState = 'SCANNING';
+          return {
+            ok: false,
+            statusCode: 400,
+            error: `Gas wallet ${wallet.address} holds ${ethers.formatEther(balWei)} ETH on ${rpcInfo.name} (< 0.0001 ETH required for L2 gas).`,
+          };
+        }
+        const tx = await wallet.sendTransaction({
+          to: contractAddr,
+          data: verifiedCandidate.calldata,
+          gasLimit: gasLimitWithHeadroom,
+        });
+        sentTxHash = tx.hash;
+        break;
+      } catch (err: any) {
+        lastBroadcastErr = err;
+        const msg = String(err?.message || '');
+        if (!/429|403|timeout|fetch|coalesce|archive|network|ECONN|socket/i.test(msg)) {
+          break;
+        }
+      }
+    }
+
+    if (!sentTxHash) {
+      this.agentState = 'SCANNING';
+      return {
+        ok: false,
+        statusCode: 500,
+        error: lastBroadcastErr?.message || `Failed to broadcast verified arbitrage transaction on ${rpcInfo.name}.`,
+      };
+    }
+
+    const receipt = await waitForReceiptWithFailover(chain, sentTxHash, 45000);
+    const isSuccess = receipt.status === 1;
+    const gasCostEth =
+      receipt.effectiveGasPrice !== null
+        ? Number(receipt.gasUsed * receipt.effectiveGasPrice) / 1e18
+        : null;
+
+    const decodedSwap = decodeArbitrageSwapsExecutedLogs(receipt.logs, contractAddr);
+    const sweptAmount = decodedSwap
+      ? ethers.formatUnits(decodedSwap.netProfitSwept, verifiedCandidate.borrowedToken.dec)
+      : '0';
+    const sweptRecipient = decodedSwap ? decodedSwap.recipient : profitWallet;
+    const ethUsd = this.pools.find((p) => p.pair === 'WETH/USDC')?.priceUsd || opp.buyPrice;
+    const borrowedSym = verifiedCandidate.borrowedToken.sym;
+    const realizedUsd =
+      decodedSwap && (borrowedSym === 'USDC' || borrowedSym === 'USDC.e' || borrowedSym === 'USDT' || borrowedSym === 'DAI')
+        ? Number(sweptAmount)
+        : decodedSwap && borrowedSym === 'WETH'
+        ? Number(sweptAmount) * ethUsd
+        : decodedSwap && opp.buyPrice > 0
+        ? Number(sweptAmount) * opp.buyPrice
+        : opp.estNetProfitUsd;
+
+    const executedTrade: ExecutedAgentTrade = {
+      id: `arb-${Date.now()}-${sentTxHash.slice(2, 8)}`,
+      txHash: sentTxHash,
+      timestamp: Date.now(),
+      blockNumber: receipt.blockNumber,
+      pair: opp.pair,
+      buyDex: opp.buyDex,
+      sellDex: opp.sellDex,
+      grossSpreadUsd: opp.grossSpreadUsd,
+      netProfitUsd: isSuccess ? Number(realizedUsd.toFixed(4)) : 0,
+      gasCostEth,
+      status: isSuccess ? 'CONFIRMED' : 'REVERTED',
+      explorerUrl: `${rpcInfo.explorer}/tx/${sentTxHash}`,
+      profitRecipient: sweptRecipient,
+    };
+
+    this.executedTrades.push(executedTrade);
+    this.lastExecutionTimestamp = Date.now();
+
+    if (isSuccess) {
+      this.lastConfirmedTxHash = sentTxHash;
+      this.lastConfirmedBlock = receipt.blockNumber;
+      this.agentState = 'TRADE_CONFIRMED';
+      this.lastExecutionNotice = `Confirmed ${verifiedCandidate.label}: swept ${sweptAmount} ${verifiedCandidate.borrowedToken.sym} to ${sweptRecipient}`;
+      return {
+        ok: true,
+        statusCode: 200,
+        txHash: sentTxHash,
+        explorerUrl: `${rpcInfo.explorer}/tx/${sentTxHash}`,
+        trade: executedTrade,
+        candidateLabel: verifiedCandidate.label,
+        gasEstimate: estimatedGas.toString(),
+        sweptAmount,
+        sweptToken: verifiedCandidate.borrowedToken.sym,
+        recipient: sweptRecipient,
+      };
+    }
+
+    this.agentState = 'SCANNING';
+    this.lastExecutionNotice = `Broadcast tx ${sentTxHash} reverted on-chain (state changed before inclusion).`;
+    return {
+      ok: false,
+      statusCode: 500,
+      txHash: sentTxHash,
+      explorerUrl: `${rpcInfo.explorer}/tx/${sentTxHash}`,
+      trade: executedTrade,
+      error: `Transaction ${sentTxHash} reverted on-chain after pool state moved ahead of inclusion.`,
+    };
+  }
+
+  /**
    * Autonomous Execution Engine:
-   * Only executes if isAutonomousExecutionEnabled is true AND opportunity is strictly profitable.
+   * Only executes if isAutonomousExecutionEnabled is true AND an executable opportunity is strictly profitable.
    */
   public async attemptAutonomousExecution() {
     if (!this.isAutonomousExecutionEnabled) {
@@ -995,8 +1583,32 @@ class LiveMevAgent {
       return;
     }
 
-    // Server-side execution is disabled (see SERVER_EXECUTION_DISABLED_MSG).
-    this.agentState = 'SCANNING';
+    if (!process.env.FLASH_ARB_SIGNER_KEY) {
+      this.agentState = 'AWAITING_GAS_SIGNER';
+      return;
+    }
+
+    if (Date.now() - this.lastExecutionTimestamp < 15000) {
+      return;
+    }
+
+    const bestExecutable = [...this.opportunities]
+      .filter((o) => o.isProfitable && o.contractExecutable)
+      .sort((a, b) => b.estNetProfitUsd - a.estNetProfitUsd)[0];
+
+    if (!bestExecutable) {
+      if (this.agentState === 'AWAITING_GAS_SIGNER') this.agentState = 'SCANNING';
+      return;
+    }
+
+    this.agentState = 'OPPORTUNITY_FOUND';
+    this.lastExecutionTimestamp = Date.now();
+    try {
+      await this.verifyAndExecuteOpportunity(bestExecutable);
+    } catch (err: any) {
+      this.agentState = 'SCANNING';
+      this.lastExecutionNotice = err?.message || 'Autonomous execution cycle failed';
+    }
   }
 
   // Last scan error (null when the latest scan fully succeeded)
@@ -1015,20 +1627,46 @@ class LiveMevAgent {
       this.scanCount++;
       this.lastScanTimestamp = Date.now();
 
-      // ids: 1 = block number, 2 = gas price, then 2 calls per pool (state + liquidity; liquidity unused for V2)
-      const calls: any[] = [
-        { jsonrpc: '2.0', method: 'eth_blockNumber', params: [], id: 1 },
-        { jsonrpc: '2.0', method: 'eth_gasPrice', params: [], id: 2 },
-      ];
+      // Aggregate all pool state + liquidity reads into Multicall3.aggregate3() chunks
+      // so 60+ pools are read atomically with only 3-4 JSON-RPC items per HTTP batch.
+      interface SubCallRef { poolIdx: number; kind: 'state' | 'liquidity' }
+      const subCalls: Array<{ target: string; allowFailure: boolean; callData: string }> = [];
+      const subRefs: SubCallRef[] = [];
+      const stateCallIdxByPool = new Array<number>(POOL_SPECS.length).fill(-1);
+      const liqCallIdxByPool = new Array<number>(POOL_SPECS.length).fill(-1);
+
       POOL_SPECS.forEach((p, i) => {
         const stateSel = p.kind === 'v3' ? '0x3850c7bd' : p.kind === 'algebra' ? '0xe76c01e4' : '0x0902f1ac';
-        calls.push({ jsonrpc: '2.0', method: 'eth_call', params: [{ to: p.address, data: stateSel }, 'latest'], id: 10 + i * 2 });
+        stateCallIdxByPool[i] = subCalls.length;
+        subCalls.push({ target: p.address, allowFailure: true, callData: stateSel });
+        subRefs.push({ poolIdx: i, kind: 'state' });
         if (p.kind !== 'v2') {
-          calls.push({ jsonrpc: '2.0', method: 'eth_call', params: [{ to: p.address, data: '0x1a686502' }, 'latest'], id: 11 + i * 2 });
+          liqCallIdxByPool[i] = subCalls.length;
+          subCalls.push({ target: p.address, allowFailure: true, callData: '0x1a686502' });
+          subRefs.push({ poolIdx: i, kind: 'liquidity' });
         }
       });
 
-      const { results } = await fetchRpcBatchWithFailover('arbitrum', calls);
+      const CHUNK_SIZE = 70;
+      const rpcBatch: any[] = [
+        { jsonrpc: '2.0', method: 'eth_blockNumber', params: [], id: 1 },
+        { jsonrpc: '2.0', method: 'eth_gasPrice', params: [], id: 2 },
+      ];
+      const chunkRanges: Array<{ rpcId: number; start: number; end: number }> = [];
+      for (let start = 0; start < subCalls.length; start += CHUNK_SIZE) {
+        const end = Math.min(subCalls.length, start + CHUNK_SIZE);
+        const rpcId = 10 + chunkRanges.length;
+        const callData = multicallIface.encodeFunctionData('aggregate3', [subCalls.slice(start, end)]);
+        rpcBatch.push({
+          jsonrpc: '2.0',
+          method: 'eth_call',
+          params: [{ to: MULTICALL3_ADDRESS, data: callData }, 'latest'],
+          id: rpcId,
+        });
+        chunkRanges.push({ rpcId, start, end });
+      }
+
+      const { results } = await fetchRpcBatchWithFailover('arbitrum', rpcBatch);
 
       const byId = new Map<number, string>();
       for (const item of results) {
@@ -1040,17 +1678,35 @@ class LiveMevAgent {
       if (!Number.isFinite(block) || !Number.isFinite(gasPriceWei)) throw new Error('Arbitrum RPC returned no block/gas price');
       this.latestBlock = block;
 
+      const returnDatas = new Array<string | null>(subCalls.length).fill(null);
+      for (const chunk of chunkRanges) {
+        const raw = byId.get(chunk.rpcId);
+        if (!raw) continue;
+        try {
+          const [decoded] = multicallIface.decodeFunctionResult('aggregate3', raw);
+          for (let offset = 0; offset < decoded.length; offset++) {
+            const entry = decoded[offset];
+            if (entry?.success && typeof entry.returnData === 'string' && entry.returnData !== '0x') {
+              returnDatas[chunk.start + offset] = entry.returnData;
+            }
+          }
+        } catch {
+          // ignore malformed chunk
+        }
+      }
+
       const word = (hex: string, i: number) => BigInt('0x' + hex.slice(2 + i * 64, 2 + (i + 1) * 64));
       const Q96 = 2 ** 96;
 
-      interface Read { spec: PoolSpec; basePerQuote: number; depthQuote: number /* in-range, in quote units */ }
+      interface Read { spec: PoolSpec; basePerQuote: number; depthQuote: number /* in-range, in quote units */; liveFeePercent: number }
       const reads: Read[] = [];
       POOL_SPECS.forEach((p, i) => {
-        const state = byId.get(10 + i * 2);
+        const state = returnDatas[stateCallIdxByPool[i]];
         if (!state) return;
         const [t0, t1] = p.base.addr.toLowerCase() < p.quote.addr.toLowerCase() ? [p.base, p.quote] : [p.quote, p.base];
         let token1PerToken0: number;
         let depthQuote: number;
+        let liveFeePercent = p.fee;
         try {
           if (p.kind === 'v2') {
             if (state.length < 130) return;
@@ -1062,9 +1718,17 @@ class LiveMevAgent {
           } else {
             if (state.length < 66) return;
             const sqrt = Number(word(state, 0)) / Q96;
-            const liqHex = byId.get(11 + i * 2);
+            const liqHex = liqCallIdxByPool[i] >= 0 ? returnDatas[liqCallIdxByPool[i]] : null;
             if (!(sqrt > 0) || !liqHex) return;
             const L = Number(BigInt(liqHex));
+            if (!(L > 0)) return;
+            if (p.kind === 'algebra' && state.length >= 194) {
+              // globalState() word 2 = current dynamic fee in 1e-6 units -> feePercent = rawFee / 10_000
+              const algebraFee = Number(word(state, 2));
+              if (Number.isFinite(algebraFee) && algebraFee > 0 && algebraFee <= 50000) {
+                liveFeePercent = Number((algebraFee / 10000).toFixed(4));
+              }
+            }
             token1PerToken0 = sqrt * sqrt * 10 ** (t0.dec - t1.dec);
             // virtual in-range reserve of the quote token, in raw units -> whole tokens
             const quoteRaw = p.quote === t1 ? L * sqrt : L / sqrt;
@@ -1075,7 +1739,7 @@ class LiveMevAgent {
         }
         const quotePerBase = p.base === t0 ? token1PerToken0 : 1 / token1PerToken0;
         if (!Number.isFinite(quotePerBase) || quotePerBase <= 0) return;
-        reads.push({ spec: p, basePerQuote: quotePerBase, depthQuote });
+        reads.push({ spec: p, basePerQuote: quotePerBase, depthQuote, liveFeePercent });
       });
 
       // ETH/USD reference = the real Uniswap V3 WETH/USDC 0.05% pool
@@ -1088,7 +1752,9 @@ class LiveMevAgent {
       for (const r of reads) {
         const qUsd = quoteUsd(r.spec.quote);
         if (qUsd === null) continue; // needs ETH/USD and it is unavailable: omit, do not guess
-        priced.push({ ...r, priceUsd: r.basePerQuote * qUsd, depthUsd: r.depthQuote * qUsd });
+        const depthUsd = r.depthQuote * qUsd;
+        if (depthUsd < 5000) continue; // exclude dust/dormant pools
+        priced.push({ ...r, priceUsd: r.basePerQuote * qUsd, depthUsd });
       }
 
       const fmtUsd = (n: number) => (n >= 1e6 ? `$${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `$${(n / 1e3).toFixed(0)}K` : `$${n.toFixed(0)}`);
@@ -1098,15 +1764,17 @@ class LiveMevAgent {
         dex: r.spec.dex,
         pair: r.spec.pair,
         poolAddress: r.spec.address,
-        feeTierPercent: r.spec.fee,
+        feeTierPercent: r.liveFeePercent,
         priceUsd: Number(r.priceUsd.toFixed(r.priceUsd < 10 ? 4 : 2)),
         blockNumber: this.latestBlock,
         lastUpdated: now,
         depthSummary: `${fmtUsd(r.depthUsd)} in-range liquidity (on-chain)`,
       }));
 
-      // Opportunities: for each pair, every other real pool vs. the deepest real pool for that pair
+      // Opportunities: evaluate every unordered pool pair (i < j) per token pair
+      // so cross-DEX and cross-fee spreads (e.g., PancakeV3 <-> SushiV3 <-> SushiV2 <-> UniV3) are all surfaced.
       const opps: LiveArbitrageOpportunity[] = [];
+      const nextRouteInputs = new Map<string, RouteExecutionInput>();
       if (ethUsd !== null) {
         const gasPriceGwei = gasPriceWei / 1e9;
         const groups = new Map<string, typeof priced>();
@@ -1114,14 +1782,16 @@ class LiveMevAgent {
         let routeType = 0;
         for (const [pair, group] of groups) {
           if (group.length < 2) continue;
-          const ref = [...group].sort((a, b) => b.depthUsd - a.depthUsd)[0];
-          for (const other of group) {
-            if (other === ref) continue;
-            routeType++;
-            const refIsBuy = ref.priceUsd <= other.priceUsd;
-            const buy = refIsBuy ? ref : other;
-            const sell = refIsBuy ? other : ref;
-            const opp = this.calculateOptimalParameters({
+          for (let i = 0; i < group.length; i++) {
+            for (let j = i + 1; j < group.length; j++) {
+              const a = group[i];
+              const b = group[j];
+              if (a.spec.address.toLowerCase() === b.spec.address.toLowerCase()) continue;
+              routeType++;
+              const aIsBuy = a.priceUsd <= b.priceUsd;
+              const buy = aIsBuy ? a : b;
+              const sell = aIsBuy ? b : a;
+              const opp = this.calculateOptimalParameters({
                 pair,
                 buyDex: buy.spec.name,
                 buyPool: buy.spec.address,
@@ -1129,21 +1799,49 @@ class LiveMevAgent {
                 sellPool: sell.spec.address,
                 buyPrice: buy.priceUsd,
                 sellPrice: sell.priceUsd,
-                feeTierA: buy.spec.fee,
-                feeTierB: sell.spec.fee,
+                feeTierA: buy.liveFeePercent,
+                feeTierB: sell.liveFeePercent,
                 depthA: buy.depthUsd,
                 depthB: sell.depthUsd,
                 routeType,
-                loanToken: ref.spec.base.sym,
+                loanToken: buy.spec.base.sym,
                 ethUsd,
                 gasPriceGwei,
                 lighterRoute: buy.spec.kind !== 'v2' && sell.spec.kind !== 'v2',
-            });
-            if (opp) opps.push(opp);
+              });
+              if (opp) {
+                const buyRouterOk = Boolean(ARBITRUM_DEX_ROUTERS[buy.spec.dex]?.supported);
+                const sellRouterOk = Boolean(ARBITRUM_DEX_ROUTERS[sell.spec.dex]?.supported);
+                opp.contractExecutable = buyRouterOk && sellRouterOk;
+                opps.push(opp);
+                nextRouteInputs.set(opp.id, {
+                  baseToken: buy.spec.base,
+                  quoteToken: buy.spec.quote,
+                  buyDex: buy.spec.dex,
+                  buyFeePercent: buy.liveFeePercent,
+                  sellDex: sell.spec.dex,
+                  sellFeePercent: sell.liveFeePercent,
+                  optimalLoanBaseUnits: opp.optimalLoanAmount,
+                  buyPriceQuotePerBase: buy.basePerQuote,
+                  buyPriceUsd: buy.priceUsd,
+                  estNetProfitUsd: opp.estNetProfitUsd,
+                });
+              }
+            }
           }
         }
       }
+      opps.sort((a, b) => {
+        const profitFlagDelta = Number(b.isProfitable) - Number(a.isProfitable);
+        if (profitFlagDelta !== 0) return profitFlagDelta;
+        const execDelta = Number(Boolean(b.contractExecutable)) - Number(Boolean(a.contractExecutable));
+        if (execDelta !== 0) return execDelta;
+        const netDelta = b.estNetProfitUsd - a.estNetProfitUsd;
+        if (Math.abs(netDelta) > 1e-6) return netDelta;
+        return b.grossSpreadBps - a.grossSpreadBps;
+      });
       this.opportunities = opps;
+      this.routeInputsByOppId = nextRouteInputs;
       this.lastError = null;
       this.consecutiveFailures = 0;
       this.lastSuccessfulScan = Date.now();
@@ -1189,6 +1887,7 @@ flashArbRouter.get('/agent/status', (_req: Request, res: Response) => {
     isSignerConfigured: Boolean(process.env.FLASH_ARB_SIGNER_KEY),
     lastConfirmedTxHash: liveAgent.lastConfirmedTxHash,
     lastConfirmedBlock: liveAgent.lastConfirmedBlock,
+    lastExecutionNotice: liveAgent.lastExecutionNotice,
     scanError: liveAgent.lastError,
     config: {
       minProfitThresholdUsd: liveAgent.minProfitThresholdUsd,
@@ -1291,7 +1990,11 @@ flashArbRouter.post('/agent/trigger', async (req: Request, res: Response) => {
   try {
     // 1. Run fresh scan
     await liveAgent.scan();
-    const sortedOpps = [...liveAgent.opportunities].sort((a, b) => b.estNetProfitUsd - a.estNetProfitUsd);
+    const sortedOpps = [...liveAgent.opportunities].sort((a, b) => {
+      const execDelta = Number(Boolean(b.contractExecutable)) - Number(Boolean(a.contractExecutable));
+      if (execDelta !== 0) return execDelta;
+      return b.estNetProfitUsd - a.estNetProfitUsd;
+    });
     const opp = req.body?.opportunityId
       ? liveAgent.opportunities.find((o) => o.id === req.body.opportunityId) || sortedOpps[0]
       : sortedOpps[0];
@@ -1300,7 +2003,37 @@ flashArbRouter.post('/agent/trigger', async (req: Request, res: Response) => {
       return res.status(400).json({ success: false, error: 'No live pool route found to execute.' });
     }
 
-    return res.status(409).json({ success: false, executionDisabled: true, error: SERVER_EXECUTION_DISABLED_MSG, opportunity: opp });
+    const result = await liveAgent.verifyAndExecuteOpportunity(opp, {
+      forceTestExecution: Boolean(req.body?.forceTestExecution),
+      chain: (req.body?.chain as 'arbitrum' | 'base' | 'optimism') || 'arbitrum',
+    });
+
+    if (!result.ok) {
+      return res.status(result.statusCode).json({
+        success: false,
+        blockedByProfitGuard: result.blockedByProfitGuard,
+        simulationFailed: result.simulationFailed,
+        requiresWallet: result.requiresWallet,
+        txPayload: result.txPayload,
+        txHash: result.txHash,
+        explorerUrl: result.explorerUrl,
+        error: result.error,
+        opportunity: opp,
+      });
+    }
+
+    return res.json({
+      success: true,
+      txHash: result.txHash,
+      explorerUrl: result.explorerUrl,
+      trade: result.trade,
+      candidateLabel: result.candidateLabel,
+      gasEstimate: result.gasEstimate,
+      sweptAmount: result.sweptAmount,
+      sweptToken: result.sweptToken,
+      recipient: result.recipient,
+      opportunity: opp,
+    });
   } catch (err: any) {
     liveAgent.agentState = 'SCANNING';
     return res.status(500).json({ success: false, error: err.message });
@@ -1321,19 +2054,13 @@ flashArbRouter.post('/agent/verify-receipt', async (req: Request, res: Response)
     const cleanHash = txHash.trim();
     const rpcInfo = RPC_ENDPOINTS[String(chain).toLowerCase()] || RPC_ENDPOINTS.arbitrum;
 
-    // Direct JSON-RPC call to verify receipt
-    const resp = await fetch(rpcInfo.rpc, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        jsonrpc: '2.0',
-        method: 'eth_getTransactionReceipt',
-        params: [cleanHash],
-        id: Date.now(),
-      }),
-    });
-    const data = await resp.json();
-    const receipt = data?.result;
+    // Direct JSON-RPC call with failover across receipt-capable nodes
+    const { result: receipt } = await fetchRpcSingleWithFailover(
+      String(chain).toLowerCase(),
+      'eth_getTransactionReceipt',
+      [cleanHash],
+      true
+    );
 
     if (!receipt) {
       return res.json({
@@ -1449,6 +2176,391 @@ flashArbRouter.get('/wallet-balances', async (req: Request, res: Response) => {
       },
       totalUsd: Number(totalUsd.toFixed(2)),
       explorerUrl: `https://arbiscan.io/address/${address}`,
+      timestamp: Date.now(),
+    });
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+/**
+ * Helper: Query ETH + all Arbitrum ERC-20 token balances for an address in one RPC batch.
+ */
+async function queryAllArbitrumBalances(chain: 'arbitrum' | 'base' | 'optimism', targetAddress: string) {
+  const tokenList = chain === 'arbitrum' ? Object.values(ARBITRUM_TOKENS) : [ARBITRUM_TOKENS.WETH, ARBITRUM_TOKENS.USDC];
+  const padded = targetAddress.toLowerCase().replace('0x', '').padStart(64, '0');
+  const balData = `0x70a08231${padded}`;
+
+  const calls: any[] = [
+    { jsonrpc: '2.0', method: 'eth_getBalance', params: [targetAddress, 'latest'], id: 1 },
+  ];
+  if (chain === 'arbitrum') {
+    tokenList.forEach((tok, idx) => {
+      calls.push({
+        jsonrpc: '2.0',
+        method: 'eth_call',
+        params: [{ to: tok.addr, data: balData }, 'latest'],
+        id: 10 + idx,
+      });
+    });
+  }
+
+  const { results } = await fetchRpcBatchWithFailover(chain, calls);
+  const byId = new Map<number, string>();
+  for (const item of results) {
+    if (item && item.id !== undefined && typeof item.result === 'string' && item.result !== '0x') {
+      byId.set(item.id, item.result);
+    }
+  }
+
+  const ethWei = BigInt(byId.get(1) || '0x0');
+  const { ethers } = await import('ethers');
+  const tokens: Array<{
+    symbol: string;
+    address: string;
+    decimals: number;
+    rawBalance: bigint;
+    formatted: string;
+  }> = [];
+
+  if (chain === 'arbitrum') {
+    tokenList.forEach((tok, idx) => {
+      const hex = byId.get(10 + idx);
+      const rawBalance = hex ? BigInt(hex) : 0n;
+      tokens.push({
+        symbol: tok.sym,
+        address: tok.addr,
+        decimals: tok.dec,
+        rawBalance,
+        formatted: ethers.formatUnits(rawBalance, tok.dec),
+      });
+    });
+  }
+
+  return {
+    ethWei,
+    ethFormatted: ethers.formatEther(ethWei),
+    tokens,
+  };
+}
+
+/**
+ * GET /api/flash-arb/contract-balances
+ * Queries live ETH + all ERC-20 token balances sitting on the active FlashArb contract,
+ * plus inspects contract owner() and selector support (executeOptimizedArbitrage / rescueTokensTo).
+ */
+flashArbRouter.get('/contract-balances', async (req: Request, res: Response) => {
+  try {
+    const chain = (String(req.query.chain || 'arbitrum').toLowerCase() as 'arbitrum' | 'base' | 'optimism');
+    const rpcInfo = RPC_ENDPOINTS[chain] || RPC_ENDPOINTS.arbitrum;
+    const contractAddr = String(req.query.address || DEPLOYED_CONTRACTS[chain] || '').trim();
+    if (!/^0x[a-fA-F0-9]{40}$/.test(contractAddr)) {
+      return res.status(400).json({ success: false, error: 'Invalid contract address' });
+    }
+
+    const { ethers } = await import('ethers');
+    const [balInfo, codeResp, ownerResp] = await Promise.all([
+      queryAllArbitrumBalances(chain, contractAddr),
+      fetchRpcSingleWithFailover(chain, 'eth_getCode', [contractAddr, 'latest'], true),
+      fetchRpcSingleWithFailover(chain, 'eth_call', [{ to: contractAddr, data: '0x8da5cb5b' }, 'latest'], true).catch(() => ({ result: null })),
+    ]);
+
+    const code = String(codeResp.result || '0x').toLowerCase();
+    const isDeployed = code !== '0x' && code.length > 2;
+    const contractOwner =
+      typeof ownerResp.result === 'string' && ownerResp.result.length >= 66
+        ? ethers.getAddress(`0x${ownerResp.result.slice(-40)}`)
+        : null;
+
+    return res.json({
+      success: true,
+      chain,
+      chainName: rpcInfo.name,
+      contractAddress: contractAddr,
+      isDeployed,
+      owner: contractOwner,
+      supportsOptimizedArbitrage: code.includes('23b3aa6b'),
+      supportsRescueTokensTo: code.includes('a7070692'),
+      supportsRescueTokens: code.includes('ae3bf8'),
+      eth: balInfo.ethFormatted,
+      ethWei: balInfo.ethWei.toString(),
+      tokens: balInfo.tokens.map((t) => ({
+        symbol: t.symbol,
+        address: t.address,
+        decimals: t.decimals,
+        balance: t.formatted,
+        hasBalance: t.rawBalance > 0n,
+      })),
+      nonZeroCount: (balInfo.ethWei > 0n ? 1 : 0) + balInfo.tokens.filter((t) => t.rawBalance > 0n).length,
+      explorerUrl: `${rpcInfo.explorer}/address/${contractAddr}`,
+      timestamp: Date.now(),
+    });
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+/**
+ * POST /api/flash-arb/sweep-all
+ * Sweeps ALL native ETH (executeDirectFlashArb) AND ALL non-zero ERC-20 token balances
+ * (rescueTokensTo -> fallback rescueTokens + owner ERC-20 forward) from the FlashArb contract(s)
+ * directly to the configured Profit Vault recipient address. Optionally sweeps leftover ERC-20 tokens
+ * from the gas/owner wallet if includeGasWalletTokens === true (never drains native gas ETH).
+ */
+flashArbRouter.post('/sweep-all', async (req: Request, res: Response) => {
+  try {
+    const chain = (String(req.body?.chain || 'arbitrum').toLowerCase() as 'arbitrum' | 'base' | 'optimism');
+    const rpcInfo = RPC_ENDPOINTS[chain] || RPC_ENDPOINTS.arbitrum;
+    const primaryContract = String(req.body?.contractAddress || DEPLOYED_CONTRACTS[chain] || '').trim();
+    const recipient = String(req.body?.recipient || profitWalletEnv() || '').trim();
+    const extraContracts = Array.isArray(req.body?.extraContracts) ? req.body.extraContracts : [];
+    const includeGasWalletTokens = Boolean(req.body?.includeGasWalletTokens);
+
+    if (!/^0x[a-fA-F0-9]{40}$/.test(primaryContract)) {
+      return res.status(400).json({ success: false, error: 'Valid contractAddress is required.' });
+    }
+    if (!/^0x[a-fA-F0-9]{40}$/.test(recipient) || recipient === '0x0000000000000000000000000000000000000000') {
+      return res.status(400).json({ success: false, error: 'Valid non-zero Profit Vault recipient address (0x...) is required.' });
+    }
+
+    const signerKey = (process.env.FLASH_ARB_SIGNER_KEY || '').trim();
+    if (!signerKey) {
+      return res.status(409).json({
+        success: false,
+        requiresWallet: true,
+        error: 'No server signer key configured. Configure FLASH_ARB_SIGNER_KEY in Signer Key Config so the server can sign owner sweep transactions.',
+      });
+    }
+
+    const { ethers } = await import('ethers');
+    const cleanKey = signerKey.startsWith('0x') ? signerKey : `0x${signerKey}`;
+    const signerAddress = new ethers.Wallet(cleanKey).address;
+
+    const sendSignedWithEstimate = async (to: string, data: string): Promise<{ txHash: string; gasUsed: string }> => {
+      const { result: gasHex } = await fetchRpcSingleWithFailover(
+        chain,
+        'eth_estimateGas',
+        [{ from: signerAddress, to, data }, 'latest'],
+        true
+      );
+      const estGas = typeof gasHex === 'string' && gasHex.startsWith('0x') ? BigInt(gasHex) : 150000n;
+      const gasLimit = (estGas * 130n) / 100n;
+
+      let sentHash = '';
+      let lastErr: any = null;
+      for (const rpcUrl of getRpcPool(chain, true)) {
+        try {
+          const provider = new ethers.JsonRpcProvider(rpcUrl);
+          const wallet = new ethers.Wallet(cleanKey, provider);
+          const bal = await provider.getBalance(wallet.address);
+          if (bal < 50000000000000n) {
+            throw new Error(`Gas wallet ${wallet.address} holds ${ethers.formatEther(bal)} ETH on ${rpcInfo.name}; fund it with ETH for gas.`);
+          }
+          const tx = await wallet.sendTransaction({ to, data, gasLimit });
+          sentHash = tx.hash;
+          break;
+        } catch (e: any) {
+          lastErr = e;
+          const msg = String(e?.message || '');
+          if (!/429|403|timeout|fetch|coalesce|archive|network|ECONN|socket/i.test(msg)) {
+            throw e;
+          }
+        }
+      }
+      if (!sentHash) throw lastErr || new Error('Broadcast failed across all RPC endpoints');
+      const receipt = await waitForReceiptWithFailover(chain, sentHash, 45000);
+      if (receipt.status !== 1) {
+        throw new Error(`Sweep tx ${sentHash} reverted on-chain`);
+      }
+      return { txHash: sentHash, gasUsed: receipt.gasUsed.toString() };
+    };
+
+    // Deduplicate contract addresses to inspect
+    const contractSet = new Map<string, string>();
+    for (const addr of [primaryContract, ...extraContracts]) {
+      const trimmed = String(addr || '').trim();
+      if (/^0x[a-fA-F0-9]{40}$/.test(trimmed)) {
+        contractSet.set(trimmed.toLowerCase(), ethers.getAddress(trimmed));
+      }
+    }
+
+    const sweptAssets: Array<{
+      source: string;
+      asset: string;
+      amount: string;
+      method: string;
+      txHash: string;
+      explorerUrl: string;
+      recipient: string;
+    }> = [];
+    const errors: Array<{ source: string; asset: string; error: string }> = [];
+    const checkedContracts: Array<{ address: string; nonZeroAssets: number; ownerMatchesSigner: boolean }> = [];
+
+    for (const contractAddr of contractSet.values()) {
+      const { result: codeRaw } = await fetchRpcSingleWithFailover(chain, 'eth_getCode', [contractAddr, 'latest'], true);
+      const code = String(codeRaw || '0x').toLowerCase();
+      if (code === '0x' || code.length <= 2) continue;
+
+      let ownerMatches = true;
+      try {
+        const { result: ownerRaw } = await fetchRpcSingleWithFailover(
+          chain,
+          'eth_call',
+          [{ to: contractAddr, data: '0x8da5cb5b' }, 'latest'],
+          true
+        );
+        if (typeof ownerRaw === 'string' && ownerRaw.length >= 66) {
+          const contractOwner = ethers.getAddress(`0x${ownerRaw.slice(-40)}`);
+          ownerMatches = contractOwner.toLowerCase() === signerAddress.toLowerCase();
+          if (!ownerMatches) {
+            errors.push({
+              source: contractAddr,
+              asset: 'ALL',
+              error: `Signer ${signerAddress} is not owner of ${contractAddr} (owner is ${contractOwner}).`,
+            });
+            checkedContracts.push({ address: contractAddr, nonZeroAssets: 0, ownerMatchesSigner: false });
+            continue;
+          }
+        }
+      } catch {
+        // assume owner if owner() absent
+      }
+
+      const balInfo = await queryAllArbitrumBalances(chain, contractAddr);
+      const nonZeroTokens = balInfo.tokens.filter((t) => t.rawBalance > 0n);
+      const nonZeroAssets = (balInfo.ethWei > 0n ? 1 : 0) + nonZeroTokens.length;
+      checkedContracts.push({ address: contractAddr, nonZeroAssets, ownerMatchesSigner: ownerMatches });
+
+      // 1. Sweep native ETH via executeDirectFlashArb(recipient)
+      if (balInfo.ethWei > 0n) {
+        try {
+          const data = encodeExecuteDirectFlashArb(recipient);
+          const { txHash } = await sendSignedWithEstimate(contractAddr, data);
+          sweptAssets.push({
+            source: contractAddr,
+            asset: 'ETH',
+            amount: balInfo.ethFormatted,
+            method: 'executeDirectFlashArb(recipient)',
+            txHash,
+            explorerUrl: `${rpcInfo.explorer}/tx/${txHash}`,
+            recipient,
+          });
+        } catch (err: any) {
+          errors.push({
+            source: contractAddr,
+            asset: 'ETH',
+            error: decodeFlashArbRevertError(err),
+          });
+        }
+      }
+
+      // 2. Sweep each non-zero ERC-20 token balance
+      for (const tok of nonZeroTokens) {
+        try {
+          if (code.includes('a7070692')) {
+            // Direct rescueTokensTo(token, recipient)
+            const data = encodeRescueTokensTo(tok.address, recipient);
+            const { txHash } = await sendSignedWithEstimate(contractAddr, data);
+            sweptAssets.push({
+              source: contractAddr,
+              asset: tok.symbol,
+              amount: tok.formatted,
+              method: 'rescueTokensTo(token, recipient)',
+              txHash,
+              explorerUrl: `${rpcInfo.explorer}/tx/${txHash}`,
+              recipient,
+            });
+          } else {
+            // Legacy contract has rescueTokens(token) -> sends to owner() == signerAddress
+            const rescueData = encodeRescueTokens(tok.address);
+            const { txHash: rescueTx } = await sendSignedWithEstimate(contractAddr, rescueData);
+
+            // If profit vault differs from owner, forward rescued tokens directly to recipient
+            if (recipient.toLowerCase() !== signerAddress.toLowerCase()) {
+              const fwdData = encodeErc20Transfer(recipient, tok.rawBalance);
+              const { txHash: fwdTx } = await sendSignedWithEstimate(tok.address, fwdData);
+              sweptAssets.push({
+                source: contractAddr,
+                asset: tok.symbol,
+                amount: tok.formatted,
+                method: 'rescueTokens(token) -> ERC20.transfer(recipient)',
+                txHash: fwdTx,
+                explorerUrl: `${rpcInfo.explorer}/tx/${fwdTx}`,
+                recipient,
+              });
+            } else {
+              sweptAssets.push({
+                source: contractAddr,
+                asset: tok.symbol,
+                amount: tok.formatted,
+                method: 'rescueTokens(token)',
+                txHash: rescueTx,
+                explorerUrl: `${rpcInfo.explorer}/tx/${rescueTx}`,
+                recipient,
+              });
+            }
+          }
+        } catch (err: any) {
+          errors.push({
+            source: contractAddr,
+            asset: tok.symbol,
+            error: decodeFlashArbRevertError(err),
+          });
+        }
+      }
+    }
+
+    // Optional: Sweep leftover ERC-20 tokens on Gas/Owner Wallet to Profit Vault (never sweeps ETH gas!)
+    if (includeGasWalletTokens && recipient.toLowerCase() !== signerAddress.toLowerCase()) {
+      const signerBalances = await queryAllArbitrumBalances(chain, signerAddress);
+      for (const tok of signerBalances.tokens.filter((t) => t.rawBalance > 0n)) {
+        try {
+          const fwdData = encodeErc20Transfer(recipient, tok.rawBalance);
+          const { txHash } = await sendSignedWithEstimate(tok.address, fwdData);
+          sweptAssets.push({
+            source: signerAddress,
+            asset: tok.symbol,
+            amount: tok.formatted,
+            method: 'ERC20.transfer(recipient)',
+            txHash,
+            explorerUrl: `${rpcInfo.explorer}/tx/${txHash}`,
+            recipient,
+          });
+        } catch (err: any) {
+          errors.push({
+            source: signerAddress,
+            asset: tok.symbol,
+            error: decodeFlashArbRevertError(err),
+          });
+        }
+      }
+    }
+
+    if (errors.length > 0 && sweptAssets.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: errors[0].error,
+        errors,
+        checkedContracts,
+        recipient,
+      });
+    }
+
+    const message =
+      sweptAssets.length > 0
+        ? `Swept ${sweptAssets.length} asset(s) to Profit Vault ${recipient}.`
+        : `All inspected contract ETH & ERC-20 balances are already $0.00 (no residual tokens locked).`;
+
+    return res.json({
+      success: true,
+      chain,
+      chainName: rpcInfo.name,
+      recipient,
+      signerAddress,
+      checkedContracts,
+      sweptAssets,
+      errors,
+      message,
       timestamp: Date.now(),
     });
   } catch (err: any) {

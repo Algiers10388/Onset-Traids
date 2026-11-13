@@ -19,11 +19,38 @@ const ETHERSCAN_V2_URL = 'https://api.etherscan.io/v2/api';
 const getEtherscanKey = (): string => process.env.ETHERSCAN_API_KEY || '';
 export const isEtherscanKeyConfigured = (): boolean => Boolean(getEtherscanKey());
 
-export async function etherscanApi(params: Record<string, string | number>, chainId = 1): Promise<any> {
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+// Global serialized queue so Etherscan V2 never receives >2 requests/sec (limit is 3/sec)
+const MIN_REQUEST_INTERVAL_MS = 500;
+let etherscanQueue: Promise<void> = Promise.resolve();
+let lastEtherscanCallAt = 0;
+
+function enqueueEtherscan<T>(task: () => Promise<T>): Promise<T> {
+  const run = etherscanQueue.then(async () => {
+    const elapsed = Date.now() - lastEtherscanCallAt;
+    if (elapsed < MIN_REQUEST_INTERVAL_MS) {
+      await sleep(MIN_REQUEST_INTERVAL_MS - elapsed);
+    }
+    lastEtherscanCallAt = Date.now();
+    return task();
+  });
+  etherscanQueue = run.then(
+    () => undefined,
+    () => undefined
+  );
+  return run;
+}
+
+function isEtherscanRateLimitMessage(msg: string): boolean {
+  return /rate limit|max calls per sec|429|too many requests/i.test(msg);
+}
+
+async function etherscanApiOnce(params: Record<string, string | number>, chainId = 1): Promise<any> {
   const apikey = getEtherscanKey();
   if (!apikey) throw new Error('ETHERSCAN_API_KEY is not set');
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 5000);
+  const timeout = setTimeout(() => controller.abort(), 8000);
   try {
     const qs = new URLSearchParams({
       chainid: String(chainId),
@@ -31,13 +58,36 @@ export async function etherscanApi(params: Record<string, string | number>, chai
       apikey,
     });
     const res = await fetch(`${ETHERSCAN_V2_URL}?${qs.toString()}`, { signal: controller.signal });
+    if (res.status === 429) {
+      throw new Error('Etherscan error: Max calls per sec rate limit reached (HTTP 429)');
+    }
     if (!res.ok) throw new Error(`Etherscan HTTP ${res.status}`);
     const json: any = await res.json();
     if (json?.status === '1' || (json?.jsonrpc && json.result !== undefined && !json.error)) return json.result;
-    throw new Error(`Etherscan error: ${typeof json?.result === 'string' ? json.result : json?.message || 'unknown'}`);
+    const errDetail = typeof json?.result === 'string' ? json.result : json?.message || json?.error?.message || 'unknown';
+    throw new Error(`Etherscan error: ${errDetail}`);
   } finally {
     clearTimeout(timeout);
   }
+}
+
+export async function etherscanApi(params: Record<string, string | number>, chainId = 1): Promise<any> {
+  const backoffMs = [1200, 2400, 4000];
+  let lastErr: unknown;
+  for (let attempt = 0; attempt <= backoffMs.length; attempt++) {
+    try {
+      return await enqueueEtherscan(() => etherscanApiOnce(params, chainId));
+    } catch (err) {
+      lastErr = err;
+      const msg = err instanceof Error ? err.message : String(err);
+      if (isEtherscanRateLimitMessage(msg) && attempt < backoffMs.length) {
+        await sleep(backoffMs[attempt]);
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw lastErr;
 }
 
 // Well-known Ethereum Mainnet addresses for smart-money tracking
@@ -140,18 +190,17 @@ export interface OnChainBlockSnapshot {
   syncSource: string;
 }
 
-// Real ETH price + gas oracle from Etherscan, refreshed at most every 30s (rate-limit friendly).
+// Real ETH price + gas oracle from Etherscan, refreshed at most every 60s (rate-limit friendly).
 // If a refresh fails and the last good value is older than 2 minutes it is discarded; nothing is substituted.
 interface MarketData { ethUsd: number; gasSafe: number; gasPropose: number; gasFast: number; fetchedAt: number }
 let market: MarketData | null = null;
 
 async function refreshMarketData(): Promise<MarketData> {
-  if (market && Date.now() - market.fetchedAt < 30_000) return market;
+  if (market && Date.now() - market.fetchedAt < 60_000) return market;
   try {
-    const [price, gas] = await Promise.all([
-      etherscanApi({ module: 'stats', action: 'ethprice' }),
-      etherscanApi({ module: 'gastracker', action: 'gasoracle' }),
-    ]);
+    // Sequential calls through the paced queue so we never burst against the 3/sec rate limit
+    const price = await etherscanApi({ module: 'stats', action: 'ethprice' });
+    const gas = await etherscanApi({ module: 'gastracker', action: 'gasoracle' });
     const ethUsd = parseFloat(price?.ethusd);
     const gasSafe = parseFloat(gas?.SafeGasPrice);
     const gasPropose = parseFloat(gas?.ProposeGasPrice);
@@ -174,7 +223,9 @@ class EtherscanIntelligenceService {
   private lastError: string | null = null;
   private liveTransactions: LiveOnChainTx[] = [];
   private isPolling = false;
-  private syncing = false;
+  private activeSync: Promise<void> | null = null;
+  private pollTimer: NodeJS.Timeout | null = null;
+  private consecutiveRateLimits = 0;
   private autoExecutionEnabled = false;
   private minProfitThresholdPercent = 0.01;
 
@@ -182,32 +233,66 @@ class EtherscanIntelligenceService {
     this.startLivePolling();
   }
 
+  private scheduleNextPoll(delayMs: number): void {
+    if (this.pollTimer) clearTimeout(this.pollTimer);
+    this.pollTimer = setTimeout(async () => {
+      await this.syncLiveBlockAndTxs();
+      const baseDelay = 12_000;
+      const nextDelay =
+        this.consecutiveRateLimits > 0
+          ? Math.min(60_000, baseDelay * Math.pow(2, this.consecutiveRateLimits))
+          : baseDelay;
+      this.scheduleNextPoll(nextDelay);
+    }, delayMs);
+    if (typeof this.pollTimer.unref === 'function') {
+      this.pollTimer.unref();
+    }
+  }
+
   private startLivePolling(): void {
     if (this.isPolling) return;
     this.isPolling = true;
-    this.syncLiveBlockAndTxs();
-    setInterval(() => this.syncLiveBlockAndTxs(), 6000);
+    void this.syncLiveBlockAndTxs().finally(() => {
+      const baseDelay = 12_000;
+      const nextDelay =
+        this.consecutiveRateLimits > 0
+          ? Math.min(60_000, baseDelay * Math.pow(2, this.consecutiveRateLimits))
+          : baseDelay;
+      this.scheduleNextPoll(nextDelay);
+    });
   }
 
-  public async syncLiveBlockAndTxs(): Promise<void> {
-    if (this.syncing) return;
-    this.syncing = true;
+  public syncLiveBlockAndTxs(): Promise<void> {
+    if (this.activeSync) return this.activeSync;
+    this.activeSync = this.performSync().finally(() => {
+      this.activeSync = null;
+    });
+    return this.activeSync;
+  }
+
+  private async performSync(): Promise<void> {
     try {
       if (!isEtherscanKeyConfigured()) {
         this.lastError = 'ETHERSCAN_API_KEY is not set';
         return;
       }
-      const [blockRaw, mk] = await Promise.all([
-        etherscanApi({ module: 'proxy', action: 'eth_getBlockByNumber', tag: 'latest', boolean: 'true' }),
-        refreshMarketData(),
-      ]);
+      // Run block fetch and market refresh sequentially so Etherscan calls are paced safely under 3/sec
+      const blockRaw = await etherscanApi({
+        module: 'proxy',
+        action: 'eth_getBlockByNumber',
+        tag: 'latest',
+        boolean: 'true',
+      });
       if (!blockRaw || !blockRaw.number) throw new Error('Etherscan returned no block');
 
       const blockNumber = parseInt(blockRaw.number, 16);
       if (this.blockSnapshot?.blockNumber === blockNumber) {
         this.lastError = null;
+        this.consecutiveRateLimits = 0;
         return;
       }
+
+      const mk = await refreshMarketData();
       const baseFeeGwei = blockRaw.baseFeePerGas ? parseInt(blockRaw.baseFeePerGas, 16) / 1e9 : NaN;
       if (!Number.isFinite(baseFeeGwei)) throw new Error('Block has no baseFeePerGas');
       const miner = (blockRaw.miner || '').toLowerCase();
@@ -280,11 +365,14 @@ class EtherscanIntelligenceService {
         this.liveTransactions = [...newTransactions.filter((t) => !existing.has(t.hash)), ...this.liveTransactions].slice(0, 50);
       }
       this.lastError = null;
+      this.consecutiveRateLimits = 0;
     } catch (err: any) {
-      this.lastError = err?.message || String(err);
+      const msg = err?.message || String(err);
+      this.lastError = msg;
+      if (isEtherscanRateLimitMessage(msg)) {
+        this.consecutiveRateLimits = Math.min(4, this.consecutiveRateLimits + 1);
+      }
       console.error('Etherscan sync failed:', this.lastError);
-    } finally {
-      this.syncing = false;
     }
   }
 
@@ -367,9 +455,25 @@ USER FOCUS: ${userPrompt || 'Summarize what the flagged activity shows and what,
 Respond ONLY with JSON: {"summary": string, "actionableStrategies": string[]} (strategies may be empty if nothing is supported by the data).`;
 
     const ai = new GoogleGenAI({});
-    const response = await callWithTimeout(() =>
-      ai.models.generateContent({ model: 'gemini-3.8-flash', contents: promptText, config: { responseMimeType: 'application/json' } })
-    );
+    let response: any = null;
+    let lastErr: any = null;
+    for (const model of ['gemini-4-hydrogen', 'gemini-3.1-flash-lite']) {
+      try {
+        response = await callWithTimeout(() =>
+          ai.models.generateContent({ model, contents: promptText, config: { responseMimeType: 'application/json' } })
+        );
+        if (response?.text) break;
+      } catch (err: any) {
+        lastErr = err;
+        const msg = String(err?.message || '');
+        if (!/503|429|UNAVAILABLE|RESOURCE_EXHAUSTED|high demand|overloaded|TIMEOUT/i.test(msg)) {
+          throw err;
+        }
+      }
+    }
+    if (!response?.text) {
+      throw lastErr || new Error('Gemini returned empty analysis output.');
+    }
     let parsed: any;
     try {
       parsed = JSON.parse(response.text || '');

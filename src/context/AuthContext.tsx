@@ -103,7 +103,7 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
             loaded.push({
               id: docSnap.id,
               title: data.title || 'Troubleshooting Session',
-              modelUsed: data.modelUsed || 'gemini-3.8-flash',
+              modelUsed: data.modelUsed || 'gemini-4-hydrogen',
               messages: typeof data.messages === 'string' ? JSON.parse(data.messages) : data.messages || [],
               createdAt: data.createdAt || Date.now(),
               updatedAt: data.updatedAt || Date.now(),

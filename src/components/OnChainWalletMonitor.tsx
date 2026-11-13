@@ -186,12 +186,18 @@ export const OnChainWalletMonitor: React.FC<OnChainWalletMonitorProps> = ({
         body: JSON.stringify({ address: addr, network: net }),
       });
 
-      const data = await res.json();
-      if (data.success && data.profile) {
+      const rawText = await res.text();
+      let data: any = null;
+      try {
+        data = rawText ? JSON.parse(rawText) : null;
+      } catch {
+        throw new Error(`Server returned non-JSON response (HTTP ${res.status})`);
+      }
+      if (data?.success && data.profile) {
         setProfile(data.profile);
         setAiAuditText(null); // Reset AI report on new address
       } else {
-        setError(data.error || 'Failed to resolve wallet profile on chain.');
+        setError(data?.error || `Failed to resolve wallet profile on chain (HTTP ${res.status}).`);
       }
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : 'Network error';
@@ -299,13 +305,27 @@ export const OnChainWalletMonitor: React.FC<OnChainWalletMonitorProps> = ({
         }),
       });
 
-      const data = await res.json();
-      if (data.success && data.audit) {
+      const rawText = await res.text();
+      let data: any = null;
+      try {
+        data = rawText ? JSON.parse(rawText) : null;
+      } catch {
+        throw new Error(`AI audit endpoint returned non-JSON response (HTTP ${res.status}). Please try again.`);
+      }
+
+      if (res.ok && data?.success && data.audit) {
         setAiAuditText(data.audit);
         setActiveTab('AI_AUDIT');
+      } else {
+        const errMsg = data?.error || `AI audit request failed (HTTP ${res.status}).`;
+        setAiAuditText(`Audit unavailable: ${errMsg}`);
+        setActiveTab('AI_AUDIT');
       }
-    } catch (e) {
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : 'Unexpected error during AI audit';
       console.error('Failed to run AI audit:', e);
+      setAiAuditText(`Audit unavailable: ${msg}`);
+      setActiveTab('AI_AUDIT');
     } finally {
       setAiAuditLoading(false);
     }

@@ -36,6 +36,14 @@ struct Args {
     /// Minimum milliseconds between block polls (public RPCs rate-limit; use your own node to go lower)
     #[arg(long, default_value_t = 2000)]
     scan_ms: u64,
+
+    /// Sweep all accumulated vault ETH and non-ETH token dust across vaults + gas wallet to FLASH_ARB_PROFIT_WALLET, then exit
+    #[arg(long, default_value_t = false)]
+    sweep_only: bool,
+
+    /// Run an automatic dust-sweep check across vaults + gas wallet every N scanned blocks (0 disables periodic sweeps; post-trade sweeps still run)
+    #[arg(long, default_value_t = 30)]
+    sweep_interval_scans: u64,
 }
 
 #[tokio::main]
@@ -48,7 +56,11 @@ async fn main() -> eyre::Result<()> {
         .init();
 
     let args = Args::parse();
-    info!("flash-arb searcher starting (LIVE broadcasting only; no paper/dry-run mode)");
+    if args.sweep_only {
+        info!("flash-arb searcher starting in --sweep-only mode (contract vaults + gas wallet non-ETH dust -> FLASH_ARB_PROFIT_WALLET)");
+    } else {
+        info!("flash-arb searcher starting (LIVE broadcasting only; no paper/dry-run mode)");
+    }
 
     let mut tasks = Vec::new();
     for chain in args.chains.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
@@ -70,14 +82,26 @@ async fn main() -> eyre::Result<()> {
             eyre::bail!("FLASH_ARB_PROFIT_WALLET is not set or not a valid address (live-only searcher)");
         }
 
+        let risk_manager = RiskManager::new(config.risk.clone());
+        if args.sweep_only {
+            info!("Running --sweep-only for {} (chain id {})", config.chain_name, config.chain_id);
+            tasks.push(tokio::spawn(async move {
+                let executor = TxExecutor::new(config.clone(), risk_manager);
+                if let Err(e) = executor.sweep_all_dust().await {
+                    error!("[{}] sweep-only failed: {:?}", config.chain_name, e);
+                }
+            }));
+            continue;
+        }
+
         info!("Spawning LIVE worker for {} (chain id {})", config.chain_name, config.chain_id);
         let scan_ms = args.scan_ms;
+        let sweep_interval_scans = args.sweep_interval_scans;
         // Risk state lives outside the retry loop so a worker restart can never clear a tripped circuit breaker.
-        let risk_manager = RiskManager::new(config.risk.clone());
         tasks.push(tokio::spawn(async move {
             let mut backoff: u64 = 5;
             loop {
-                match run_chain_worker(config.clone(), scan_ms, risk_manager.clone()).await {
+                match run_chain_worker(config.clone(), scan_ms, sweep_interval_scans, risk_manager.clone()).await {
                     Ok(()) => break,
                     Err(e) => {
                         error!("[{}] worker failed: {:?}. Restarting in {}s", config.chain_name, e, backoff);
@@ -93,6 +117,12 @@ async fn main() -> eyre::Result<()> {
         eyre::bail!("no chain workers started (check --chains and --config-dir)");
     }
 
+    if args.sweep_only {
+        futures_util::future::join_all(tasks).await;
+        info!("All --sweep-only tasks finished.");
+        return Ok(());
+    }
+
     tokio::select! {
         _ = signal::ctrl_c() => info!("Ctrl+C received. Exiting."),
         _ = futures_util::future::join_all(tasks) => error!("All chain workers exited."),
@@ -100,7 +130,12 @@ async fn main() -> eyre::Result<()> {
     Ok(())
 }
 
-async fn run_chain_worker(config: ChainConfig, scan_ms: u64, risk_manager: RiskManager) -> eyre::Result<()> {
+async fn run_chain_worker(
+    config: ChainConfig,
+    scan_ms: u64,
+    sweep_interval_scans: u64,
+    risk_manager: RiskManager,
+) -> eyre::Result<()> {
     let chain = config.chain_name.clone();
     let monitor = PriceMonitor::new(config.clone())?;
     let route_finder = RouteFinder::new(config.clone());
@@ -203,6 +238,14 @@ async fn run_chain_worker(config: ChainConfig, scan_ms: u64, risk_manager: RiskM
                         }
                     }
                 }
+            }
+        }
+
+        // Sweep any residual ETH / non-ETH ERC-20 dust on startup and every `sweep_interval_scans` blocks
+        // (skipped if `executed` already ran a post-trade sweep on this block).
+        if !executed && (scans == 1 || (sweep_interval_scans > 0 && scans % sweep_interval_scans == 0)) {
+            if let Err(e) = executor.sweep_all_dust().await {
+                warn!("[{}] periodic dust sweep failed: {:?}", chain, e);
             }
         }
 

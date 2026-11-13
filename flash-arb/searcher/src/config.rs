@@ -1,6 +1,6 @@
 use ethers::types::Address;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 fn default_balancer_vault() -> String {
@@ -32,6 +32,9 @@ pub struct ChainConfig {
     #[serde(default = "default_balancer_vault")]
     pub balancer_vault: String,
     pub flash_arb_contract: String,
+    /// Additional contract vaults to sweep alongside `flash_arb_contract` (e.g. previous deployments)
+    #[serde(default)]
+    pub extra_sweep_contracts: Vec<String>,
     pub dexes: HashMap<String, DexConfig>,
     pub tokens: HashMap<String, String>,
     pub risk: RiskConfig,
@@ -69,8 +72,8 @@ pub enum DexKind {
 
 pub fn dex_kind(dex_id: &str) -> DexKind {
     match dex_id {
-        "uniswap_v3" => DexKind::V3,
-        "camelot_v2" | "sushiswap_v2" => DexKind::V2,
+        "uniswap_v3" | "pancake_v3" | "sushiswap_v3" => DexKind::V3,
+        "sushiswap_v2" => DexKind::V2,
         _ => DexKind::Unsupported,
     }
 }
@@ -94,6 +97,48 @@ impl ChainConfig {
                 config.rpc_http = url.trim().to_string();
             }
         }
+        let contract_var = format!("FLASH_ARB_CONTRACT_{}", config.chain_name.to_uppercase());
+        if let Ok(addr) = std::env::var(&contract_var) {
+            if !addr.trim().is_empty() {
+                config.flash_arb_contract = addr.trim().to_string();
+            }
+        }
         Ok(config)
+    }
+
+    /// All unique non-zero FlashArb contract vaults configured for this chain (primary + extra_sweep_contracts).
+    pub fn sweep_contracts(&self) -> Vec<Address> {
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        for raw in std::iter::once(&self.flash_arb_contract).chain(self.extra_sweep_contracts.iter()) {
+            if let Some(addr) = parse_addr(raw) {
+                if addr != Address::zero() && seen.insert(addr) {
+                    out.push(addr);
+                }
+            }
+        }
+        out
+    }
+
+    /// Every configured ERC-20 token (including excluded tokens, which may still accumulate dust).
+    pub fn all_tokens(&self) -> Vec<(String, Address)> {
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        for (sym, raw) in &self.tokens {
+            if let Some(addr) = parse_addr(raw) {
+                if addr != Address::zero() && seen.insert(addr) {
+                    out.push((sym.clone(), addr));
+                }
+            }
+        }
+        for raw in &self.risk.excluded_tokens {
+            if let Some(addr) = parse_addr(raw) {
+                if addr != Address::zero() && seen.insert(addr) {
+                    out.push((format!("TOKEN_{:?}", addr), addr));
+                }
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
     }
 }

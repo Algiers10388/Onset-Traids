@@ -1503,11 +1503,17 @@ function AppInner({ initialAssets, initialCandles }: { initialAssets: CryptoAsse
         }),
       });
 
-      const data = await response.json();
-      if (data.success && data.analysis) {
+      const rawText = await response.text();
+      let data: any = null;
+      try {
+        data = rawText ? JSON.parse(rawText) : null;
+      } catch {
+        throw new Error(`AI audit endpoint returned non-JSON response (HTTP ${response.status})`);
+      }
+      if (response.ok && data?.success && data.analysis) {
         setAiAnalysis(data.analysis);
       } else {
-        throw new Error(data.error || 'Failed to fetch AI audit');
+        throw new Error(data?.error || 'Failed to fetch AI audit');
       }
     } catch (err) {
       console.error('AI Audit request failed:', err);

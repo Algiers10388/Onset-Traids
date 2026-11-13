@@ -1,18 +1,18 @@
 import express from "express";
 import path from "path";
-import { createAccessGuard } from "./server/accessGuard.js";
+import { createAccessGuard } from "./server/accessGuard.ts";
 import crypto from "crypto";
 import fs from "fs";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI } from "@google/genai";
 import dotenv from "dotenv";
-import { setupFiatRoutes } from "./server/fiatRoutes";
-import { setupExchangeRoutes } from "./server/exchangeRoutes";
-import { aiRouter } from "./server/aiRoutes";
-import { walletRouter } from "./server/walletRoutes";
-import { flashArbRouter } from "./server/flashArbRoutes";
-import { sentimentRouter } from "./server/sentimentRoutes";
-import { requireAuth, AuthRequest } from "./src/middleware/auth.ts";
+import { setupFiatRoutes } from "./server/fiatRoutes.ts";
+import { setupExchangeRoutes } from "./server/exchangeRoutes.ts";
+import { aiRouter } from "./server/aiRoutes.ts";
+import { walletRouter } from "./server/walletRoutes.ts";
+import { flashArbRouter } from "./server/flashArbRoutes.ts";
+import { sentimentRouter } from "./server/sentimentRoutes.ts";
+import { requireAuth, type AuthRequest } from "./src/middleware/auth.ts";
 import { getOrCreateUser } from "./src/db/users.ts";
 import {
   saveUserPortfolio,
@@ -185,7 +185,7 @@ async function startServer() {
   const handleQuotesRequest = async (req: express.Request, res: express.Response) => {
     try {
       const symbol = String(req.query.symbol || "BTC/USDT");
-      const { fetchLiveExchangeQuotes } = await import("./server/liveMarketData");
+      const { fetchLiveExchangeQuotes } = await import("./server/liveMarketData.ts");
       const quotes = await fetchLiveExchangeQuotes(symbol);
       res.json({ success: true, symbol, quotes, timestamp: Date.now() });
     } catch (err: any) {
@@ -292,11 +292,29 @@ Provide an objective, professional, mathematically sound evaluation in valid JSO
 }
 Return ONLY valid JSON without markdown wrapping.`;
 
-      const response = await ai.models.generateContent({
-        model: "gemini-3.8-flash",
-        contents: prompt,
-        config: { responseMimeType: "application/json", temperature: 0.3 },
-      });
+      let response: any = null;
+      let usedModel = "gemini-4-hydrogen";
+      let lastErr: any = null;
+      for (const model of ["gemini-4-hydrogen", "gemini-3.1-flash-lite"]) {
+        try {
+          usedModel = model;
+          response = await ai.models.generateContent({
+            model,
+            contents: prompt,
+            config: { responseMimeType: "application/json", temperature: 0.3 },
+          });
+          if (response?.text) break;
+        } catch (err: any) {
+          lastErr = err;
+          const msg = String(err?.message || "");
+          if (!/503|429|UNAVAILABLE|RESOURCE_EXHAUSTED|high demand|overloaded|TIMEOUT/i.test(msg)) {
+            throw err;
+          }
+        }
+      }
+      if (!response?.text) {
+        throw lastErr || new Error("Gemini returned an empty response");
+      }
       const cleanJson = (response.text || "").trim().replace(/^```json\s*/i, "").replace(/```$/, "").trim();
       let parsedAnalysis: any;
       try {
@@ -307,7 +325,7 @@ Return ONLY valid JSON without markdown wrapping.`;
       if (parsedAnalysis?.riskScore === undefined) {
         return res.status(502).json({ success: false, error: "Gemini analysis was missing required fields." });
       }
-      return res.json({ success: true, source: "gemini-3.8-flash", analysis: parsedAnalysis });
+      return res.json({ success: true, source: usedModel, analysis: parsedAnalysis });
     } catch (err: any) {
       console.error("AI strategy audit error:", err);
       return res.status(500).json({
@@ -401,6 +419,17 @@ Return ONLY valid JSON without markdown wrapping.`;
     } catch (err: any) {
       console.error("Failed to get trade executions from Cloud SQL:", err);
       res.status(500).json({ success: false, error: err.message || "Failed to get trade executions" });
+    }
+  });
+
+  // Ensure unmatched /api/* routes and /api errors always return JSON (never HTML)
+  app.use("/api", (_req, res) => {
+    res.status(404).json({ success: false, error: "API route not found" });
+  });
+  app.use("/api", (err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    console.error("Unhandled API error:", err);
+    if (!res.headersSent) {
+      res.status(err?.status || 500).json({ success: false, error: err?.message || "Internal server error" });
     }
   });
 

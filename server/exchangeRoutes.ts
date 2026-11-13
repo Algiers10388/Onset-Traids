@@ -1,5 +1,5 @@
-import express, { Request, Response } from 'express';
-import { isBotEmergencyFrozen, getBotMaxSingleOrderUsd } from "./fiatRoutes";
+import express, { type Request, type Response } from 'express';
+import { isBotEmergencyFrozen, getBotMaxSingleOrderUsd } from "./fiatRoutes.ts";
 import crypto from 'crypto';
 import {
   fetchLiveTickers,
@@ -8,8 +8,8 @@ import {
   fetchLiveExchangeQuotes,
   getAssetDefinition,
   SUPPORTED_ASSETS,
-} from './liveMarketData';
-import { etherscanService } from './etherscanService';
+} from './liveMarketData.ts';
+import { etherscanService } from './etherscanService.ts';
 
 /**
  * Live USD unit price for an asset symbol (BTC, ETH, SOL, ...), from the live ticker feed.

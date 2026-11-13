@@ -48,7 +48,7 @@ interface AiTroubleshooterModalProps {
 }
 
 type AssistantRole = 'TROUBLESHOOTING' | 'MARKET_UPDATES' | 'SMART_CONTRACT_AUDIT';
-type GeminiModel = 'gemini-3.8-flash' | 'gemini-3.1-flash-lite' | 'gemini-3.1-pro-preview';
+type GeminiModel = 'gemini-4-hydrogen' | 'gemini-3.1-flash-lite';
 
 const QUICK_PROMPTS = [
   {
@@ -93,14 +93,14 @@ export const AiTroubleshooterModal: React.FC<AiTroubleshooterModalProps> = ({
       content:
         "Hello! I am your **Apex AI Copilot & Compiler Diagnostics Assistant**.\n\nI can assist you with:\n- **Termux & Android compilation** (solves `version not found in artifacts for this platform` by using `pkg install -y solidity` and `--use $(which solc)`)\n- **WSL & PowerShell setup** for Foundry and the Rust searcher\n- **Live Crypto Market & News Updates** using real-time Google Search Grounding\n- **Smart Contract & Flash Loan Math Audits**\n\nHow can I help you today?",
       timestamp: Date.now(),
-      modelUsed: 'gemini-3.8-flash',
+      modelUsed: 'gemini-4-hydrogen',
     },
   ]);
 
   const [input, setInput] = useState<string>('');
   const [loading, setLoading] = useState<boolean>(false);
   const [role, setRole] = useState<AssistantRole>('TROUBLESHOOTING');
-  const [model, setModel] = useState<GeminiModel>('gemini-3.8-flash');
+  const [model, setModel] = useState<GeminiModel>('gemini-4-hydrogen');
   const [useSearchGrounding, setUseSearchGrounding] = useState<boolean>(true);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [sessionId, setSessionId] = useState<string>(() => 'chat_' + Date.now());
@@ -165,9 +165,15 @@ export const AiTroubleshooterModal: React.FC<AiTroubleshooterModalProps> = ({
         }),
       });
 
-      const data = await res.json();
+      const rawText = await res.text();
+      let data: any = null;
+      try {
+        data = rawText ? JSON.parse(rawText) : null;
+      } catch {
+        throw new Error(`AI proxy returned non-JSON response (HTTP ${res.status})`);
+      }
 
-      if (data.success && data.reply) {
+      if (res.ok && data?.success && data.reply) {
         const botMsg: Message = {
           id: 'bot_' + Date.now(),
           role: 'model',
@@ -251,7 +257,8 @@ export const AiTroubleshooterModal: React.FC<AiTroubleshooterModalProps> = ({
   const handleLoadSession = (session: SavedChatSession) => {
     setMessages(session.messages);
     setSessionId(session.id);
-    setModel((session.modelUsed as GeminiModel) || 'gemini-3.8-flash');
+    const savedModel = session.modelUsed === 'gemini-3.1-flash-lite' ? 'gemini-3.1-flash-lite' : 'gemini-4-hydrogen';
+    setModel(savedModel);
     setShowSavedList(false);
   };
 
@@ -517,19 +524,16 @@ export const AiTroubleshooterModal: React.FC<AiTroubleshooterModalProps> = ({
                 onChange={(e) => setModel(e.target.value as GeminiModel)}
                 className="bg-transparent text-cyan-300 font-mono text-[11px] font-semibold focus:outline-none cursor-pointer"
               >
-                <option value="gemini-3.8-flash" className="bg-slate-900 text-white">
-                  gemini-3.8-flash (Search Grounded)
+                <option value="gemini-4-hydrogen" className="bg-slate-900 text-white">
+                  gemini-4-hydrogen (Search Grounded)
                 </option>
                 <option value="gemini-3.1-flash-lite" className="bg-slate-900 text-white">
                   gemini-3.1-flash-lite (Fastest)
                 </option>
-                <option value="gemini-3.1-pro-preview" className="bg-slate-900 text-white">
-                  gemini-3.1-pro-preview (Deep Reasoning)
-                </option>
               </select>
             </div>
 
-            {/* Search Grounding Checkbox (Active on 3.8 flash) */}
+            {/* Search Grounding Checkbox (Active on gemini-4-hydrogen) */}
             <label className="flex items-center gap-1.5 cursor-pointer text-[11px] text-slate-300 hover:text-white select-none">
               <input
                 type="checkbox"

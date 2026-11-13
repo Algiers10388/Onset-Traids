@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createAccessGuard, tokenMatches } from './accessGuard.js';
+import { createAccessGuard, tokenMatches } from './accessGuard.ts';
 
 function run(guard: any, o: { url?: string; ip?: string; headers?: Record<string, string> }) {
   let passed = false; let status = 0;

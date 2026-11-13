@@ -110,7 +110,7 @@ export const CHAIN_CONFIG_MAP: Record<'arbitrum' | 'base' | 'optimism', ChainMet
     chainIdHex: '0xa4b1',
     chainIdDec: 42161,
     explorer: 'https://arbiscan.io',
-    contract: '0x19359c6C418669FCfC46196970814353b8766BE0',
+    contract: '0xeee31ff9e69904b43c124095b6f33aa61505bcc2',
     icon: '🔵',
     currency: 'ETH',
     rpcUrl: 'https://arb1.arbitrum.io/rpc',
@@ -170,6 +170,7 @@ interface SimulatedOpp {
   profitGuardReason?: string;
   gasSavingsPercent?: number;
   priceImpactBps?: number;
+  dexFeeBps?: number;
 }
 
 export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
@@ -232,8 +233,7 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
 
   const isValidEvmAddress = (address: string): boolean => {
     if (!address) return false;
-    const trimmed = address.trim();
-    return /^0x[a-fA-F0-9]{40}$/.test(trimmed) || /^[a-zA-Z0-9._-]+\.eth$/.test(trimmed);
+    return /^0x[a-fA-F0-9]{40}$/.test(address.trim());
   };
 
   const formatShortAddress = (addr: string): string => {
@@ -303,8 +303,14 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
 
   // Active FlashArb Contract Address per Chain (Customizable & Deployed by Agent)
   const [deployedContracts, setDeployedContracts] = useState<Record<'arbitrum' | 'base' | 'optimism', string>>(() => {
+    const savedArb = localStorage.getItem('flash_arb_contract_arbitrum');
+    // Upgrade legacy sweep-only default 0x1935...6BE0 to deployed FlashArbOptimized 0xeee3...bcc2
+    const arbContract =
+      savedArb && savedArb.toLowerCase() !== '0x19359c6c418669fcfc46196970814353b8766be0'
+        ? savedArb
+        : CHAIN_CONFIG_MAP.arbitrum.contract;
     return {
-      arbitrum: localStorage.getItem('flash_arb_contract_arbitrum') || CHAIN_CONFIG_MAP.arbitrum.contract,
+      arbitrum: arbContract,
       base: localStorage.getItem('flash_arb_contract_base') || CHAIN_CONFIG_MAP.base.contract,
       optimism: localStorage.getItem('flash_arb_contract_optimism') || CHAIN_CONFIG_MAP.optimism.contract,
     };
@@ -366,6 +372,21 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
     usdtFormatted: string;
     totalUsd: number;
     explorerUrl: string;
+  } | null>(null);
+
+  const [contractOnChainStatus, setContractOnChainStatus] = useState<{
+    eth: string;
+    nonZeroCount: number;
+    supportsOptimizedArbitrage: boolean;
+    supportsRescueTokensTo: boolean;
+    nonZeroTokens: Array<{ symbol: string; balance: string }>;
+  } | null>(null);
+  const [isSweepingAll, setIsSweepingAll] = useState<boolean>(false);
+  const [includeGasWalletTokensInSweep, setIncludeGasWalletTokensInSweep] = useState<boolean>(false);
+  const [sweepAllNotice, setSweepAllNotice] = useState<{
+    success: boolean;
+    message: string;
+    sweptAssets?: Array<{ asset: string; amount: string; method: string; txHash: string; explorerUrl: string }>;
   } | null>(null);
 
   const fetchAgentStatus = async () => {
@@ -466,6 +487,70 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
     } catch {}
   };
 
+  const fetchContractBalances = async () => {
+    try {
+      const targetAddr = deployedContracts[selectedChain] || CHAIN_CONFIG_MAP[selectedChain].contract;
+      const res = await fetch(`/api/flash-arb/contract-balances?chain=${selectedChain}&address=${encodeURIComponent(targetAddr)}`);
+      if (res.ok) {
+        const data = await res.json();
+        if (data.success) {
+          setContractOnChainStatus({
+            eth: data.eth || '0.0',
+            nonZeroCount: data.nonZeroCount || 0,
+            supportsOptimizedArbitrage: Boolean(data.supportsOptimizedArbitrage),
+            supportsRescueTokensTo: Boolean(data.supportsRescueTokensTo),
+            nonZeroTokens: Array.isArray(data.tokens)
+              ? data.tokens.filter((t: any) => t.hasBalance).map((t: any) => ({ symbol: t.symbol, balance: t.balance }))
+              : [],
+          });
+        }
+      }
+    } catch {}
+  };
+
+  const handleSweepAllBalances = async () => {
+    if (!isValidEvmAddress(profitWalletAddress)) {
+      setSweepAllNotice({ success: false, message: 'Configure a valid 42-character EVM Profit Vault address first.' });
+      return;
+    }
+    setIsSweepingAll(true);
+    setSweepAllNotice(null);
+    setLiveExecutionError(null);
+    try {
+      const res = await fetch('/api/flash-arb/sweep-all', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chain: selectedChain,
+          contractAddress: deployedContracts[selectedChain] || CHAIN_CONFIG_MAP[selectedChain].contract,
+          extraContracts:
+            selectedChain === 'arbitrum'
+              ? ['0xeee31ff9e69904b43c124095b6f33aa61505bcc2', '0x19359c6C418669FCfC46196970814353b8766BE0']
+              : [],
+          recipient: profitWalletAddress.trim(),
+          includeGasWalletTokens: includeGasWalletTokensInSweep,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        throw new Error(data.error || 'Sweep All failed');
+      }
+      setSweepAllNotice({
+        success: true,
+        message: data.message || 'Sweep completed cleanly.',
+        sweptAssets: data.sweptAssets || [],
+      });
+      await Promise.all([fetchProfitWalletBalances(), fetchContractBalances(), fetchGasStatus()]);
+    } catch (err: any) {
+      setSweepAllNotice({
+        success: false,
+        message: err.message || 'Sweep All failed',
+      });
+    } finally {
+      setIsSweepingAll(false);
+    }
+  };
+
   const handleToggleAgent = async () => {
     const endpoint = isAgentRunning ? '/api/flash-arb/agent/stop' : '/api/flash-arb/agent/start';
     try {
@@ -477,15 +562,20 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
     } catch {}
   };
 
-  const handleTriggerAgentTrade = async (forceOverride?: boolean | React.MouseEvent) => {
+  const handleTriggerAgentTrade = async (forceOverride?: boolean | React.MouseEvent, opportunityId?: string) => {
     setIsTriggeringAgentTrade(true);
     setLiveExecutionError(null);
+    setLiveExecutionSuccess(null);
     const isForce = typeof forceOverride === 'boolean' ? forceOverride : forceTestExecution;
     try {
       const res = await fetch('/api/flash-arb/agent/trigger', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ forceTestExecution: Boolean(isForce) }),
+        body: JSON.stringify({
+          forceTestExecution: Boolean(isForce),
+          chain: selectedChain,
+          ...(opportunityId ? { opportunityId } : {}),
+        }),
       });
       const data = await res.json();
       if (!res.ok || !data.success) {
@@ -493,20 +583,55 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
           setLiveExecutionError(`🛡️ ${data.error}`);
           return;
         }
+        if (data.simulationFailed) {
+          setLiveExecutionError(`🛡️ ${data.error}`);
+          return;
+        }
         if (data.requiresWallet && data.txPayload) {
           const hash = await sendOkxTransaction(data.txPayload);
           setLastConfirmedTxHash(hash);
-          await fetchProfitWalletBalances();
-          await fetchAgentStatus();
+          await fetch('/api/flash-arb/agent/verify-receipt', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              txHash: hash,
+              chain: selectedChain,
+              pair: data.opportunity?.pair || 'WETH/USDC',
+              buyDex: data.opportunity?.buyDex || 'Uniswap V3',
+              sellDex: data.opportunity?.sellDex || 'Sushiswap V2',
+              recipient: profitWalletAddress,
+            }),
+          }).catch(() => {});
+          await Promise.all([fetchProfitWalletBalances(), fetchContractBalances(), fetchAgentStatus()]);
           return;
         }
         throw new Error(data.error || 'Agent execution failed');
       }
-      if (data.trade?.txHash) {
-        setLastConfirmedTxHash(data.trade.txHash);
+      if (data.txHash || data.trade?.txHash) {
+        const txHash = data.txHash || data.trade.txHash;
+        setLastConfirmedTxHash(txHash);
+        const profitUsd = Number(data.trade?.netProfitUsd ?? data.opportunity?.estNetProfitUsd ?? 0);
+        setLiveExecutionSuccess({
+          txHash,
+          chain: CHAIN_CONFIG_MAP[selectedChain].name,
+          token: data.sweptToken || data.opportunity?.loanToken || 'WETH',
+          profitUsd,
+          recipient: data.recipient || profitWalletAddress,
+          timestamp: new Date().toLocaleTimeString(),
+          blockLatency: 'verified',
+        });
+        setTotalRealizedAlpha((prev) => {
+          const next = Number((prev + Math.max(0, profitUsd)).toFixed(2));
+          localStorage.setItem('flash_arb_realized_alpha', next.toString());
+          return next;
+        });
+        setArbitrageExecutionsCount((prev) => {
+          const next = prev + 1;
+          localStorage.setItem('flash_arb_executions_count', next.toString());
+          return next;
+        });
       }
-      await fetchProfitWalletBalances();
-      await fetchAgentStatus();
+      await Promise.all([fetchProfitWalletBalances(), fetchContractBalances(), fetchAgentStatus()]);
     } catch (err: any) {
       setLiveExecutionError(err.message || 'Agent trade dispatch failed');
     } finally {
@@ -762,12 +887,22 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
     return () => clearInterval(interval);
   }, [availableAssets]);
 
-  // Initial queries
+  // Initial queries + sync wallet config to server runtime
   useEffect(() => {
+    fetch('/api/flash-arb/profit-wallet', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        profitWallet: profitWalletAddress,
+        gasWallet: gasWalletAddress,
+      }),
+    }).catch(() => {});
+
     fetchGasStatus();
     fetchSignerConfig();
     fetchAgentStatus();
     fetchProfitWalletBalances();
+    fetchContractBalances();
     checkContractDeployment('arbitrum');
     checkContractDeployment('base');
     checkContractDeployment('optimism');
@@ -777,13 +912,18 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
       fetchProfitWalletBalances();
     }, 3500);
 
-    // Sync contracts from server registry
+    // Sync contracts from server registry (or push upgraded local contract to server)
     fetch('/api/flash-arb/deployed-contracts')
       .then((res) => res.json())
       .then((data) => {
         if (data.success && data.contracts) {
+          const savedArb = localStorage.getItem('flash_arb_contract_arbitrum');
+          const resolvedArb =
+            savedArb && savedArb.toLowerCase() !== '0x19359c6c418669fcfc46196970814353b8766be0'
+              ? savedArb
+              : data.contracts.arbitrum || CHAIN_CONFIG_MAP.arbitrum.contract;
           setDeployedContracts((prev) => ({
-            arbitrum: localStorage.getItem('flash_arb_contract_arbitrum') || data.contracts.arbitrum || prev.arbitrum,
+            arbitrum: resolvedArb || prev.arbitrum,
             base: localStorage.getItem('flash_arb_contract_base') || data.contracts.base || prev.base,
             optimism: localStorage.getItem('flash_arb_contract_optimism') || data.contracts.optimism || prev.optimism,
           }));
@@ -796,6 +936,15 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
 
   useEffect(() => {
     checkContractDeployment(selectedChain, deployedContracts[selectedChain]);
+    fetchContractBalances();
+    const targetAddr = deployedContracts[selectedChain];
+    if (targetAddr && isValidEvmAddress(targetAddr)) {
+      fetch('/api/flash-arb/deployed-contracts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chain: selectedChain, address: targetAddr }),
+      }).catch(() => {});
+    }
   }, [selectedChain, deployedContracts]);
 
   // Sync from Firestore when user is authenticated
@@ -863,14 +1012,17 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
   const handleSaveProfitWallet = async (addressToSave: string, customLabel?: string) => {
     const trimmed = addressToSave.trim();
     if (!isValidEvmAddress(trimmed)) {
-      setWalletValidationError('Invalid address format. Enter a valid 42-character EVM address (0x...) or .eth ENS name.');
+      setWalletValidationError('Invalid address format. Enter a valid 42-character hex EVM address (0x...). ENS names cannot be ABI-encoded directly.');
       return false;
     }
 
-    const isCake = trimmed.toLowerCase() === defaultProfitWallet.toLowerCase();
+    setWalletValidationError(null);
+    setIsSavingWallet(true);
+
+    const isMetaMaskDefault = trimmed.toLowerCase() === defaultProfitWallet.toLowerCase();
     const isOkx = Boolean(okxConnectedAddress && trimmed.toLowerCase() === okxConnectedAddress.toLowerCase());
     const finalLabel = customLabel?.trim() || (
-      isCake
+      isMetaMaskDefault
         ? 'MetaMask Profit Vault (..cb9)'
         : isOkx
         ? `OKX Web3 Wallet (${trimmed.toLowerCase().endsWith('11') ? '..11' : trimmed.slice(-4)})`
@@ -885,6 +1037,19 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
     setLabelInput(finalLabel);
     localStorage.setItem('flash_arb_profit_wallet', trimmed);
     localStorage.setItem('flash_arb_profit_wallet_label', finalLabel);
+
+    try {
+      await fetch('/api/flash-arb/profit-wallet', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          profitWallet: trimmed,
+          gasWallet: gasWalletAddress,
+        }),
+      });
+    } catch (err) {
+      console.warn('Failed syncing profit wallet to server:', err);
+    }
 
     if (user?.uid) {
       try {
@@ -1062,6 +1227,12 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
       return;
     }
 
+    // If dispatching a scanned live opportunity, route through verified executeOptimizedArbitrage + eth_estimateGas
+    if (customOpp?.id?.startsWith('opp-')) {
+      await handleTriggerAgentTrade(forceTestExecution, customOpp.id);
+      return;
+    }
+
     // Strict Profit Guard: block trade if net profit is negative or below safety threshold
     if (customOpp && !forceTestExecution) {
       if (customOpp.isProfitable === false || customOpp.netProfitUsd < minProfitThresholdUsd) {
@@ -1097,9 +1268,15 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
       // Calibrate minimal gas limit (135k - 148.5k gas)
       const optimalGasLimit = customOpp?.revmGas ? `0x${customOpp.revmGas.toString(16)}` : '0x24410';
 
-      // FlashArbOptimized executeDirectFlashArb(address recipient) live call payload
-      // 100% of realized arbitrage profit transfers atomically on-chain to profitWalletAddress (MetaMask ..cb9 by default, or the vault you set)
-      const cleanRecipient = profitWalletAddress.toLowerCase().replace('0x', '').padStart(64, '0');
+      if (!/^0x[a-fA-F0-9]{40}$/.test(profitWalletAddress.trim())) {
+        setLiveExecutionError('Invalid profit recipient wallet: enter a 42-character hex EVM address (0x...) before broadcasting.');
+        setIsExecutingLiveTrade(false);
+        return;
+      }
+
+      // FlashArbOptimized executeDirectFlashArb(address recipient) sweeps native ETH held on the contract to profitWalletAddress.
+      // Note: full Balancer V2 flash-loan ERC-20 arbitrage & profit sweeping runs via executeOptimizedArbitrage(...) in flash-arb/searcher.
+      const cleanRecipient = profitWalletAddress.trim().toLowerCase().replace('0x', '').padStart(64, '0');
       const txPayload = {
         to: targetContract,
         data: `0x7804d9ac${cleanRecipient}`,
@@ -1461,7 +1638,7 @@ RPC_BASE_WS=wss://base-mainnet.public.blastapi.io
               </span>
               <span className="px-2.5 py-1 rounded-lg bg-indigo-500/20 border border-indigo-400/40 text-indigo-300 font-mono text-xs flex items-center gap-1.5">
                 <Coins className="h-3.5 w-3.5 text-indigo-400" />
-                {ARB_TOKENS.length} TOKENS · 24 DEX POOLS
+                {ARB_TOKENS.length} TOKENS · {agentMonitoredPools.length || 70} DEX POOLS
               </span>
               <span className="px-2.5 py-1 rounded-lg font-mono text-xs font-bold border bg-rose-500/20 border-rose-500/40 text-rose-300 flex items-center gap-1.5">
                 <span className="h-1.5 w-1.5 rounded-full bg-rose-500 animate-ping" />
@@ -1572,7 +1749,22 @@ RPC_BASE_WS=wss://base-mainnet.public.blastapi.io
 
             <button
               type="button"
-              onClick={handleTriggerAgentTrade}
+              onClick={handleSweepAllBalances}
+              disabled={isSweepingAll}
+              className="px-3.5 py-2 rounded-xl bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-400/50 text-emerald-200 font-mono font-bold text-xs shadow-lg transition-all flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+              title="Sweep all ETH and ERC-20 token balances from FlashArb contracts to Profit Vault"
+            >
+              {isSweepingAll ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin text-emerald-300" />
+              ) : (
+                <ArrowUpRight className="h-3.5 w-3.5 text-emerald-300" />
+              )}
+              <span>{isSweepingAll ? 'Sweeping All...' : 'Sweep All to Vault'}</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => handleTriggerAgentTrade()}
               disabled={isTriggeringAgentTrade}
               className="px-4 py-2 rounded-xl bg-gradient-to-r from-cyan-500 to-emerald-500 hover:from-cyan-400 hover:to-emerald-400 text-slate-950 font-mono font-bold text-xs shadow-lg transition-all flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
             >
@@ -1581,10 +1773,62 @@ RPC_BASE_WS=wss://base-mainnet.public.blastapi.io
               ) : (
                 <Zap className="h-4 w-4 text-slate-950" />
               )}
-              <span>{isTriggeringAgentTrade ? 'Dispatching Trade...' : '⚡ Trigger Live On-Chain Trade'}</span>
+              <span>{isTriggeringAgentTrade ? 'Simulating & Executing...' : '⚡ Trigger Live On-Chain Trade'}</span>
             </button>
           </div>
         </div>
+
+        {(liveExecutionError || liveExecutionSuccess || sweepAllNotice) && (
+          <div className="space-y-2">
+            {liveExecutionError && (
+              <div className="p-2.5 rounded-xl bg-rose-950/70 border border-rose-500/50 text-rose-200 text-xs font-mono flex items-center gap-2">
+                <AlertTriangle className="h-4 w-4 text-rose-400 shrink-0" />
+                <span>{liveExecutionError}</span>
+              </div>
+            )}
+            {liveExecutionSuccess && (
+              <div className="p-2.5 rounded-xl bg-emerald-950/70 border border-emerald-500/50 text-emerald-200 text-xs font-mono flex flex-wrap items-center justify-between gap-2">
+                <span className="flex items-center gap-1.5 font-bold">
+                  <CheckCircle2 className="h-4 w-4 text-emerald-400 shrink-0" />
+                  Arbitrage Verified & Swept to {formatShortAddress(liveExecutionSuccess.recipient)} (+${liveExecutionSuccess.profitUsd.toFixed(2)})
+                </span>
+                <a
+                  href={`${targetChainConfig.explorer}/tx/${liveExecutionSuccess.txHash}`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-cyan-300 hover:underline flex items-center gap-1"
+                >
+                  <span>Tx: {formatShortAddress(liveExecutionSuccess.txHash)}</span>
+                  <ExternalLink className="h-3 w-3" />
+                </a>
+              </div>
+            )}
+            {sweepAllNotice && (
+              <div className={`p-2.5 rounded-xl border text-xs font-mono space-y-1.5 ${sweepAllNotice.success ? 'bg-emerald-950/70 border-emerald-500/50 text-emerald-200' : 'bg-rose-950/70 border-rose-500/50 text-rose-200'}`}>
+                <div className="flex items-center gap-2 font-bold">
+                  {sweepAllNotice.success ? <CheckCircle2 className="h-4 w-4 text-emerald-400 shrink-0" /> : <AlertTriangle className="h-4 w-4 text-rose-400 shrink-0" />}
+                  <span>{sweepAllNotice.message}</span>
+                </div>
+                {sweepAllNotice.sweptAssets && sweepAllNotice.sweptAssets.length > 0 && (
+                  <div className="flex flex-wrap gap-2 pl-6">
+                    {sweepAllNotice.sweptAssets.map((s, i) => (
+                      <a
+                        key={`${s.txHash}-${i}`}
+                        href={s.explorerUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="px-2 py-0.5 rounded bg-slate-900 border border-emerald-500/40 text-emerald-300 hover:text-white flex items-center gap-1 text-[11px]"
+                      >
+                        <span>{s.amount} {s.asset} ({s.method})</span>
+                        <ExternalLink className="h-2.5 w-2.5" />
+                      </a>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        )}
 
         {/* Live Arbitrum DEX Pools Grid */}
         <div className="pt-3 border-t border-slate-800/80">
@@ -2125,15 +2369,42 @@ RPC_BASE_WS=wss://base-mainnet.public.blastapi.io
                   </div>
                 </div>
 
-                {/* Non-custodial Routing Guarantee */}
-                <div className="p-2.5 rounded-xl bg-slate-950/80 border border-slate-800 space-y-1 text-xs">
-                  <div className="flex items-center gap-1.5 text-emerald-300 text-[11px] font-bold">
-                    <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400 shrink-0" />
-                    <span>Smart Contract Sweep Guarantee</span>
+                {/* Non-custodial Routing Guarantee + Sweep All Controls */}
+                <div className="p-3 rounded-xl bg-slate-950/80 border border-emerald-500/30 space-y-2 text-xs">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="flex items-center gap-1.5 text-emerald-300 text-[11px] font-bold">
+                      <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400 shrink-0" />
+                      <span>Smart Contract Sweep All (ETH + ERC-20 Tokens)</span>
+                    </div>
+                    <span className="text-[10px] font-mono text-slate-400">
+                      Contract Holding: <strong className={contractOnChainStatus?.nonZeroCount ? 'text-amber-300' : 'text-emerald-400'}>
+                        {contractOnChainStatus ? `${contractOnChainStatus.eth} ETH · ${contractOnChainStatus.nonZeroTokens.length} non-zero ERC-20` : 'Checking...'}
+                      </strong>
+                    </span>
                   </div>
                   <p className="text-[11px] text-slate-400 font-sans leading-relaxed">
-                    Upon loan settlement, the contract automatically executes <code className="text-emerald-300 font-mono">asset.transfer(recipient, netProfit)</code> straight into this wallet. The gas funder only pays network fees and never touches the profit.
+                    Profit from <code className="text-emerald-300 font-mono">executeOptimizedArbitrage</code> transfers atomically to this vault. Use <strong>Sweep All Balances</strong> to rescue any residual native ETH and ERC-20 tokens (WETH, USDC, USDT, ARB, WBTC, DAI, LINK, GMX, wstETH) from deployed contracts into <code className="text-emerald-300 font-mono">{formatShortAddress(profitWalletAddress)}</code>.
                   </p>
+                  <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
+                    <label className="flex items-center gap-1.5 text-[11px] text-slate-300 font-sans cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={includeGasWalletTokensInSweep}
+                        onChange={(e) => setIncludeGasWalletTokensInSweep(e.target.checked)}
+                        className="rounded bg-slate-900 border-slate-700 text-emerald-500 focus:ring-0 cursor-pointer"
+                      />
+                      <span>Also sweep leftover ERC-20s from Gas Wallet (keeps ETH gas)</span>
+                    </label>
+                    <button
+                      type="button"
+                      onClick={handleSweepAllBalances}
+                      disabled={isSweepingAll}
+                      className="px-3 py-1.5 rounded-lg bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-400 hover:to-teal-400 text-slate-950 font-mono font-bold text-[11px] flex items-center gap-1.5 cursor-pointer shadow-md disabled:opacity-50"
+                    >
+                      {isSweepingAll ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <ArrowUpRight className="h-3.5 w-3.5" />}
+                      <span>{isSweepingAll ? 'Sweeping...' : 'Sweep All Balances'}</span>
+                    </button>
+                  </div>
                 </div>
 
                 {/* Quick Presets: MetaMask (..cb9, default) vs OKX Web3 Wallet (..11) */}
@@ -2159,7 +2430,7 @@ RPC_BASE_WS=wss://base-mainnet.public.blastapi.io
                         {profitWalletAddress.toLowerCase() === defaultProfitWallet.toLowerCase() ? (
                           <Check className="h-3.5 w-3.5 stroke-[3] text-slate-950" />
                         ) : (
-                          <span className="text-[10px] text-emerald-400 font-mono">..5d</span>
+                          <span className="text-[10px] text-emerald-400 font-mono">default</span>
                         )}
                       </button>
 
@@ -3471,7 +3742,7 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
                 </thead>
                 <tbody className="divide-y divide-slate-800">
                   {(() => {
-                    const displayOpportunities: SimulatedOpp[] = agentOpportunities.length > 0
+                    const mappedOpportunities: SimulatedOpp[] = agentOpportunities.length > 0
                       ? agentOpportunities.map((opp) => ({
                           id: opp.id,
                           chain: 'Arbitrum' as const,
@@ -3497,8 +3768,15 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
                           profitGuardReason: opp.profitGuardReason,
                           gasSavingsPercent: opp.gasSavingsPercent,
                           priceImpactBps: opp.priceImpactBps,
+                          dexFeeBps: opp.dexFeeBps,
                         }))
                       : opportunities;
+
+                    const displayOpportunities = scanTokenFilter === 'ALL'
+                      ? mappedOpportunities
+                      : mappedOpportunities.filter(
+                          (o) => o.token === scanTokenFilter || o.tokenName.includes(scanTokenFilter)
+                        );
 
                     if (displayOpportunities.length === 0) {
                       return (
@@ -3506,9 +3784,13 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
                           <td colSpan={8} className="py-12 text-center text-slate-400">
                             <div className="flex flex-col items-center justify-center space-y-2">
                               <Activity className="h-6 w-6 text-cyan-400 animate-pulse" />
-                              <span className="font-bold text-white text-xs">Searcher Daemon Active & Listening (0 Fake Injections)</span>
+                              <span className="font-bold text-white text-xs">
+                                {scanTokenFilter === 'ALL'
+                                  ? 'Searcher Daemon Active & Listening (0 Fake Injections)'
+                                  : `No live spreads matched token filter "${scanTokenFilter}"`}
+                              </span>
                               <span className="text-[11px] text-slate-500 max-w-md">
-                                Monitoring Arbitrum, Base, and Optimism DEX pools for real cross-venue discrepancies. Click "Scan Real Pool Spreads" to query live liquidity pools across {ARB_TOKENS.length} tokens and 24 DEX pools.
+                                Monitoring Arbitrum, Base, and Optimism DEX pools for real cross-venue discrepancies. Click "Scan Real Pool Spreads" to query live liquidity pools across {ARB_TOKENS.length} tokens and {agentMonitoredPools.length || 70} DEX pools.
                               </span>
                             </div>
                           </td>
@@ -3535,12 +3817,12 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
                           <div className="text-white font-bold">{opp.loanAmount}</div>
                           <div className="text-[10px] text-emerald-400">{opp.loanProvider}</div>
                           {opp.priceImpactBps !== undefined && (
-                            <div className="text-[9px] text-slate-500">Slippage: ~{opp.priceImpactBps}%</div>
+                            <div className="text-[9px] text-slate-500">Slippage: ~{opp.priceImpactBps} bps</div>
                           )}
                         </td>
                         <td className="py-3 px-3">
                           <div className="text-emerald-400 font-bold">+{opp.spreadBps.toFixed(1)} bps</div>
-                          <div className="text-[9px] text-slate-500">Pool Fee: 35.0 bps</div>
+                          <div className="text-[9px] text-slate-500">Pool Fee: {(opp.dexFeeBps ?? 35).toFixed(1)} bps</div>
                         </td>
                         <td className="py-3 px-3">
                           <div className="flex items-center gap-1 text-slate-300">
@@ -3633,14 +3915,14 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
                 <div className="flex items-center gap-2">
                   <h3 className="text-sm font-bold text-white font-mono uppercase tracking-wider flex items-center gap-2">
                     <Database className="h-4 w-4 text-emerald-400" />
-                    Live Monitored Liquidity Pools ({(agentMonitoredPools.length || 24)} Pools Active)
+                    Live Monitored Liquidity Pools ({agentMonitoredPools.length || 70} Pools Active)
                   </h3>
                   <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
-                    24 Pools Synchronized
+                    {agentMonitoredPools.length || 70} Pools Synchronized
                   </span>
                 </div>
                 <p className="text-xs text-slate-400 font-mono">
-                  Real-time Arbitrum One pool reserves & slot0 prices streamed via batch JSON-RPC every 3.5s across Uniswap V3, Camelot, Sushiswap, PancakeSwap, Curve, and Balancer.
+                  Real-time Arbitrum One pool reserves & slot0 prices streamed via Multicall3 across Uniswap V3, PancakeSwap V3, SushiSwap V3, Sushiswap V2, Camelot V2, and Camelot V3.
                 </p>
               </div>
 
@@ -3673,14 +3955,13 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
                     onChange={(e) => setPoolProtocolFilter(e.target.value)}
                     className="bg-transparent text-cyan-300 font-bold focus:outline-none cursor-pointer"
                   >
-                    <option value="ALL">All Protocols (7 DEXes)</option>
+                    <option value="ALL">All Protocols (6 DEXes)</option>
                     <option value="Uniswap V3">Uniswap V3</option>
-                    <option value="Camelot V3">Camelot V3 (Algebra)</option>
-                    <option value="Sushiswap V2">Sushiswap V2</option>
                     <option value="PancakeSwap V3">PancakeSwap V3</option>
-                    <option value="Curve Finance">Curve Finance</option>
-                    <option value="Balancer V2">Balancer V2 (0% Flash)</option>
-                    <option value="Trader Joe V2.1">Trader Joe V2.1</option>
+                    <option value="SushiSwap V3">SushiSwap V3</option>
+                    <option value="Sushiswap V2">Sushiswap V2</option>
+                    <option value="Camelot V2">Camelot V2</option>
+                    <option value="Camelot V3">Camelot V3 (Algebra)</option>
                   </select>
                 </div>
               </div>

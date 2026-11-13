@@ -10,7 +10,7 @@ use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 const Q96: f64 = 79228162514264337593543950336.0; // 2^96
-const V3_FEE_TIERS: [u32; 4] = [100, 500, 3000, 10_000];
+const V3_FEE_TIERS: [u32; 5] = [100, 500, 2500, 3000, 10_000];
 /// Fee assumed for V2-style pairs (Uniswap V2 / Sushiswap = 0.30%). Camelot's is configurable per pair;
 /// the eth_call simulation is the source of truth, this only drives the pre-filter.
 const V2_FEE_PPM: u32 = 3000;

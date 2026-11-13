@@ -1,9 +1,17 @@
-import express, { Request, Response } from 'express';
+import express, { type Request, type Response } from 'express';
 import { GoogleGenAI } from '@google/genai';
 
 export const walletRouter = express.Router();
 
-const ai = new GoogleGenAI();
+let aiClient: GoogleGenAI | null = null;
+function getGenAI(): GoogleGenAI | null {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) return null;
+  if (!aiClient) {
+    aiClient = new GoogleGenAI({ apiKey });
+  }
+  return aiClient;
+}
 
 const RPC_ENDPOINTS: Record<string, string> = {
   ethereum: 'https://ethereum.publicnode.com',
@@ -564,16 +572,31 @@ walletRouter.post('/receive-address', (req: Request, res: Response) => {
 // AI Wallet Forensic Audit
 walletRouter.post('/ai-audit', async (req: Request, res: Response) => {
   try {
-    const { address, network, totalNetWorthUsd, holdings = [], txCount } = req.body;
+    const ai = getGenAI();
+    if (!ai) {
+      return res.status(503).json({ success: false, error: 'GEMINI_API_KEY is not configured.' });
+    }
 
-    const isPrivacy = ['monero', 'salvium', 'qrl', 'tari', 'wownero'].includes(network);
+    const {
+      address = '',
+      network = 'ethereum',
+      totalNetWorthUsd = 0,
+      holdings = [],
+      txCount = 0,
+    } = req.body || {};
+
+    const cleanNetwork = String(network || 'ethereum').toLowerCase();
+    const isPrivacy = ['monero', 'salvium', 'qrl', 'tari', 'wownero'].includes(cleanNetwork);
+    const holdingsSummary = Array.isArray(holdings) && holdings.length > 0
+      ? holdings.map((h: any) => `${h.symbol} ($${Math.round(Number(h.valueUsd) || 0)})`).join(', ')
+      : 'None detected';
 
     const prompt = `Perform an institutional on-chain forensic and portfolio audit for this wallet:
 Address: ${address}
-Network: ${network.toUpperCase()} ${isPrivacy ? '(Privacy / CryptoNote / Quantum-Resistant / Mimblewimble Stack)' : '(EVM)'}
+Network: ${cleanNetwork.toUpperCase()} ${isPrivacy ? '(Privacy / CryptoNote / Quantum-Resistant / Mimblewimble Stack)' : '(EVM)'}
 Total Net Worth: $${totalNetWorthUsd}
 Lifetime Transactions: ${txCount}
-Top Holdings: ${holdings.map((h: any) => `${h.symbol} ($${Math.round(h.valueUsd)})`).join(', ')}
+Top Holdings: ${holdingsSummary}
 
 Please provide:
 1. Executive Archetype & Threat Model (e.g. Shielded Whale, Quantum-Proof Holder, DeFi Staker)
@@ -582,20 +605,39 @@ Please provide:
 4. Security Best Practices (Subaddress usage, Key Image verification, OTS index safety).
 Be rigorous, quantitative, and concise.`;
 
-    // Real model call only; failures surface as an error (no canned audit text).
-    const response = await callWithTimeout(() =>
-      ai.models.generateContent({
-        model: 'gemini-3.8-flash',
-        contents: prompt,
-        config: {
-          systemInstruction:
-            'You are the Chief Privacy & Forensic Cryptographer for institutional crypto trading desks. Deliver structured, rigorous wallet intelligence on Monero, Salvium, QRL, and Tari ecosystems.',
-        },
-      }),
-      30000
-    );
-    const auditText = response.text || '';
-    if (!auditText) return res.status(502).json({ success: false, error: 'AI returned an empty audit' });
+    const systemInstruction =
+      'You are the Chief Privacy & Forensic Cryptographer for institutional crypto trading desks. Deliver structured, rigorous wallet intelligence on Monero, Salvium, QRL, and Tari ecosystems.';
+
+    let response: any = null;
+    let lastErr: any = null;
+    for (const model of ['gemini-4-hydrogen', 'gemini-3.1-flash-lite']) {
+      try {
+        response = await callWithTimeout(
+          () =>
+            ai.models.generateContent({
+              model,
+              contents: prompt,
+              config: { systemInstruction },
+            }),
+          25000
+        );
+        if (response?.text) break;
+      } catch (err: any) {
+        lastErr = err;
+        const msg = String(err?.message || '');
+        if (!/503|429|UNAVAILABLE|RESOURCE_EXHAUSTED|high demand|overloaded|TIMEOUT/i.test(msg)) {
+          throw err;
+        }
+      }
+    }
+
+    const auditText = response?.text || '';
+    if (!auditText) {
+      return res.status(502).json({
+        success: false,
+        error: lastErr?.message || 'AI returned an empty audit',
+      });
+    }
 
     res.json({ success: true, audit: auditText });
   } catch (error: unknown) {

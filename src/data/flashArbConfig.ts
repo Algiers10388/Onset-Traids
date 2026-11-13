@@ -1644,6 +1644,14 @@ struct Args {
     /// Minimum milliseconds between block polls (public RPCs rate-limit; use your own node to go lower)
     #[arg(long, default_value_t = 2000)]
     scan_ms: u64,
+
+    /// Sweep all accumulated vault ETH and non-ETH token dust across vaults + gas wallet to FLASH_ARB_PROFIT_WALLET, then exit
+    #[arg(long, default_value_t = false)]
+    sweep_only: bool,
+
+    /// Run an automatic dust-sweep check across vaults + gas wallet every N scanned blocks (0 disables periodic sweeps; post-trade sweeps still run)
+    #[arg(long, default_value_t = 30)]
+    sweep_interval_scans: u64,
 }
 
 #[tokio::main]
@@ -1656,7 +1664,11 @@ async fn main() -> eyre::Result<()> {
         .init();
 
     let args = Args::parse();
-    info!("flash-arb searcher starting (LIVE broadcasting only; no paper/dry-run mode)");
+    if args.sweep_only {
+        info!("flash-arb searcher starting in --sweep-only mode (contract vaults + gas wallet non-ETH dust -> FLASH_ARB_PROFIT_WALLET)");
+    } else {
+        info!("flash-arb searcher starting (LIVE broadcasting only; no paper/dry-run mode)");
+    }
 
     let mut tasks = Vec::new();
     for chain in args.chains.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
@@ -1678,14 +1690,26 @@ async fn main() -> eyre::Result<()> {
             eyre::bail!("FLASH_ARB_PROFIT_WALLET is not set or not a valid address (live-only searcher)");
         }
 
+        let risk_manager = RiskManager::new(config.risk.clone());
+        if args.sweep_only {
+            info!("Running --sweep-only for {} (chain id {})", config.chain_name, config.chain_id);
+            tasks.push(tokio::spawn(async move {
+                let executor = TxExecutor::new(config.clone(), risk_manager);
+                if let Err(e) = executor.sweep_all_dust().await {
+                    error!("[{}] sweep-only failed: {:?}", config.chain_name, e);
+                }
+            }));
+            continue;
+        }
+
         info!("Spawning LIVE worker for {} (chain id {})", config.chain_name, config.chain_id);
         let scan_ms = args.scan_ms;
+        let sweep_interval_scans = args.sweep_interval_scans;
         // Risk state lives outside the retry loop so a worker restart can never clear a tripped circuit breaker.
-        let risk_manager = RiskManager::new(config.risk.clone());
         tasks.push(tokio::spawn(async move {
             let mut backoff: u64 = 5;
             loop {
-                match run_chain_worker(config.clone(), scan_ms, risk_manager.clone()).await {
+                match run_chain_worker(config.clone(), scan_ms, sweep_interval_scans, risk_manager.clone()).await {
                     Ok(()) => break,
                     Err(e) => {
                         error!("[{}] worker failed: {:?}. Restarting in {}s", config.chain_name, e, backoff);
@@ -1701,6 +1725,12 @@ async fn main() -> eyre::Result<()> {
         eyre::bail!("no chain workers started (check --chains and --config-dir)");
     }
 
+    if args.sweep_only {
+        futures_util::future::join_all(tasks).await;
+        info!("All --sweep-only tasks finished.");
+        return Ok(());
+    }
+
     tokio::select! {
         _ = signal::ctrl_c() => info!("Ctrl+C received. Exiting."),
         _ = futures_util::future::join_all(tasks) => error!("All chain workers exited."),
@@ -1708,7 +1738,12 @@ async fn main() -> eyre::Result<()> {
     Ok(())
 }
 
-async fn run_chain_worker(config: ChainConfig, scan_ms: u64, risk_manager: RiskManager) -> eyre::Result<()> {
+async fn run_chain_worker(
+    config: ChainConfig,
+    scan_ms: u64,
+    sweep_interval_scans: u64,
+    risk_manager: RiskManager,
+) -> eyre::Result<()> {
     let chain = config.chain_name.clone();
     let monitor = PriceMonitor::new(config.clone())?;
     let route_finder = RouteFinder::new(config.clone());
@@ -1814,6 +1849,14 @@ async fn run_chain_worker(config: ChainConfig, scan_ms: u64, risk_manager: RiskM
             }
         }
 
+        // Sweep any residual ETH / non-ETH ERC-20 dust on startup and every \`sweep_interval_scans\` blocks
+        // (skipped if \`executed\` already ran a post-trade sweep on this block).
+        if !executed && (scans == 1 || (sweep_interval_scans > 0 && scans % sweep_interval_scans == 0)) {
+            if let Err(e) = executor.sweep_all_dust().await {
+                warn!("[{}] periodic dust sweep failed: {:?}", chain, e);
+            }
+        }
+
         if scans % 15 == 0 {
             let loss = *risk_manager.daily_gas_loss_usd.read().await;
             info!(
@@ -1839,7 +1882,7 @@ use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 const Q96: f64 = 79228162514264337593543950336.0; // 2^96
-const V3_FEE_TIERS: [u32; 4] = [100, 500, 3000, 10_000];
+const V3_FEE_TIERS: [u32; 5] = [100, 500, 2500, 3000, 10_000];
 /// Fee assumed for V2-style pairs (Uniswap V2 / Sushiswap = 0.30%). Camelot's is configurable per pair;
 /// the eth_call simulation is the source of truth, this only drives the pre-filter.
 const V2_FEE_PPM: u32 = 3000;
@@ -2598,13 +2641,40 @@ impl RiskManager {
     lang: 'rust',
     path: 'flash-arb/searcher/src/executor.rs',
     code: `use crate::config::{is_zero_address, parse_addr, ChainConfig};
-use crate::evm::encode_execute_call;
+use crate::evm::{
+    call_decode, decode_arbitrage_swaps_executed, decode_erc20_u256, encode_direct_sweep_call,
+    encode_erc20_balance_of_call, encode_erc20_transfer_call, encode_execute_call,
+    encode_rescue_tokens_call, encode_rescue_tokens_to_call, multicall,
+};
 use crate::risk::RiskManager;
 use crate::routes::ArbitrageOpportunity;
 use crate::sim::SimulationResult;
+use ethers::abi::ParamType;
 use ethers::prelude::*;
+use ethers::types::transaction::eip2718::TypedTransaction;
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
+
+/// Always keep at least 0.00005 ETH on the signer/gas wallet so future arbitrages & sweeps can pay L2 gas.
+const SIGNER_MIN_GAS_RESERVE_WEI: u128 = 50_000_000_000_000;
+
+#[derive(Debug, Default, Clone)]
+pub struct SweepReport {
+    pub contract_eth_swept_wei: U256,
+    pub contract_tokens_swept: usize,
+    pub gas_wallet_tokens_swept: usize,
+    pub txs_confirmed: usize,
+    pub skipped_tokens: usize,
+}
+
+#[derive(Debug)]
+#[allow(dead_code)]
+enum SweepTxOutcome {
+    Confirmed(H256),
+    SimulationReverted(String),
+    BroadcastReverted(H256),
+    Skipped(String),
+}
 
 pub struct TxExecutor {
     pub config: ChainConfig,
@@ -2616,7 +2686,327 @@ impl TxExecutor {
         Self { config, risk_manager }
     }
 
-    /// Live only: re-check risk limits, sign with FLASH_ARB_SIGNER_KEY, broadcast, await receipt.
+    fn build_signer_context(
+        &self,
+    ) -> eyre::Result<(Address, Address, Provider<Http>, Arc<SignerMiddleware<Provider<Http>, LocalWallet>>)> {
+        // The profit wallet must be set explicitly and never zero: no hard-coded fallback address.
+        let profit_recipient = std::env::var("FLASH_ARB_PROFIT_WALLET")
+            .ok()
+            .and_then(|s| parse_addr(&s))
+            .filter(|a| *a != Address::zero())
+            .ok_or_else(|| eyre::eyre!("FLASH_ARB_PROFIT_WALLET not set (or zero / invalid address)"))?;
+
+        let key = std::env::var("FLASH_ARB_SIGNER_KEY")
+            .ok()
+            .map(|k| k.trim().to_string())
+            .filter(|k| !k.is_empty())
+            .ok_or_else(|| eyre::eyre!("FLASH_ARB_SIGNER_KEY not set"))?;
+        let wallet: LocalWallet = key.parse::<LocalWallet>()?.with_chain_id(self.config.chain_id);
+        let signer_address = wallet.address();
+
+        let provider = Provider::<Http>::try_from(self.config.rpc_http.as_str())?;
+        let client = Arc::new(SignerMiddleware::new(provider.clone(), wallet));
+        Ok((profit_recipient, signer_address, provider, client))
+    }
+
+    async fn query_token_balances(
+        &self,
+        provider: &Provider<Http>,
+        account: Address,
+        tokens: &[(String, Address)],
+        block: u64,
+    ) -> Vec<(String, Address, U256)> {
+        let mut non_zero = Vec::new();
+        if tokens.is_empty() {
+            return non_zero;
+        }
+        for chunk in tokens.chunks(50) {
+            let calls: Vec<(Address, Vec<u8>)> = chunk
+                .iter()
+                .map(|(_, tok)| (*tok, encode_erc20_balance_of_call(account)))
+                .collect();
+            let results = match multicall(provider, &calls, block).await {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!("[{}] balanceOf multicall failed for {:?}: {}", self.config.chain_name, account, e);
+                    continue;
+                }
+            };
+            for ((sym, tok), res) in chunk.iter().zip(results.into_iter()) {
+                if let Some(bytes) = res {
+                    if let Some(bal) = decode_erc20_u256(&bytes) {
+                        if !bal.is_zero() {
+                            non_zero.push((sym.clone(), *tok, bal));
+                        }
+                    }
+                }
+            }
+        }
+        non_zero
+    }
+
+    /// Pre-flight \`estimate_gas\` + gas-reserve check before signing and broadcasting any sweep transaction.
+    async fn send_verified_sweep_tx(
+        &self,
+        provider: &Provider<Http>,
+        client: &Arc<SignerMiddleware<Provider<Http>, LocalWallet>>,
+        signer_address: Address,
+        to: Address,
+        calldata: Bytes,
+        label: &str,
+    ) -> eyre::Result<SweepTxOutcome> {
+        let est_req = Eip1559TransactionRequest::new()
+            .to(to)
+            .from(signer_address)
+            .data(calldata.clone())
+            .chain_id(self.config.chain_id);
+        let typed: TypedTransaction = est_req.into();
+
+        let est_gas = match provider.estimate_gas(&typed, None).await {
+            Ok(g) => g.low_u64(),
+            Err(e) => return Ok(SweepTxOutcome::SimulationReverted(e.to_string())),
+        };
+        if est_gas > self.config.risk.max_gas_per_tx {
+            return Ok(SweepTxOutcome::Skipped(format!(
+                "estimated gas {} exceeds max_gas_per_tx {}",
+                est_gas, self.config.risk.max_gas_per_tx
+            )));
+        }
+
+        let gas_limit = (est_gas + est_gas / 4).max(21_000);
+        let (max_fee, priority_fee) = provider
+            .estimate_eip1559_fees(None)
+            .await
+            .unwrap_or((U256::from(100_000_000u64), U256::from(10_000_000u64)));
+        let max_fee = max_fee.max(U256::from(1_000_000u64));
+        let priority_fee = priority_fee.min(max_fee);
+
+        let signer_eth = provider.get_balance(signer_address, None).await.unwrap_or_default();
+        let needed = U256::from(gas_limit)
+            .saturating_mul(max_fee)
+            .saturating_add(U256::from(SIGNER_MIN_GAS_RESERVE_WEI));
+        if signer_eth < needed {
+            return Ok(SweepTxOutcome::Skipped(format!(
+                "signer {:?} ETH balance ({} wei) below gas cost + reserve ({} wei)",
+                signer_address, signer_eth, needed
+            )));
+        }
+
+        let tx_req = Eip1559TransactionRequest::new()
+            .to(to)
+            .from(signer_address)
+            .data(calldata)
+            .gas(gas_limit)
+            .max_priority_fee_per_gas(priority_fee)
+            .max_fee_per_gas(max_fee)
+            .chain_id(self.config.chain_id);
+
+        let pending = client.send_transaction(tx_req, None).await?;
+        let tx_hash = pending.tx_hash();
+        info!("[{}] Sweep broadcast ({}): 0x{:x}", self.config.chain_name, label, tx_hash);
+
+        match pending.await? {
+            Some(receipt) => {
+                if receipt.status == Some(U64::from(1u64)) {
+                    info!(
+                        "[{}] Sweep CONFIRMED ({}): 0x{:x} in block {}",
+                        self.config.chain_name,
+                        label,
+                        tx_hash,
+                        receipt.block_number.unwrap_or_default()
+                    );
+                    Ok(SweepTxOutcome::Confirmed(tx_hash))
+                } else {
+                    warn!("[{}] Sweep REVERTED on-chain ({}): 0x{:x}", self.config.chain_name, label, tx_hash);
+                    Ok(SweepTxOutcome::BroadcastReverted(tx_hash))
+                }
+            }
+            None => {
+                warn!("[{}] Sweep tx dropped/timeout ({}): 0x{:x}", self.config.chain_name, label, tx_hash);
+                Ok(SweepTxOutcome::Skipped("transaction dropped / not mined in timeout window".into()))
+            }
+        }
+    }
+
+    /// Sweeps all detected native ETH + non-ETH ERC-20 dust from every configured FlashArb contract vault
+    /// AND all non-ETH ERC-20 token dust sitting in the signer/gas wallet directly to \`FLASH_ARB_PROFIT_WALLET\`.
+    /// Native ETH on the gas wallet is never drained so L2 gas remains funded for future executions.
+    pub async fn sweep_all_dust(&self) -> eyre::Result<SweepReport> {
+        let (profit_recipient, signer_address, provider, client) = self.build_signer_context()?;
+        let mut report = SweepReport::default();
+        let tokens = self.config.all_tokens();
+        let block = provider.get_block_number().await.map(|b| b.as_u64()).unwrap_or(0);
+
+        // Phase 1: Contract Vault(s) — sweep native ETH + all non-ETH ERC-20 token balances.
+        for contract_addr in self.config.sweep_contracts() {
+            if contract_addr == profit_recipient {
+                continue;
+            }
+            let code = provider.get_code(contract_addr, None).await.unwrap_or_default();
+            if code.is_empty() {
+                debug!("[{}] Vault {:?} has no bytecode; skipping sweep", self.config.chain_name, contract_addr);
+                continue;
+            }
+            let owner_ok = match call_decode(&provider, contract_addr, "owner()", &[], &[ParamType::Address]).await {
+                Ok(toks) => toks.into_iter().next().and_then(|t| t.into_address()) == Some(signer_address),
+                Err(_) => false,
+            };
+            if !owner_ok {
+                warn!(
+                    "[{}] Vault {:?} is not owned by signer {:?}; skipping contract sweep",
+                    self.config.chain_name, contract_addr, signer_address
+                );
+                continue;
+            }
+
+            // 1a. Native ETH sitting on vault contract
+            let eth_bal = provider.get_balance(contract_addr, None).await.unwrap_or_default();
+            if !eth_bal.is_zero() {
+                let label = format!("vault {:?} ETH ({} wei) -> {:?}", contract_addr, eth_bal, profit_recipient);
+                match self
+                    .send_verified_sweep_tx(
+                        &provider,
+                        &client,
+                        signer_address,
+                        contract_addr,
+                        encode_direct_sweep_call(profit_recipient),
+                        &label,
+                    )
+                    .await
+                {
+                    Ok(SweepTxOutcome::Confirmed(_)) => {
+                        report.contract_eth_swept_wei = report.contract_eth_swept_wei.saturating_add(eth_bal);
+                        report.txs_confirmed += 1;
+                    }
+                    Ok(other) => warn!("[{}] Vault ETH sweep skipped ({}): {:?}", self.config.chain_name, label, other),
+                    Err(e) => warn!("[{}] Vault ETH sweep error ({}): {:?}", self.config.chain_name, label, e),
+                }
+            }
+
+            // 1b. Non-ETH ERC-20 dust sitting on vault contract
+            let vault_tokens = self.query_token_balances(&provider, contract_addr, &tokens, block).await;
+            for (sym, token_addr, bal) in vault_tokens {
+                let label_direct = format!("rescueTokensTo {} ({}) from {:?} -> {:?}", sym, bal, contract_addr, profit_recipient);
+                match self
+                    .send_verified_sweep_tx(
+                        &provider,
+                        &client,
+                        signer_address,
+                        contract_addr,
+                        encode_rescue_tokens_to_call(token_addr, profit_recipient),
+                        &label_direct,
+                    )
+                    .await
+                {
+                    Ok(SweepTxOutcome::Confirmed(_)) => {
+                        report.contract_tokens_swept += 1;
+                        report.txs_confirmed += 1;
+                    }
+                    Ok(SweepTxOutcome::SimulationReverted(_)) => {
+                        // Legacy deployments only expose \`rescueTokens(address)\` which transfers to \`owner()\` (= signer_address).
+                        // Run it first, then Phase 2 below forwards the balance from signer_address to \`profit_recipient\`.
+                        let label_legacy = format!("rescueTokens {} ({}) from {:?} -> owner {:?}", sym, bal, contract_addr, signer_address);
+                        match self
+                            .send_verified_sweep_tx(
+                                &provider,
+                                &client,
+                                signer_address,
+                                contract_addr,
+                                encode_rescue_tokens_call(token_addr),
+                                &label_legacy,
+                            )
+                            .await
+                        {
+                            Ok(SweepTxOutcome::Confirmed(_)) => {
+                                report.contract_tokens_swept += 1;
+                                report.txs_confirmed += 1;
+                            }
+                            Ok(other) => {
+                                warn!("[{}] Legacy vault token rescue skipped ({}): {:?}", self.config.chain_name, label_legacy, other);
+                                report.skipped_tokens += 1;
+                            }
+                            Err(e) => {
+                                warn!("[{}] Legacy vault token rescue error ({}): {:?}", self.config.chain_name, label_legacy, e);
+                                report.skipped_tokens += 1;
+                            }
+                        }
+                    }
+                    Ok(other) => {
+                        warn!("[{}] Vault token rescue skipped ({}): {:?}", self.config.chain_name, label_direct, other);
+                        report.skipped_tokens += 1;
+                    }
+                    Err(e) => {
+                        warn!("[{}] Vault token rescue error ({}): {:?}", self.config.chain_name, label_direct, e);
+                        report.skipped_tokens += 1;
+                    }
+                }
+            }
+        }
+
+        // Phase 2: Gas Wallet (signer_address) — sweep all non-ETH ERC-20 dust (including anything just rescued via legacy rescueTokens).
+        // Never sweep native ETH out of the gas wallet.
+        if signer_address == profit_recipient {
+            debug!(
+                "[{}] Gas wallet {:?} matches FLASH_ARB_PROFIT_WALLET; skipping Phase 2 token transfer",
+                self.config.chain_name, signer_address
+            );
+        } else {
+            let latest_block = provider.get_block_number().await.map(|b| b.as_u64()).unwrap_or(block);
+            let signer_tokens = self
+                .query_token_balances(&provider, signer_address, &tokens, latest_block)
+                .await;
+            for (sym, token_addr, bal) in signer_tokens {
+                let label = format!("gas-wallet transfer {} ({}) {:?} -> {:?}", sym, bal, signer_address, profit_recipient);
+                match self
+                    .send_verified_sweep_tx(
+                        &provider,
+                        &client,
+                        signer_address,
+                        token_addr,
+                        encode_erc20_transfer_call(profit_recipient, bal),
+                        &label,
+                    )
+                    .await
+                {
+                    Ok(SweepTxOutcome::Confirmed(_)) => {
+                        report.gas_wallet_tokens_swept += 1;
+                        report.txs_confirmed += 1;
+                    }
+                    Ok(other) => {
+                        warn!("[{}] Gas-wallet token sweep skipped ({}): {:?}", self.config.chain_name, label, other);
+                        report.skipped_tokens += 1;
+                    }
+                    Err(e) => {
+                        warn!("[{}] Gas-wallet token sweep error ({}): {:?}", self.config.chain_name, label, e);
+                        report.skipped_tokens += 1;
+                    }
+                }
+            }
+        }
+
+        if report.txs_confirmed > 0 || report.skipped_tokens > 0 {
+            info!(
+                "[{}] Sweep summary: vault_eth={} wei, vault_tokens={}, gas_wallet_tokens={}, confirmed_txs={}, skipped={} -> {:?}",
+                self.config.chain_name,
+                report.contract_eth_swept_wei,
+                report.contract_tokens_swept,
+                report.gas_wallet_tokens_swept,
+                report.txs_confirmed,
+                report.skipped_tokens,
+                profit_recipient
+            );
+        } else {
+            debug!(
+                "[{}] Sweep check complete: zero residual ETH or ERC-20 dust across vaults and gas wallet {:?}",
+                self.config.chain_name, signer_address
+            );
+        }
+
+        Ok(report)
+    }
+
+    /// Live only: re-check risk limits, sign with FLASH_ARB_SIGNER_KEY, broadcast, await receipt,
+    /// and sweep any accumulated non-ETH token dust or residual vault ETH to FLASH_ARB_PROFIT_WALLET.
     /// Refuses to send anything that was not verified by an eth_call simulation against the deployed contract.
     pub async fn execute(&self, opp: &ArbitrageOpportunity, sim: &SimulationResult) -> eyre::Result<()> {
         if !sim.verified || !sim.success {
@@ -2631,22 +3021,7 @@ impl TxExecutor {
             return Ok(());
         }
 
-        // The profit wallet must be set explicitly: no hard-coded fallback address.
-        let profit_recipient = std::env::var("FLASH_ARB_PROFIT_WALLET")
-            .ok()
-            .and_then(|s| parse_addr(&s))
-            .ok_or_else(|| eyre::eyre!("FLASH_ARB_PROFIT_WALLET not set (or not a valid address)"))?;
-
-        let key = std::env::var("FLASH_ARB_SIGNER_KEY")
-            .ok()
-            .map(|k| k.trim().to_string())
-            .filter(|k| !k.is_empty())
-            .ok_or_else(|| eyre::eyre!("FLASH_ARB_SIGNER_KEY not set"))?;
-        let wallet: LocalWallet = key.parse::<LocalWallet>()?.with_chain_id(self.config.chain_id);
-        let signer_address = wallet.address();
-
-        let provider = Provider::<Http>::try_from(self.config.rpc_http.as_str())?;
-        let client = Arc::new(SignerMiddleware::new(provider.clone(), wallet));
+        let (profit_recipient, signer_address, provider, client) = self.build_signer_context()?;
         let contract_address = self.config.flash_arb_contract.parse::<Address>()?;
 
         let (max_fee, _) = provider
@@ -2678,14 +3053,36 @@ impl TxExecutor {
         match pending_tx.await? {
             Some(receipt) => {
                 if receipt.status == Some(U64::from(1u64)) {
-                    info!(
-                        "[{}] FlashArb CONFIRMED in block {} (gas {:?}); modelled net profit \${:.2}",
-                        self.config.chain_name,
-                        receipt.block_number.unwrap_or_default(),
-                        receipt.gas_used.unwrap_or_default(),
-                        opp.net_profit_usd
-                    );
+                    if let Some((token_in, token_out, borrowed, net_profit, swept_to)) =
+                        decode_arbitrage_swaps_executed(&receipt, contract_address)
+                    {
+                        info!(
+                            "[{}] FlashArb CONFIRMED in block {} (gas {:?}) | tokenIn {:?} -> tokenOut {:?} | borrowed {} | on-chain profit {} swept to {:?} (modelled \${:.2})",
+                            self.config.chain_name,
+                            receipt.block_number.unwrap_or_default(),
+                            receipt.gas_used.unwrap_or_default(),
+                            token_in,
+                            token_out,
+                            borrowed,
+                            net_profit,
+                            swept_to,
+                            opp.net_profit_usd
+                        );
+                    } else {
+                        info!(
+                            "[{}] FlashArb CONFIRMED in block {} (gas {:?}); modelled net profit \${:.2}",
+                            self.config.chain_name,
+                            receipt.block_number.unwrap_or_default(),
+                            receipt.gas_used.unwrap_or_default(),
+                            opp.net_profit_usd
+                        );
+                    }
                     self.risk_manager.record_success();
+
+                    // Sweep any residual token dust / ETH across contracts and gas wallet -> FLASH_ARB_PROFIT_WALLET
+                    if let Err(e) = self.sweep_all_dust().await {
+                        warn!("[{}] Post-trade dust sweep failed: {:?}", self.config.chain_name, e);
+                    }
                 } else {
                     let gas_used = receipt.gas_used.unwrap_or_default();
                     let price = receipt.effective_gas_price.unwrap_or(max_fee);
@@ -2727,7 +3124,8 @@ aave_v3_addresses_provider = "0xa97684ead0e402dC232d5A977953DF7ECBaB3CDb"
 aave_flash_fee_bps = 5 # 0.05% fee
 
 # Deployed FlashArb Contract
-flash_arb_contract = "0x0000000000000000000000000000000000000000"
+flash_arb_contract = "0xeee31ff9e69904b43c124095b6f33aa61505bcc2"
+extra_sweep_contracts = ["0x19359c6C418669FCfC46196970814353b8766BE0"]
 
 # DEX Routers & Factories
 [dexes.uniswap_v3]
@@ -2735,24 +3133,41 @@ router = "0xE592427A0AEce92De3Edee1F18E0157C05861564"
 quoter = "0xb27308f9F90D607463bb33eA1BeBb41C27CE5AB6"
 factory = "0x1F98431c8aD98523631AE4a59f267346ea31F984"
 
-[dexes.camelot_v2]
-router = "0xc873fEcbd354f5A56E00E710B90EF4201db2448d"
-factory = "0x6EcCab422D763aC031210895C81787E87B43A652"
+[dexes.pancake_v3]
+router = "0x1b81D678ffb9C0263b24A97847620C99d213eB14"
+factory = "0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865"
+
+[dexes.sushiswap_v3]
+router = "0x8A21F6768C1f8075791D08546Dadf6daA0bE820c"
+factory = "0x1af415a1EbA07a4986a52B6f2e7dE7003D82231e"
 
 [dexes.sushiswap_v2]
 router = "0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506"
 factory = "0xc35DADB65012eC5796536bD9864eD8773aBc74C4"
+
+# Camelot V2 Router uses 6-arg swapExactTokensForTokensSupportingFeeOnTransferTokens(..., referrer, deadline)
+# rather than UniswapV2Router02's 5-arg swapExactTokensForTokens -> skipped by FlashArbOptimized
+[dexes.camelot_v2]
+router = "0xc873fEcbd354f5A56E00E710B90EF4201db2448d"
+factory = "0x6EcCab422D763aC031210895C81787E87B43A652"
 
 [dexes.curve]
 two_pool = "0x7f90122BF0700F9E7e1F688fe926940E8839F353"
 
 # Whitelisted High-Liquidity Tokens (Excludes fee-on-transfer & rebasing)
 [tokens]
-WETH = "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1"
-USDC = "0xaf88d065e77c8cC2239327C5EDb3A432268e5831"
-USDT = "0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9"
-ARB  = "0x912CE59144191C1204E64559FE8253a0e49E6548"
-WBTC = "0x2f2a2543B76A4166549F7aaB2e75Bef0aefC5B0f"
+WETH   = "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1"
+USDC   = "0xaf88d065e77c8cC2239327C5EDb3A432268e5831"
+USDCe  = "0xFF970A61A04b1cA14834A43f5dE4533eBDDB5CC8"
+USDT   = "0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9"
+DAI    = "0xDA10009cBd5D07dd0CeCc66161FC93D7c9000da1"
+ARB    = "0x912CE59144191C1204E64559FE8253a0e49E6548"
+WBTC   = "0x2f2a2543B76A4166549F7aaB2e75Bef0aefC5B0f"
+LINK   = "0xf97f4df75117a78c1A5a0DBb814Af92458539FB4"
+GMX    = "0xfc5A1A6EB076a2C7aD06eD22C90d7E710E35ad0a"
+AAVE   = "0xba5DdD1f9d7F570dc94a51479a000E3BCE967196"
+PENDLE = "0x0c880f6761F1af8d9Aa9C466984b80DAb9a8c9e8"
+UNI    = "0xFa7F8980b0f1E64A2062791cc3b0871572f1F7f0"
 
 # Risk Controls & Circuit Breakers
 [risk]
@@ -3008,6 +3423,78 @@ pub fn encode_execute_call(opp: &ArbitrageOpportunity, recipient: Address) -> By
     Bytes::from(data)
 }
 
+/// Calldata for FlashArbOptimized.executeDirectFlashArb(recipient) (sweeps native ETH from contract)
+pub fn encode_direct_sweep_call(recipient: Address) -> Bytes {
+    let mut data: Vec<u8> = sel("executeDirectFlashArb(address)");
+    data.extend(ethers::abi::encode(&[Token::Address(recipient)]));
+    Bytes::from(data)
+}
+
+/// Calldata for legacy FlashArbOptimized.rescueTokens(token) (sweeps token from contract to owner)
+pub fn encode_rescue_tokens_call(token: Address) -> Bytes {
+    let mut data: Vec<u8> = sel("rescueTokens(address)");
+    data.extend(ethers::abi::encode(&[Token::Address(token)]));
+    Bytes::from(data)
+}
+
+/// Calldata for FlashArbOptimized.rescueTokensTo(token, recipient) (sweeps token directly to profit wallet)
+pub fn encode_rescue_tokens_to_call(token: Address, recipient: Address) -> Bytes {
+    let mut data: Vec<u8> = sel("rescueTokensTo(address,address)");
+    data.extend(ethers::abi::encode(&[Token::Address(token), Token::Address(recipient)]));
+    Bytes::from(data)
+}
+
+/// Calldata for IERC20.balanceOf(account)
+pub fn encode_erc20_balance_of_call(account: Address) -> Vec<u8> {
+    let mut data = sel("balanceOf(address)");
+    data.extend(ethers::abi::encode(&[Token::Address(account)]));
+    data
+}
+
+/// Calldata for IERC20.transfer(recipient, amount)
+pub fn encode_erc20_transfer_call(recipient: Address, amount: U256) -> Bytes {
+    let mut data = sel("transfer(address,uint256)");
+    data.extend(ethers::abi::encode(&[Token::Address(recipient), Token::Uint(amount)]));
+    Bytes::from(data)
+}
+
+/// Decode a single ABI-encoded uint256 return word (e.g. from IERC20.balanceOf).
+pub fn decode_erc20_u256(bytes: &[u8]) -> Option<U256> {
+    if bytes.len() < 32 {
+        return None;
+    }
+    let decoded = ethers::abi::decode(&[ParamType::Uint(256)], bytes).ok()?;
+    decoded.into_iter().next().and_then(|t| t.into_uint())
+}
+
+/// Decode \`ArbitrageSwapsExecuted(address indexed tokenIn, address indexed tokenOut, uint256 amountBorrowed, uint256 netProfitSwept, address indexed recipient)\`.
+pub fn decode_arbitrage_swaps_executed(
+    receipt: &TransactionReceipt,
+    contract: Address,
+) -> Option<(Address, Address, U256, U256, Address)> {
+    let topic0 = H256::from(ethers::utils::keccak256(
+        "ArbitrageSwapsExecuted(address,address,uint256,uint256,address)",
+    ));
+    for log in &receipt.logs {
+        if log.address != contract || log.topics.len() < 4 || log.topics[0] != topic0 {
+            continue;
+        }
+        let Ok(vals) = ethers::abi::decode(&[ParamType::Uint(256), ParamType::Uint(256)], log.data.as_ref()) else {
+            continue;
+        };
+        if vals.len() < 2 {
+            continue;
+        }
+        let borrowed = tok_uint(&vals[0]);
+        let profit = tok_uint(&vals[1]);
+        let token_in = Address::from(log.topics[1]);
+        let token_out = Address::from(log.topics[2]);
+        let recipient = Address::from(log.topics[3]);
+        return Some((token_in, token_out, borrowed, profit, recipient));
+    }
+    None
+}
+
 pub fn sel(sig: &str) -> Vec<u8> {
     ethers::utils::id(sig).to_vec()
 }
@@ -3059,6 +3546,68 @@ pub async fn multicall(
             tup.get(1)?.clone().into_bytes()
         })
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sweep_selectors_and_lengths_match_abi() {
+        let addr: Address = "0x65602EB9e09B07002872E074004400d37e27CCB9".parse().unwrap();
+        let tok: Address = "0xaf88d065e77c8cC2239327C5EDb3A432268e5831".parse().unwrap();
+
+        let direct = encode_direct_sweep_call(addr);
+        assert_eq!(&direct[..4], &[0x78, 0x04, 0xd9, 0xac]);
+        assert_eq!(direct.len(), 36);
+
+        let rescue = encode_rescue_tokens_call(tok);
+        assert_eq!(&rescue[..4], &[0x00, 0xae, 0x3b, 0xf8]);
+        assert_eq!(rescue.len(), 36);
+
+        let rescue_to = encode_rescue_tokens_to_call(tok, addr);
+        assert_eq!(rescue_to.len(), 68);
+
+        let bal = encode_erc20_balance_of_call(addr);
+        assert_eq!(&bal[..4], &[0x70, 0xa0, 0x82, 0x31]);
+        assert_eq!(bal.len(), 36);
+
+        let xfer = encode_erc20_transfer_call(addr, U256::from(12345u64));
+        assert_eq!(&xfer[..4], &[0xa9, 0x05, 0x9c, 0xbb]);
+        assert_eq!(xfer.len(), 68);
+    }
+
+    #[test]
+    fn decodes_erc20_uint256_and_arb_event() {
+        let raw = ethers::abi::encode(&[Token::Uint(U256::from(987654321u64))]);
+        assert_eq!(decode_erc20_u256(&raw), Some(U256::from(987654321u64)));
+        assert_eq!(decode_erc20_u256(&[0u8; 4]), None);
+
+        let contract: Address = "0xeee31ff9e69904b43c124095b6f33aa61505bcc2".parse().unwrap();
+        let token_in: Address = "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1".parse().unwrap();
+        let token_out: Address = "0xaf88d065e77c8cC2239327C5EDb3A432268e5831".parse().unwrap();
+        let recipient: Address = "0x65602EB9e09B07002872E074004400d37e27CCB9".parse().unwrap();
+
+        let topic0 = H256::from(ethers::utils::keccak256(
+            "ArbitrageSwapsExecuted(address,address,uint256,uint256,address)",
+        ));
+        let mut receipt = TransactionReceipt::default();
+        let mut log = Log::default();
+        log.address = contract;
+        log.topics = vec![topic0, token_in.into(), token_out.into(), recipient.into()];
+        log.data = Bytes::from(ethers::abi::encode(&[
+            Token::Uint(U256::from(10_000_000_000u64)),
+            Token::Uint(U256::from(42_000_000u64)),
+        ]));
+        receipt.logs.push(log);
+
+        let decoded = decode_arbitrage_swaps_executed(&receipt, contract).expect("event decoded");
+        assert_eq!(decoded.0, token_in);
+        assert_eq!(decoded.1, token_out);
+        assert_eq!(decoded.2, U256::from(10_000_000_000u64));
+        assert_eq!(decoded.3, U256::from(42_000_000u64));
+        assert_eq!(decoded.4, recipient);
+    }
 }`,
   },
   'config.rs': {
@@ -3066,7 +3615,7 @@ pub async fn multicall(
     path: 'flash-arb/searcher/src/config.rs',
     code: `use ethers::types::Address;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 fn default_balancer_vault() -> String {
@@ -3098,6 +3647,9 @@ pub struct ChainConfig {
     #[serde(default = "default_balancer_vault")]
     pub balancer_vault: String,
     pub flash_arb_contract: String,
+    /// Additional contract vaults to sweep alongside \`flash_arb_contract\` (e.g. previous deployments)
+    #[serde(default)]
+    pub extra_sweep_contracts: Vec<String>,
     pub dexes: HashMap<String, DexConfig>,
     pub tokens: HashMap<String, String>,
     pub risk: RiskConfig,
@@ -3135,8 +3687,8 @@ pub enum DexKind {
 
 pub fn dex_kind(dex_id: &str) -> DexKind {
     match dex_id {
-        "uniswap_v3" => DexKind::V3,
-        "camelot_v2" | "sushiswap_v2" => DexKind::V2,
+        "uniswap_v3" | "pancake_v3" | "sushiswap_v3" => DexKind::V3,
+        "sushiswap_v2" => DexKind::V2,
         _ => DexKind::Unsupported,
     }
 }
@@ -3160,7 +3712,49 @@ impl ChainConfig {
                 config.rpc_http = url.trim().to_string();
             }
         }
+        let contract_var = format!("FLASH_ARB_CONTRACT_{}", config.chain_name.to_uppercase());
+        if let Ok(addr) = std::env::var(&contract_var) {
+            if !addr.trim().is_empty() {
+                config.flash_arb_contract = addr.trim().to_string();
+            }
+        }
         Ok(config)
+    }
+
+    /// All unique non-zero FlashArb contract vaults configured for this chain (primary + extra_sweep_contracts).
+    pub fn sweep_contracts(&self) -> Vec<Address> {
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        for raw in std::iter::once(&self.flash_arb_contract).chain(self.extra_sweep_contracts.iter()) {
+            if let Some(addr) = parse_addr(raw) {
+                if addr != Address::zero() && seen.insert(addr) {
+                    out.push(addr);
+                }
+            }
+        }
+        out
+    }
+
+    /// Every configured ERC-20 token (including excluded tokens, which may still accumulate dust).
+    pub fn all_tokens(&self) -> Vec<(String, Address)> {
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        for (sym, raw) in &self.tokens {
+            if let Some(addr) = parse_addr(raw) {
+                if addr != Address::zero() && seen.insert(addr) {
+                    out.push((sym.clone(), addr));
+                }
+            }
+        }
+        for raw in &self.risk.excluded_tokens {
+            if let Some(addr) = parse_addr(raw) {
+                if addr != Address::zero() && seen.insert(addr) {
+                    out.push((format!("TOKEN_{:?}", addr), addr));
+                }
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
     }
 }`,
   },
