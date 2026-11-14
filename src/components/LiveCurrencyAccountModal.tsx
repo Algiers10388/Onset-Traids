@@ -220,7 +220,7 @@ export const LiveCurrencyAccountModal: React.FC<LiveCurrencyAccountModalProps> =
 
   const downloadReceiptText = (tx: FiatTransaction) => {
     const receiptContent = `========================================================
-APEX QUANT FINANCIAL RAIL - PROOF OF SETTLEMENT
+ONSET-TRAIDS FINANCIAL RAIL - PROOF OF SETTLEMENT
 ========================================================
 Settlement ID:      ${tx.id}
 Cryptographic Hash: ${tx.referenceHash}

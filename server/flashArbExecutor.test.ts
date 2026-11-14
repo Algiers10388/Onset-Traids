@@ -9,6 +9,7 @@ import {
   getChainDexRouters,
   FLASH_ARB_OPTIMIZED_ABI,
   resolveArbitrageCandidates,
+  buildScaledArbitrageCandidates,
   encodeExecuteDirectFlashArb,
   encodeRescueTokens,
   encodeRescueTokensTo,
@@ -19,6 +20,9 @@ import {
   encodeErc721SafeTransferFrom,
   encodeErc1155SafeTransferFrom,
   classifyDetectedErcStandard,
+  DEFAULT_MIN_GAS_RESERVE_WEI,
+  computeTradeGasAndFinancingExtra,
+  computeGasSurplusAllocation,
 } from './flashArbExecutor.ts';
 
 const RECIPIENT = '0x65602EB9e09B07002872E074004400d37e27CCB9';
@@ -136,7 +140,7 @@ test('CHAIN_TOKENS & getChainTokens expose verified multi-chain tokens with comp
   const opTokens = getChainTokens('optimism');
 
   assert.equal(arbTokens.length, 20);
-  assert.equal(baseTokens.length, 7);
+  assert.equal(baseTokens.length, 13);
   assert.equal(opTokens.length, 8);
 
   // Canonical Arbitrum addresses for PENDLE and UNI
@@ -159,11 +163,33 @@ test('CHAIN_TOKENS & getChainTokens expose verified multi-chain tokens with comp
   assert.equal(CHAIN_TOKENS.optimism.wstETH.arbCompatible, false);
   assert.equal(CHAIN_TOKENS.optimism.wstETH.sweepCompatible, true);
 
-  // Core tokens support both arbitrage & sweep
+  // Core & expanded Base tokens support both arbitrage & sweep
   assert.equal(ARBITRUM_TOKENS.WETH.arbCompatible, true);
   assert.equal(ARBITRUM_TOKENS.WETH.sweepCompatible, true);
   assert.equal(CHAIN_TOKENS.base.USDC.arbCompatible, true);
   assert.equal(CHAIN_TOKENS.base.USDC.sweepCompatible, true);
+  assert.equal(CHAIN_TOKENS.base.VIRTUAL.arbCompatible, true);
+  assert.equal(CHAIN_TOKENS.base.DEGEN.arbCompatible, true);
+  assert.equal(CHAIN_TOKENS.base.MORPHO.arbCompatible, true);
+
+  const virtualCandidates = resolveArbitrageCandidates(
+    {
+      chain: 'base',
+      baseToken: CHAIN_TOKENS.base.VIRTUAL,
+      quoteToken: CHAIN_TOKENS.base.WETH,
+      buyDex: 'Uniswap V3',
+      buyFeePercent: 0.3,
+      sellDex: 'Uniswap V2',
+      sellFeePercent: 0.3,
+      optimalLoanBaseUnits: 500,
+      buyPriceQuotePerBase: 0.0005,
+      buyPriceUsd: 1.5,
+      estNetProfitUsd: 12,
+    },
+    RECIPIENT
+  );
+  assert.equal(virtualCandidates.length, 2);
+  assert.ok(virtualCandidates[0].calldata.startsWith('0x23b3aa6b'));
 });
 
 test('parseExtraTokenSpec parses ERC-20 addresses and ERC-721/1155 address:tokenId specs', () => {
@@ -252,7 +278,7 @@ test('CHAIN_DEX_ROUTERS and getChainDexRouters expose verified routers on Arbitr
 
   const opRouters = getChainDexRouters('optimism');
   assert.equal(opRouters['Uniswap V3'].router?.toLowerCase(), '0xe592427a0aece92de3edee1f18e0157c05861564');
-  assert.equal(opRouters['SushiSwap V3'].router?.toLowerCase(), '0xfb7ef66a7e61224dd6fcd0d7d9c3be5c8b049b9f');
+  assert.equal(opRouters['SushiSwap V3'].router?.toLowerCase(), '0x8c32fd078b89eccb06b40289a539d84a4aa9fda6');
   assert.equal(opRouters['Uniswap V2'].router?.toLowerCase(), '0x4a7b5da61326a6379179b40d00f57e5bbdc962c2');
   assert.equal(opRouters['Velodrome Slipstream'].supported, false);
 });
@@ -303,7 +329,7 @@ test('resolveArbitrageCandidates encodes Base & Optimism routes and excludes Sli
   assert.equal(opCandidates.length, 2);
   const decodedOpQuote = iface.decodeFunctionData('executeOptimizedArbitrage', opCandidates[1].calldata);
   assert.equal(decodedOpQuote.routerA.toLowerCase(), '0xe592427a0aece92de3edee1f18e0157c05861564');
-  assert.equal(decodedOpQuote.routerB.toLowerCase(), '0xfb7ef66a7e61224dd6fcd0d7d9c3be5c8b049b9f');
+  assert.equal(decodedOpQuote.routerB.toLowerCase(), '0x8c32fd078b89eccb06b40289a539d84a4aa9fda6');
   assert.equal(Number(decodedOpQuote.routeType), 3); // V3 -> V3
 
   // Monitor-only Slipstream DEXes must be excluded from automated execution
@@ -343,5 +369,135 @@ test('resolveArbitrageCandidates encodes Base & Optimism routes and excludes Sli
   );
   assert.equal(veloExcluded.length, 0);
 });
+
+test('computeTradeGasAndFinancingExtra computes Cancun gas savings and 0% Balancer fee savings', () => {
+  const extra = computeTradeGasAndFinancingExtra({
+    gasUsed: 148000n,
+    effectiveGasPriceWei: 100000000n, // 0.1 gwei
+    ethPriceUsd: 3000,
+    loanNotionalUsd: 25000,
+    loanFeePercent: 0,
+  });
+
+  // (350,000 - 148,000) * 0.1 gwei = 202,000 * 1e8 wei = 0.0000202 ETH
+  assert.equal(extra.gasSavedWei, 202000n * 100000000n);
+  assert.ok(Math.abs(extra.gasSavedEth - 0.0000202) < 1e-10);
+  assert.ok(Math.abs(extra.gasSavedUsd - 0.0606) < 1e-6);
+  // 0.05% of $25,000 = $12.50
+  assert.equal(extra.loanFeeSavedUsd, 12.5);
+  assert.equal(extra.totalExtraUsd, Number((extra.gasSavedUsd + 12.5).toFixed(4)));
+
+  // Edge case: missing gas price or gasUsed >= baseline returns 0 gas savings
+  const zeroGas = computeTradeGasAndFinancingExtra({
+    gasUsed: 400000n,
+    effectiveGasPriceWei: null,
+    ethPriceUsd: 3000,
+    loanNotionalUsd: 10000,
+  });
+  assert.equal(zeroGas.gasSavedWei, 0n);
+  assert.equal(zeroGas.gasSavedUsd, 0);
+  assert.equal(zeroGas.loanFeeSavedUsd, 5);
+});
+
+test('computeGasSurplusAllocation protects 0.002 ETH reserve, caps by maxSendWei, and skips dust', () => {
+  const gasPriceWei = 100000000n; // 0.1 gwei
+
+  // Sufficient balance above 0.002 ETH reserve (0.01 ETH total)
+  const fullSurplus = computeGasSurplusAllocation({
+    balanceWei: ethers.parseEther('0.01'),
+    transferGasUnits: 21000n,
+    gasPriceWei,
+  });
+  assert.equal(fullSurplus.worthSending, true);
+  assert.equal(fullSurplus.gasLimit, (21000n * 125n) / 100n); // 26250n
+  assert.equal(fullSurplus.txFeeWei, (26250n * gasPriceWei * 120n) / 100n);
+  assert.equal(
+    fullSurplus.maxSendableWei,
+    ethers.parseEther('0.01') - DEFAULT_MIN_GAS_RESERVE_WEI - fullSurplus.txFeeWei
+  );
+  assert.equal(fullSurplus.sendWei, fullSurplus.maxSendableWei);
+  assert.equal(fullSurplus.remainingReserveWei, DEFAULT_MIN_GAS_RESERVE_WEI);
+
+  // Respects maxSendWei cap when surplus is larger than single-trade gas savings
+  const capped = computeGasSurplusAllocation({
+    balanceWei: ethers.parseEther('0.01'),
+    transferGasUnits: 21000n,
+    gasPriceWei,
+    maxSendWei: ethers.parseEther('0.001'),
+  });
+  assert.equal(capped.worthSending, true);
+  assert.equal(capped.sendWei, ethers.parseEther('0.001'));
+  assert.ok(capped.remainingReserveWei > DEFAULT_MIN_GAS_RESERVE_WEI);
+
+  // Rejects sub-2x-fee dust above reserve
+  const dust = computeGasSurplusAllocation({
+    balanceWei: DEFAULT_MIN_GAS_RESERVE_WEI + fullSurplus.txFeeWei * 2n,
+    transferGasUnits: 21000n,
+    gasPriceWei,
+  });
+  assert.equal(dust.worthSending, false);
+  assert.equal(dust.sendWei, 0n);
+
+  // Rejects balances at or below reserve
+  const belowReserve = computeGasSurplusAllocation({
+    balanceWei: ethers.parseEther('0.0015'),
+    transferGasUnits: 21000n,
+    gasPriceWei,
+  });
+  assert.equal(belowReserve.worthSending, false);
+  assert.equal(belowReserve.maxSendableWei, 0n);
+  assert.equal(belowReserve.sendWei, 0n);
+});
+
+test('buildScaledArbitrageCandidates caps by Balancer Vault liquidity and generates V3 progressive clips', () => {
+  const input = {
+    chain: 'base' as const,
+    baseToken: CHAIN_TOKENS.base.cbETH,
+    quoteToken: CHAIN_TOKENS.base.WETH,
+    buyDex: 'Uniswap V3',
+    buyFeePercent: 0.05,
+    sellDex: 'PancakeSwap V3',
+    sellFeePercent: 0.01,
+    optimalLoanBaseUnits: 10,
+    buyPriceQuotePerBase: 1.1,
+    buyPriceUsd: 2400,
+    estNetProfitUsd: 16,
+  };
+
+  // Vault has 0 cbETH and 20 WETH -> should skip cbETH entirely and prioritize WETH clips [100%, 50%, 25%, 10%]
+  const cands = buildScaledArbitrageCandidates(
+    input,
+    RECIPIENT,
+    {
+      [CHAIN_TOKENS.base.cbETH.addr.toLowerCase()]: 0n,
+      [CHAIN_TOKENS.base.WETH.addr.toLowerCase()]: ethers.parseEther('20'),
+    },
+    [1, 0.5, 0.25, 0.1]
+  );
+
+  assert.equal(cands.length, 4);
+  assert.ok(cands.every((c) => c.borrowedToken.sym === 'WETH'));
+  assert.equal(cands[0].amountUnits, ethers.parseEther('11'));
+  assert.equal(cands[1].amountUnits, ethers.parseEther('5.5'));
+  assert.equal(cands[2].amountUnits, ethers.parseEther('2.75'));
+  assert.equal(cands[3].amountUnits, ethers.parseEther('1.1'));
+  assert.ok(cands.every((c) => c.minProfitUnits >= 1n));
+
+  // If WETH vault holds only 4 WETH (85% safe cap = 3.4 WETH), 100% and 50% clips cap cleanly at 3.4 WETH deduplicated
+  const capped = buildScaledArbitrageCandidates(
+    input,
+    RECIPIENT,
+    {
+      [CHAIN_TOKENS.base.cbETH.addr.toLowerCase()]: 0n,
+      [CHAIN_TOKENS.base.WETH.addr.toLowerCase()]: ethers.parseEther('4'),
+    },
+    [1, 0.5, 0.25, 0.1]
+  );
+  assert.equal(capped.length, 3);
+  assert.equal(capped[0].amountUnits, ethers.parseEther('3.4'));
+  assert.equal(capped[1].amountUnits, ethers.parseEther('2.75'));
+  assert.equal(capped[2].amountUnits, ethers.parseEther('1.1'));
+});
+
 
 

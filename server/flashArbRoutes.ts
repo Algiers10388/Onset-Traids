@@ -1,6 +1,7 @@
 import { Router, type Request, type Response } from 'express';
 import { ethers } from 'ethers';
 import { sizeArbitrage, MAX_DEPTH_FRACTION } from './arbSizing.ts';
+import { fetchLiveTickers } from './liveMarketData.ts';
 import {
   ARBITRUM_TOKENS,
   CHAIN_TOKENS,
@@ -9,6 +10,7 @@ import {
   CHAIN_DEX_ROUTERS,
   getChainDexRouters,
   resolveArbitrageCandidates,
+  buildScaledArbitrageCandidates,
   encodeExecuteDirectFlashArb,
   encodeRescueTokens,
   encodeRescueTokensTo,
@@ -20,6 +22,9 @@ import {
   ERC165_INTERFACE_IDS,
   decodeArbitrageSwapsExecutedLogs,
   decodeFlashArbRevertError,
+  DEFAULT_MIN_GAS_RESERVE_WEI,
+  computeTradeGasAndFinancingExtra,
+  computeGasSurplusAllocation,
   type ArbitrumTokenInfo,
   type ErcStandard,
   type ExtraTokenSpec,
@@ -267,6 +272,129 @@ async function waitForReceiptWithFailover(
 }
 
 /**
+ * Forwards excess native ETH above `minReserveWei` (default 0.002 ETH) from the Gas Signer Wallet
+ * directly to `recipient` (FLASH_ARB_PROFIT_WALLET). Never drains below operational gas reserve
+ * and skips dust amounts smaller than 2x the estimated L2 transfer fee.
+ */
+async function sweepGasWalletEthSurplus(params: {
+  chain: 'arbitrum' | 'base' | 'optimism';
+  cleanKey: string;
+  signerAddress: string;
+  recipient: string;
+  minReserveWei?: bigint;
+  maxSendWei?: bigint;
+}): Promise<{
+  swept: boolean;
+  sentWei: bigint;
+  sentEthFormatted: string;
+  txHash?: string;
+  explorerUrl?: string;
+  reason?: string;
+}> {
+  const { chain, cleanKey, signerAddress, recipient } = params;
+  const rpcInfo = RPC_ENDPOINTS[chain] || RPC_ENDPOINTS.arbitrum;
+  const minReserveWei = params.minReserveWei ?? DEFAULT_MIN_GAS_RESERVE_WEI;
+
+  if (signerAddress.toLowerCase() === recipient.toLowerCase()) {
+    return {
+      swept: false,
+      sentWei: 0n,
+      sentEthFormatted: '0',
+      reason: 'Gas wallet matches Profit Vault recipient; no ETH transfer needed.',
+    };
+  }
+
+  const [balResp, gasPriceResp, estGasResp] = await Promise.all([
+    fetchRpcSingleWithFailover(chain, 'eth_getBalance', [signerAddress, 'latest'], true),
+    fetchRpcSingleWithFailover(chain, 'eth_gasPrice', [], true),
+    fetchRpcSingleWithFailover(
+      chain,
+      'eth_estimateGas',
+      [{ from: signerAddress, to: recipient, value: '0x1' }, 'latest'],
+      true
+    ).catch(() => ({ result: '0x61a8' })), // 25,000 gas fallback for L2 native ETH transfers
+  ]);
+
+  const balanceWei = typeof balResp.result === 'string' ? BigInt(balResp.result) : 0n;
+  const gasPriceWei = typeof gasPriceResp.result === 'string' ? BigInt(gasPriceResp.result) : 0n;
+  const transferGasUnits =
+    typeof estGasResp.result === 'string' && estGasResp.result.startsWith('0x')
+      ? BigInt(estGasResp.result)
+      : 25000n;
+
+  const alloc = computeGasSurplusAllocation({
+    balanceWei,
+    minReserveWei,
+    transferGasUnits,
+    gasPriceWei,
+    maxSendWei: params.maxSendWei,
+  });
+
+  if (!alloc.worthSending || alloc.sendWei <= 0n) {
+    const reserveEth = Number(ethers.formatEther(minReserveWei)).toFixed(4);
+    const balEth = Number(ethers.formatEther(balanceWei)).toFixed(6);
+    return {
+      swept: false,
+      sentWei: 0n,
+      sentEthFormatted: '0',
+      reason:
+        alloc.maxSendableWei <= 0n
+          ? `Gas wallet balance (${balEth} ETH) is within ${reserveEth} ETH operational reserve.`
+          : `Surplus above ${reserveEth} ETH reserve is smaller than 2x L2 transfer gas fee; skipped to avoid wasting gas.`,
+    };
+  }
+
+  let sentTxHash = '';
+  let lastErr: any = null;
+  for (const rpcUrl of getRpcPool(chain, true)) {
+    try {
+      const provider = new ethers.JsonRpcProvider(rpcUrl);
+      const wallet = new ethers.Wallet(cleanKey, provider);
+      const tx = await wallet.sendTransaction({
+        to: recipient,
+        value: alloc.sendWei,
+        gasLimit: alloc.gasLimit,
+      });
+      sentTxHash = tx.hash;
+      break;
+    } catch (err: any) {
+      lastErr = err;
+      const msg = String(err?.message || '');
+      if (!/429|403|timeout|fetch|coalesce|archive|network|ECONN|socket/i.test(msg)) {
+        break;
+      }
+    }
+  }
+
+  if (!sentTxHash) {
+    return {
+      swept: false,
+      sentWei: 0n,
+      sentEthFormatted: '0',
+      reason: lastErr?.message || 'Failed to broadcast gas surplus transfer.',
+    };
+  }
+
+  const receipt = await waitForReceiptWithFailover(chain, sentTxHash, 45000);
+  if (receipt.status !== 1) {
+    return {
+      swept: false,
+      sentWei: 0n,
+      sentEthFormatted: '0',
+      reason: `Gas surplus transfer ${sentTxHash} reverted on-chain.`,
+    };
+  }
+
+  return {
+    swept: true,
+    sentWei: alloc.sendWei,
+    sentEthFormatted: Number(ethers.formatEther(alloc.sendWei)).toFixed(6),
+    txHash: sentTxHash,
+    explorerUrl: `${rpcInfo.explorer}/tx/${sentTxHash}`,
+  };
+}
+
+/**
  * Fetch raw on-chain balance and gas price via JSON-RPC with multi-endpoint failover
  */
 async function queryChainGas(chain: 'arbitrum' | 'base' | 'optimism', address: string) {
@@ -379,14 +507,16 @@ flashArbRouter.get('/gas-status', async (req: Request, res: Response) => {
       return res.status(400).json({ success: false, error: 'No valid address: pass ?address= or set FLASH_ARB_GAS_WALLET.' });
     }
 
-    // Approximate ETH USD price for USD balance computation
-    const ethUsdPrice = 2850;
-
-    const [arbStatus, baseStatus, opStatus] = await Promise.all([
+    const [liveFeed, arbStatus, baseStatus, opStatus] = await Promise.all([
+      getLiveTokenPriceFeed().catch(() => null),
       queryChainGas('arbitrum', address),
       queryChainGas('base', address),
       queryChainGas('optimism', address),
     ]);
+    const ethUsdPrice =
+      liveFeed?.ethUsd ||
+      getLiveTokenUsdPrice('WETH', 'arbitrum') ||
+      0;
 
     const isSignerConfigured = Boolean(process.env.FLASH_ARB_SIGNER_KEY);
 
@@ -395,23 +525,24 @@ flashArbRouter.get('/gas-status', async (req: Request, res: Response) => {
       gasWallet: address,
       profitWallet: profitWalletEnv(),
       isSignerConfigured,
+      ethUsdPrice: ethUsdPrice > 0 ? ethUsdPrice : null,
       chains: {
         arbitrum: {
           ...RPC_ENDPOINTS.arbitrum,
           ...arbStatus,
-          balanceUsd: Number(((arbStatus.balanceEth ?? 0) * ethUsdPrice).toFixed(2)),
+          balanceUsd: ethUsdPrice > 0 ? Number(((arbStatus.balanceEth ?? 0) * ethUsdPrice).toFixed(2)) : 0,
           fundedForTrading: (arbStatus.balanceEth ?? 0) >= 0.002,
         },
         base: {
           ...RPC_ENDPOINTS.base,
           ...baseStatus,
-          balanceUsd: Number(((baseStatus.balanceEth ?? 0) * ethUsdPrice).toFixed(2)),
+          balanceUsd: ethUsdPrice > 0 ? Number(((baseStatus.balanceEth ?? 0) * ethUsdPrice).toFixed(2)) : 0,
           fundedForTrading: (baseStatus.balanceEth ?? 0) >= 0.002,
         },
         optimism: {
           ...RPC_ENDPOINTS.optimism,
           ...opStatus,
-          balanceUsd: Number(((opStatus.balanceEth ?? 0) * ethUsdPrice).toFixed(2)),
+          balanceUsd: ethUsdPrice > 0 ? Number(((opStatus.balanceEth ?? 0) * ethUsdPrice).toFixed(2)) : 0,
           fundedForTrading: (opStatus.balanceEth ?? 0) >= 0.002,
         },
       },
@@ -768,7 +899,7 @@ flashArbRouter.get('/deploy-payload', async (req: Request, res: Response) => {
 // In-memory registry of active FlashArb contract addresses per chain
 const DEPLOYED_CONTRACTS: Record<string, string> = {
   arbitrum: '0xeee31ff9e69904b43c124095b6f33aa61505bcc2',
-  base: '0x29B35c83955146Ba8fd754B4b96956D245A5661e',
+  base: '0x37440674a814f24d9C6ea0990b272215D40c4512',
   optimism: '0x738C8Eb31316B23d9b8A68B0c2658B456c932598',
 };
 
@@ -983,6 +1114,10 @@ export interface ExecutedAgentTrade {
   grossSpreadUsd: number | null;
   netProfitUsd: number | null;
   gasCostEth: number | null;
+  gasSavedUsd?: number;
+  loanFeeSavedUsd?: number;
+  gasSavedEthSwept?: string | null;
+  gasSweepTxHash?: string | null;
   status: 'CONFIRMED' | 'REVERTED' | 'PENDING';
   explorerUrl: string;
   profitRecipient: string;
@@ -1012,10 +1147,16 @@ const BASE_T = {
   WETH: { sym: 'WETH', addr: '0x4200000000000000000000000000000000000006', dec: 18 },
   USDC: { sym: 'USDC', addr: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913', dec: 6 },
   USDbC: { sym: 'USDbC', addr: '0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA', dec: 6 },
+  USDT: { sym: 'USDT', addr: '0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2', dec: 6 },
   cbETH: { sym: 'cbETH', addr: '0x2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22', dec: 18 },
+  wstETH: { sym: 'wstETH', addr: '0xc1CBa3fCea344f92D9239c08C0568f6F2F0ee452', dec: 18 },
+  ezETH: { sym: 'ezETH', addr: '0x2416092f143378750bb29b79eD961ab195CcEea5', dec: 18 },
   AERO: { sym: 'AERO', addr: '0x940181a94A35A4569E4529A3CDfB74e38FD98631', dec: 18 },
   DAI: { sym: 'DAI', addr: '0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb', dec: 18 },
   cbBTC: { sym: 'cbBTC', addr: '0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf', dec: 8 },
+  DEGEN: { sym: 'DEGEN', addr: '0x4ed4E862860beD51a9570b96d89aF5E1B0Efefed', dec: 18 },
+  VIRTUAL: { sym: 'VIRTUAL', addr: '0x0b3e328455c4059EEb9e3f84b5543F74E24e7E1b', dec: 18 },
+  MORPHO: { sym: 'MORPHO', addr: '0xBAa5CC21fd487B8Fcc2F632f3F4E8D37262a0842', dec: 18 },
 } satisfies Record<string, Tok>;
 
 const OP_T = {
@@ -1135,60 +1276,132 @@ const POOL_SPECS: PoolSpec[] = [
   { id: 'camelot_v3_wsteth_weth', name: 'Camelot V3 wstETH/WETH', dex: 'Camelot V3', pair: 'wstETH/WETH', address: '0xdEb89DE4bb6ecf5BFeD581EB049308b52d9b2Da7', fee: 0.01, kind: 'algebra', base: T.wstETH, quote: T.WETH },
 ];
 
-// ---- Monitored Base L2 pools (verified on-chain via factory getPool / getPair with >= $5K depth) ----
+// ---- Monitored Base L2 pools (95 verified on-chain pools across 6 DEXes with >= $5K depth) ----
 const BASE_POOL_SPECS: PoolSpec[] = [
-  // WETH / USDC (10 pools across 6 DEXes)
+  // WETH / USDC (15 pools across 6 DEXes)
   { id: 'base_univ3_weth_usdc_005', name: 'Uniswap V3 WETH/USDC (0.05%)', dex: 'Uniswap V3', pair: 'WETH/USDC', address: '0xd0b53D9277642d899DF5C87A3966A349A798F224', fee: 0.05, kind: 'v3', base: BASE_T.WETH, quote: BASE_T.USDC },
   { id: 'base_univ3_weth_usdc_001', name: 'Uniswap V3 WETH/USDC (0.01%)', dex: 'Uniswap V3', pair: 'WETH/USDC', address: '0xb4CB800910B228ED3d0834cF79D697127BBB00e5', fee: 0.01, kind: 'v3', base: BASE_T.WETH, quote: BASE_T.USDC },
   { id: 'base_univ3_weth_usdc_030', name: 'Uniswap V3 WETH/USDC (0.30%)', dex: 'Uniswap V3', pair: 'WETH/USDC', address: '0x6c561B446416E1A00E8E93E221854d6eA4171372', fee: 0.30, kind: 'v3', base: BASE_T.WETH, quote: BASE_T.USDC },
+  { id: 'base_univ3_weth_usdc_100', name: 'Uniswap V3 WETH/USDC (1.00%)', dex: 'Uniswap V3', pair: 'WETH/USDC', address: '0x0b1C2DCbBfA744ebD3fC17fF1A96A1E1Eb4B2d69', fee: 1.00, kind: 'v3', base: BASE_T.WETH, quote: BASE_T.USDC },
   { id: 'base_pancake_v3_weth_usdc_001', name: 'PancakeSwap V3 WETH/USDC (0.01%)', dex: 'PancakeSwap V3', pair: 'WETH/USDC', address: '0x72AB388E2E2F6FaceF59E3C3FA2C4E29011c2D38', fee: 0.01, kind: 'v3', base: BASE_T.WETH, quote: BASE_T.USDC },
   { id: 'base_pancake_v3_weth_usdc_005', name: 'PancakeSwap V3 WETH/USDC (0.05%)', dex: 'PancakeSwap V3', pair: 'WETH/USDC', address: '0xB775272E537cc670C65DC852908aD47015244EaF', fee: 0.05, kind: 'v3', base: BASE_T.WETH, quote: BASE_T.USDC },
+  { id: 'base_pancake_v3_weth_usdc_025', name: 'PancakeSwap V3 WETH/USDC (0.25%)', dex: 'PancakeSwap V3', pair: 'WETH/USDC', address: '0xE9d76696f8A35e2E2520e3125875C3af23f1E69c', fee: 0.25, kind: 'v3', base: BASE_T.WETH, quote: BASE_T.USDC },
   { id: 'base_sushiv3_weth_usdc_005', name: 'SushiSwap V3 WETH/USDC (0.05%)', dex: 'SushiSwap V3', pair: 'WETH/USDC', address: '0x57713F7716e0b0F65ec116912F834E49805480d2', fee: 0.05, kind: 'v3', base: BASE_T.WETH, quote: BASE_T.USDC },
+  { id: 'base_sushiv3_weth_usdc_030', name: 'SushiSwap V3 WETH/USDC (0.30%)', dex: 'SushiSwap V3', pair: 'WETH/USDC', address: '0x41595326AaBe6132FC6C7aE71Af087A3A9DBC9F6', fee: 0.30, kind: 'v3', base: BASE_T.WETH, quote: BASE_T.USDC },
+  { id: 'base_sushiv3_weth_usdc_001', name: 'SushiSwap V3 WETH/USDC (0.01%)', dex: 'SushiSwap V3', pair: 'WETH/USDC', address: '0x482Fe995c4a52bc79271aB29A53591363Ee30a89', fee: 0.01, kind: 'v3', base: BASE_T.WETH, quote: BASE_T.USDC },
   { id: 'base_univ2_weth_usdc', name: 'Uniswap V2 WETH/USDC (0.30%)', dex: 'Uniswap V2', pair: 'WETH/USDC', address: '0x88A43bbDF9D098eEC7bCEda4e2494615dfD9bB9C', fee: 0.30, kind: 'v2', base: BASE_T.WETH, quote: BASE_T.USDC },
   { id: 'base_baseswap_weth_usdc', name: 'BaseSwap V2 WETH/USDC (0.30%)', dex: 'BaseSwap V2', pair: 'WETH/USDC', address: '0xab067c01C7F5734da168C699Ae9d23a4512c9FdB', fee: 0.30, kind: 'v2', base: BASE_T.WETH, quote: BASE_T.USDC },
   { id: 'base_aero_slip_weth_usdc_ts1', name: 'Aerodrome Slipstream WETH/USDC (CL-1)', dex: 'Aerodrome Slipstream', pair: 'WETH/USDC', address: '0xdbc6998296caA1652A810dc8D3BaF4A8294330f1', fee: 0.01, kind: 'slipstream', base: BASE_T.WETH, quote: BASE_T.USDC },
   { id: 'base_aero_slip_weth_usdc_ts100', name: 'Aerodrome Slipstream WETH/USDC (CL-100)', dex: 'Aerodrome Slipstream', pair: 'WETH/USDC', address: '0xb2cc224c1c9feE385f8ad6a55b4d94E92359DC59', fee: 0.014, kind: 'slipstream', base: BASE_T.WETH, quote: BASE_T.USDC },
+  { id: 'base_aero_slip_weth_usdc_ts2000', name: 'Aerodrome Slipstream WETH/USDC (CL-2000)', dex: 'Aerodrome Slipstream', pair: 'WETH/USDC', address: '0x0652202C4b2D09CB93aEDeFAdc14B36869483a98', fee: 0.043, kind: 'slipstream', base: BASE_T.WETH, quote: BASE_T.USDC },
 
-  // cbETH / WETH (6 pools across 4 DEXes)
+  // WETH / USDT (3 pools across 2 DEXes)
+  { id: 'base_univ3_weth_usdt_030', name: 'Uniswap V3 WETH/USDT (0.30%)', dex: 'Uniswap V3', pair: 'WETH/USDT', address: '0xcE1d8c90A5F0ef28fe0F457e5Ad615215899319a', fee: 0.30, kind: 'v3', base: BASE_T.WETH, quote: BASE_T.USDT },
+  { id: 'base_univ3_weth_usdt_005', name: 'Uniswap V3 WETH/USDT (0.05%)', dex: 'Uniswap V3', pair: 'WETH/USDT', address: '0xd92E0767473D1E3FF11Ac036f2b1DB90aD0aE55F', fee: 0.05, kind: 'v3', base: BASE_T.WETH, quote: BASE_T.USDT },
+  { id: 'base_aero_slip_weth_usdt_ts100', name: 'Aerodrome Slipstream WETH/USDT (CL-100)', dex: 'Aerodrome Slipstream', pair: 'WETH/USDT', address: '0x9785eF59E2b499fB741674ecf6fAF912Df7b3C1b', fee: 0.0409, kind: 'slipstream', base: BASE_T.WETH, quote: BASE_T.USDT },
+
+  // WETH / USDbC (3 pools across 2 DEXes)
+  { id: 'base_univ3_weth_usdbc_005', name: 'Uniswap V3 WETH/USDbC (0.05%)', dex: 'Uniswap V3', pair: 'WETH/USDbC', address: '0x4C36388bE6F416A29C8d8Eee81C771cE6bE14B18', fee: 0.05, kind: 'v3', base: BASE_T.WETH, quote: BASE_T.USDbC },
+  { id: 'base_univ3_weth_usdbc_030', name: 'Uniswap V3 WETH/USDbC (0.30%)', dex: 'Uniswap V3', pair: 'WETH/USDbC', address: '0x3DdF264AC95D19e81f8c25f4c300C4e59e424d43', fee: 0.30, kind: 'v3', base: BASE_T.WETH, quote: BASE_T.USDbC },
+  { id: 'base_baseswap_weth_usdbc', name: 'BaseSwap V2 WETH/USDbC (0.30%)', dex: 'BaseSwap V2', pair: 'WETH/USDbC', address: '0x41d160033C222E6f3722EC97379867324567d883', fee: 0.30, kind: 'v2', base: BASE_T.WETH, quote: BASE_T.USDbC },
+
+  // cbETH / WETH (8 pools across 5 DEXes)
   { id: 'base_univ3_cbeth_weth_001', name: 'Uniswap V3 cbETH/WETH (0.01%)', dex: 'Uniswap V3', pair: 'cbETH/WETH', address: '0xA9DaFa443a02FBc907Cb0093276B3E6F4ef02A46', fee: 0.01, kind: 'v3', base: BASE_T.cbETH, quote: BASE_T.WETH },
   { id: 'base_univ3_cbeth_weth_005', name: 'Uniswap V3 cbETH/WETH (0.05%)', dex: 'Uniswap V3', pair: 'cbETH/WETH', address: '0x10648BA41B8565907Cfa1496765fA4D95390aa0d', fee: 0.05, kind: 'v3', base: BASE_T.cbETH, quote: BASE_T.WETH },
+  { id: 'base_univ3_cbeth_weth_030', name: 'Uniswap V3 cbETH/WETH (0.30%)', dex: 'Uniswap V3', pair: 'cbETH/WETH', address: '0x7B9636266734270DE5bE02544c04E27046903ff8', fee: 0.30, kind: 'v3', base: BASE_T.cbETH, quote: BASE_T.WETH },
   { id: 'base_pancake_v3_cbeth_weth_001', name: 'PancakeSwap V3 cbETH/WETH (0.01%)', dex: 'PancakeSwap V3', pair: 'cbETH/WETH', address: '0x257FCbAE4Ac6B26A02E4FC5e1a11e4174B5ce395', fee: 0.01, kind: 'v3', base: BASE_T.cbETH, quote: BASE_T.WETH },
   { id: 'base_pancake_v3_cbeth_weth_005', name: 'PancakeSwap V3 cbETH/WETH (0.05%)', dex: 'PancakeSwap V3', pair: 'cbETH/WETH', address: '0xc0efC182479319ff258EcA420e2647cD82D3790c', fee: 0.05, kind: 'v3', base: BASE_T.cbETH, quote: BASE_T.WETH },
   { id: 'base_sushiv3_cbeth_weth_005', name: 'SushiSwap V3 cbETH/WETH (0.05%)', dex: 'SushiSwap V3', pair: 'cbETH/WETH', address: '0xb81B9Aef36c76d740850C31C45697c83468DCB54', fee: 0.05, kind: 'v3', base: BASE_T.cbETH, quote: BASE_T.WETH },
+  { id: 'base_baseswap_cbeth_weth', name: 'BaseSwap V2 cbETH/WETH (0.30%)', dex: 'BaseSwap V2', pair: 'cbETH/WETH', address: '0x07CFA5Df24fB17486AF0CBf6C910F24253a674D3', fee: 0.30, kind: 'v2', base: BASE_T.cbETH, quote: BASE_T.WETH },
   { id: 'base_aero_slip_cbeth_weth_ts1', name: 'Aerodrome Slipstream cbETH/WETH (CL-1)', dex: 'Aerodrome Slipstream', pair: 'cbETH/WETH', address: '0x47cA96Ea59C13F72745928887f84C9F52C3D7348', fee: 0.01, kind: 'slipstream', base: BASE_T.cbETH, quote: BASE_T.WETH },
 
-  // cbBTC / WETH (6 pools across 3 DEXes)
+  // cbETH / USDC (2 pools across 1 DEX)
+  { id: 'base_univ3_cbeth_usdc_100', name: 'Uniswap V3 cbETH/USDC (1.00%)', dex: 'Uniswap V3', pair: 'cbETH/USDC', address: '0xe65ef07833bE37659919Bbe7eC366a2EC889c884', fee: 1.00, kind: 'v3', base: BASE_T.cbETH, quote: BASE_T.USDC },
+  { id: 'base_univ3_cbeth_usdc_030', name: 'Uniswap V3 cbETH/USDC (0.30%)', dex: 'Uniswap V3', pair: 'cbETH/USDC', address: '0xa8E4C55D6dAf4D768aeBa2378c1AD94c112Ef48a', fee: 0.30, kind: 'v3', base: BASE_T.cbETH, quote: BASE_T.USDC },
+
+  // wstETH / WETH (3 pools across 2 DEXes)
+  { id: 'base_univ3_wsteth_weth_001', name: 'Uniswap V3 wstETH/WETH (0.01%)', dex: 'Uniswap V3', pair: 'wstETH/WETH', address: '0x20E068D76f9E90b90604500B84c7e19dCB923e7e', fee: 0.01, kind: 'v3', base: BASE_T.wstETH, quote: BASE_T.WETH },
+  { id: 'base_univ3_wsteth_weth_005', name: 'Uniswap V3 wstETH/WETH (0.05%)', dex: 'Uniswap V3', pair: 'wstETH/WETH', address: '0x6f4482cBF7b43599078fcb012732e20480015644', fee: 0.05, kind: 'v3', base: BASE_T.wstETH, quote: BASE_T.WETH },
+  { id: 'base_aero_slip_wsteth_weth_ts1', name: 'Aerodrome Slipstream wstETH/WETH (CL-1)', dex: 'Aerodrome Slipstream', pair: 'wstETH/WETH', address: '0x861A2922bE165a5Bd41b1E482B49216b465e1B5F', fee: 0.009, kind: 'slipstream', base: BASE_T.wstETH, quote: BASE_T.WETH },
+
+  // ezETH / WETH (2 pools across 2 DEXes)
+  { id: 'base_univ3_ezeth_weth_005', name: 'Uniswap V3 ezETH/WETH (0.05%)', dex: 'Uniswap V3', pair: 'ezETH/WETH', address: '0x58603091b4Da10685e114d85E330Cab36e655627', fee: 0.05, kind: 'v3', base: BASE_T.ezETH, quote: BASE_T.WETH },
+  { id: 'base_pancake_v3_ezeth_weth_001', name: 'PancakeSwap V3 ezETH/WETH (0.01%)', dex: 'PancakeSwap V3', pair: 'ezETH/WETH', address: '0x4c98E9C2439C0d4621C62FeE2fED6D042fa8c570', fee: 0.01, kind: 'v3', base: BASE_T.ezETH, quote: BASE_T.WETH },
+
+  // cbBTC / WETH (8 pools across 3 DEXes)
   { id: 'base_univ3_cbbtc_weth_005', name: 'Uniswap V3 cbBTC/WETH (0.05%)', dex: 'Uniswap V3', pair: 'cbBTC/WETH', address: '0x7AeA2E8A3843516afa07293a10Ac8E49906dabD1', fee: 0.05, kind: 'v3', base: BASE_T.cbBTC, quote: BASE_T.WETH },
   { id: 'base_univ3_cbbtc_weth_030', name: 'Uniswap V3 cbBTC/WETH (0.30%)', dex: 'Uniswap V3', pair: 'cbBTC/WETH', address: '0x8c7080564B5A792A33Ef2FD473fbA6364d5495e5', fee: 0.30, kind: 'v3', base: BASE_T.cbBTC, quote: BASE_T.WETH },
+  { id: 'base_univ3_cbbtc_weth_100', name: 'Uniswap V3 cbBTC/WETH (1.00%)', dex: 'Uniswap V3', pair: 'cbBTC/WETH', address: '0x233571eAE953D9d59eEFc0769F71Dc19287DDCCB', fee: 1.00, kind: 'v3', base: BASE_T.cbBTC, quote: BASE_T.WETH },
   { id: 'base_pancake_v3_cbbtc_weth_001', name: 'PancakeSwap V3 cbBTC/WETH (0.01%)', dex: 'PancakeSwap V3', pair: 'cbBTC/WETH', address: '0xC211e1f853A898Bd1302385CCdE55f33a8C4B3f3', fee: 0.01, kind: 'v3', base: BASE_T.cbBTC, quote: BASE_T.WETH },
   { id: 'base_pancake_v3_cbbtc_weth_005', name: 'PancakeSwap V3 cbBTC/WETH (0.05%)', dex: 'PancakeSwap V3', pair: 'cbBTC/WETH', address: '0xd974D59e30054cf1aBedeD0C9947B0D8Baf90029', fee: 0.05, kind: 'v3', base: BASE_T.cbBTC, quote: BASE_T.WETH },
+  { id: 'base_pancake_v3_cbbtc_weth_025', name: 'PancakeSwap V3 cbBTC/WETH (0.25%)', dex: 'PancakeSwap V3', pair: 'cbBTC/WETH', address: '0x5b3613ef9a535b48e82e2800aCb77053DFeC93b1', fee: 0.25, kind: 'v3', base: BASE_T.cbBTC, quote: BASE_T.WETH },
   { id: 'base_aero_slip_cbbtc_weth_ts1', name: 'Aerodrome Slipstream cbBTC/WETH (CL-1)', dex: 'Aerodrome Slipstream', pair: 'cbBTC/WETH', address: '0x22AEe3699b6A0fEd71490C103Bd4E5f3309891D5', fee: 0.01, kind: 'slipstream', base: BASE_T.cbBTC, quote: BASE_T.WETH },
   { id: 'base_aero_slip_cbbtc_weth_ts100', name: 'Aerodrome Slipstream cbBTC/WETH (CL-100)', dex: 'Aerodrome Slipstream', pair: 'cbBTC/WETH', address: '0x70aCDF2Ad0bf2402C957154f944c19Ef4e1cbAE1', fee: 0.25, kind: 'slipstream', base: BASE_T.cbBTC, quote: BASE_T.WETH },
 
-  // cbBTC / USDC (5 pools across 3 DEXes)
+  // cbBTC / USDC (8 pools across 3 DEXes)
   { id: 'base_univ3_cbbtc_usdc_005', name: 'Uniswap V3 cbBTC/USDC (0.05%)', dex: 'Uniswap V3', pair: 'cbBTC/USDC', address: '0xfBB6Eed8e7aa03B138556eeDaF5D271A5E1e43ef', fee: 0.05, kind: 'v3', base: BASE_T.cbBTC, quote: BASE_T.USDC },
   { id: 'base_univ3_cbbtc_usdc_030', name: 'Uniswap V3 cbBTC/USDC (0.30%)', dex: 'Uniswap V3', pair: 'cbBTC/USDC', address: '0xeC558e484cC9f2210714E345298fdc53B253c27D', fee: 0.30, kind: 'v3', base: BASE_T.cbBTC, quote: BASE_T.USDC },
+  { id: 'base_univ3_cbbtc_usdc_100', name: 'Uniswap V3 cbBTC/USDC (1.00%)', dex: 'Uniswap V3', pair: 'cbBTC/USDC', address: '0x3e7586D52A9D07F8611B8ecf6CCc8a689c34a659', fee: 1.00, kind: 'v3', base: BASE_T.cbBTC, quote: BASE_T.USDC },
   { id: 'base_pancake_v3_cbbtc_usdc_001', name: 'PancakeSwap V3 cbBTC/USDC (0.01%)', dex: 'PancakeSwap V3', pair: 'cbBTC/USDC', address: '0xb94b22332ABf5f89877A14Cc88f2aBC48c34B3Df', fee: 0.01, kind: 'v3', base: BASE_T.cbBTC, quote: BASE_T.USDC },
   { id: 'base_pancake_v3_cbbtc_usdc_005', name: 'PancakeSwap V3 cbBTC/USDC (0.05%)', dex: 'PancakeSwap V3', pair: 'cbBTC/USDC', address: '0x26e263efdc91f0d3279E2Ec2Bd58A7Ca5C2fCE62', fee: 0.05, kind: 'v3', base: BASE_T.cbBTC, quote: BASE_T.USDC },
+  { id: 'base_pancake_v3_cbbtc_usdc_025', name: 'PancakeSwap V3 cbBTC/USDC (0.25%)', dex: 'PancakeSwap V3', pair: 'cbBTC/USDC', address: '0x748Bb91Fc5F4200302D9A79185bC161260a1B461', fee: 0.25, kind: 'v3', base: BASE_T.cbBTC, quote: BASE_T.USDC },
   { id: 'base_aero_slip_cbbtc_usdc_ts100', name: 'Aerodrome Slipstream cbBTC/USDC (CL-100)', dex: 'Aerodrome Slipstream', pair: 'cbBTC/USDC', address: '0x4e962BB3889Bf030368F56810A9c96B83CB3E778', fee: 0.05, kind: 'slipstream', base: BASE_T.cbBTC, quote: BASE_T.USDC },
+  { id: 'base_aero_slip_cbbtc_usdc_ts2000', name: 'Aerodrome Slipstream cbBTC/USDC (CL-2000)', dex: 'Aerodrome Slipstream', pair: 'cbBTC/USDC', address: '0x3e66e55e97ce60096f74b7C475e8249f2D31a9fb', fee: 0.033, kind: 'slipstream', base: BASE_T.cbBTC, quote: BASE_T.USDC },
 
-  // AERO / USDC & AERO / WETH (7 pools across 3 DEXes)
+  // AERO / USDC & AERO / WETH (8 pools across 3 DEXes)
   { id: 'base_univ3_aero_usdc_005', name: 'Uniswap V3 AERO/USDC (0.05%)', dex: 'Uniswap V3', pair: 'AERO/USDC', address: '0xE5B5f522E98B5a2baAe212d4dA66b865B781DB97', fee: 0.05, kind: 'v3', base: BASE_T.AERO, quote: BASE_T.USDC },
   { id: 'base_univ3_aero_usdc_030', name: 'Uniswap V3 AERO/USDC (0.30%)', dex: 'Uniswap V3', pair: 'AERO/USDC', address: '0x2426DC0A657BD481ab48f86C1616431905901238', fee: 0.30, kind: 'v3', base: BASE_T.AERO, quote: BASE_T.USDC },
   { id: 'base_aero_slip_aero_usdc_ts200', name: 'Aerodrome Slipstream AERO/USDC (CL-200)', dex: 'Aerodrome Slipstream', pair: 'AERO/USDC', address: '0xCCd9cC53b63662088c738B8BC06E9078Fb8D9ad4', fee: 0.30, kind: 'slipstream', base: BASE_T.AERO, quote: BASE_T.USDC },
+  { id: 'base_aero_slip_aero_usdc_ts2000', name: 'Aerodrome Slipstream AERO/USDC (CL-2000)', dex: 'Aerodrome Slipstream', pair: 'AERO/USDC', address: '0xBE00fF35AF70E8415D0eB605a286D8A45466A4c1', fee: 1.00, kind: 'slipstream', base: BASE_T.AERO, quote: BASE_T.USDC },
   { id: 'base_univ3_aero_weth_030', name: 'Uniswap V3 AERO/WETH (0.30%)', dex: 'Uniswap V3', pair: 'AERO/WETH', address: '0x3d5D143381916280ff91407FeBEB52f2b60f33Cf', fee: 0.30, kind: 'v3', base: BASE_T.AERO, quote: BASE_T.WETH },
+  { id: 'base_univ3_aero_weth_100', name: 'Uniswap V3 AERO/WETH (1.00%)', dex: 'Uniswap V3', pair: 'AERO/WETH', address: '0x0D5959a52E7004b601f0bE70618D01aC3cDce976', fee: 1.00, kind: 'v3', base: BASE_T.AERO, quote: BASE_T.WETH },
   { id: 'base_pancake_v3_aero_weth_005', name: 'PancakeSwap V3 AERO/WETH (0.05%)', dex: 'PancakeSwap V3', pair: 'AERO/WETH', address: '0x20CB8f872ae894F7c9e32e621C186e5AFCe82Fd0', fee: 0.05, kind: 'v3', base: BASE_T.AERO, quote: BASE_T.WETH },
   { id: 'base_aero_slip_aero_weth_ts200', name: 'Aerodrome Slipstream AERO/WETH (CL-200)', dex: 'Aerodrome Slipstream', pair: 'AERO/WETH', address: '0x82321f3BEB69f503380D6B233857d5C43562e2D0', fee: 0.32, kind: 'slipstream', base: BASE_T.AERO, quote: BASE_T.WETH },
 
-  // Stable & USDbC pairs (8 pools across 4 DEXes)
+  // DEGEN / WETH (3 pools across 2 DEXes)
+  { id: 'base_univ3_degen_weth_030', name: 'Uniswap V3 DEGEN/WETH (0.30%)', dex: 'Uniswap V3', pair: 'DEGEN/WETH', address: '0xc9034c3E7F58003E6ae0C8438e7c8f4598d5ACAA', fee: 0.30, kind: 'v3', base: BASE_T.DEGEN, quote: BASE_T.WETH },
+  { id: 'base_univ3_degen_weth_100', name: 'Uniswap V3 DEGEN/WETH (1.00%)', dex: 'Uniswap V3', pair: 'DEGEN/WETH', address: '0x0cA6485b7e9cF814A3Fd09d81672B07323535b64', fee: 1.00, kind: 'v3', base: BASE_T.DEGEN, quote: BASE_T.WETH },
+  { id: 'base_aero_slip_degen_weth_ts200', name: 'Aerodrome Slipstream DEGEN/WETH (CL-200)', dex: 'Aerodrome Slipstream', pair: 'DEGEN/WETH', address: '0xaFB62448929664Bfccb0aAe22f232520e765bA88', fee: 0.24, kind: 'slipstream', base: BASE_T.DEGEN, quote: BASE_T.WETH },
+
+  // VIRTUAL / WETH & VIRTUAL / USDC (8 pools across 4 DEXes)
+  { id: 'base_univ3_virtual_weth_005', name: 'Uniswap V3 VIRTUAL/WETH (0.05%)', dex: 'Uniswap V3', pair: 'VIRTUAL/WETH', address: '0x9c087Eb773291e50CF6c6a90ef0F4500e349B903', fee: 0.05, kind: 'v3', base: BASE_T.VIRTUAL, quote: BASE_T.WETH },
+  { id: 'base_univ3_virtual_weth_030', name: 'Uniswap V3 VIRTUAL/WETH (0.30%)', dex: 'Uniswap V3', pair: 'VIRTUAL/WETH', address: '0x1D4daB3f27C7F656b6323C1D6Ef713b48A8f72F1', fee: 0.30, kind: 'v3', base: BASE_T.VIRTUAL, quote: BASE_T.WETH },
+  { id: 'base_univ3_virtual_weth_100', name: 'Uniswap V3 VIRTUAL/WETH (1.00%)', dex: 'Uniswap V3', pair: 'VIRTUAL/WETH', address: '0x8e0A7d4018fb2674346d5742055174f899Fe1826', fee: 1.00, kind: 'v3', base: BASE_T.VIRTUAL, quote: BASE_T.WETH },
+  { id: 'base_univ2_virtual_weth', name: 'Uniswap V2 VIRTUAL/WETH (0.30%)', dex: 'Uniswap V2', pair: 'VIRTUAL/WETH', address: '0xE31c372a7Af875b3B5E0F3713B17ef51556da667', fee: 0.30, kind: 'v2', base: BASE_T.VIRTUAL, quote: BASE_T.WETH },
+  { id: 'base_aero_slip_virtual_weth_ts200', name: 'Aerodrome Slipstream VIRTUAL/WETH (CL-200)', dex: 'Aerodrome Slipstream', pair: 'VIRTUAL/WETH', address: '0xC200F21EfE67c7F41B81A854c26F9cdA80593065', fee: 0.06, kind: 'slipstream', base: BASE_T.VIRTUAL, quote: BASE_T.WETH },
+  { id: 'base_aero_slip_virtual_weth_ts100', name: 'Aerodrome Slipstream VIRTUAL/WETH (CL-100)', dex: 'Aerodrome Slipstream', pair: 'VIRTUAL/WETH', address: '0x3f0296BF652e19bca772EC3dF08b32732F93014A', fee: 0.0146, kind: 'slipstream', base: BASE_T.VIRTUAL, quote: BASE_T.WETH },
+  { id: 'base_univ3_virtual_usdc_030', name: 'Uniswap V3 VIRTUAL/USDC (0.30%)', dex: 'Uniswap V3', pair: 'VIRTUAL/USDC', address: '0x529d2863a1521d0b57db028168fdE2E97120017C', fee: 0.30, kind: 'v3', base: BASE_T.VIRTUAL, quote: BASE_T.USDC },
+  { id: 'base_pancake_v3_virtual_usdc_005', name: 'PancakeSwap V3 VIRTUAL/USDC (0.05%)', dex: 'PancakeSwap V3', pair: 'VIRTUAL/USDC', address: '0x7CB770D0513c30e0CB45E4899e4a2CbEEd6F9830', fee: 0.05, kind: 'v3', base: BASE_T.VIRTUAL, quote: BASE_T.USDC },
+
+  // MORPHO / WETH (4 pools across 2 DEXes)
+  { id: 'base_univ3_morpho_weth_030', name: 'Uniswap V3 MORPHO/WETH (0.30%)', dex: 'Uniswap V3', pair: 'MORPHO/WETH', address: '0x2F42Df4aF5312B492E9d7F7b2110D9c7bf2D9e4F', fee: 0.30, kind: 'v3', base: BASE_T.MORPHO, quote: BASE_T.WETH },
+  { id: 'base_univ3_morpho_weth_100', name: 'Uniswap V3 MORPHO/WETH (1.00%)', dex: 'Uniswap V3', pair: 'MORPHO/WETH', address: '0x3444bF60B93BD30f701601356Ac136aD6a9b7A79', fee: 1.00, kind: 'v3', base: BASE_T.MORPHO, quote: BASE_T.WETH },
+  { id: 'base_univ3_morpho_weth_001', name: 'Uniswap V3 MORPHO/WETH (0.01%)', dex: 'Uniswap V3', pair: 'MORPHO/WETH', address: '0x9EaaaBE267A8B3c1bA081A2866Fa9Ea22F84680d', fee: 0.01, kind: 'v3', base: BASE_T.MORPHO, quote: BASE_T.WETH },
+  { id: 'base_aero_slip_morpho_weth_ts200', name: 'Aerodrome Slipstream MORPHO/WETH (CL-200)', dex: 'Aerodrome Slipstream', pair: 'MORPHO/WETH', address: '0xB5F0b4aE66C14F7EFaA9aA1468E8FC536A3E288c', fee: 0.3034, kind: 'slipstream', base: BASE_T.MORPHO, quote: BASE_T.WETH },
+
+  // Stablecoin pairs: USDC/USDT, USDC/DAI, USDC/USDbC (20 pools across 4 DEXes)
+  { id: 'base_univ3_usdc_usdt_001', name: 'Uniswap V3 USDC/USDT (0.01%)', dex: 'Uniswap V3', pair: 'USDC/USDT', address: '0xD56da2B74bA826f19015E6B7Dd9Dae1903E85DA1', fee: 0.01, kind: 'v3', base: BASE_T.USDC, quote: BASE_T.USDT },
+  { id: 'base_univ3_usdc_usdt_005', name: 'Uniswap V3 USDC/USDT (0.05%)', dex: 'Uniswap V3', pair: 'USDC/USDT', address: '0xB7F084c7f7f1c680d08780e2b2ef4F2133DB0Df8', fee: 0.05, kind: 'v3', base: BASE_T.USDC, quote: BASE_T.USDT },
+  { id: 'base_univ3_usdc_usdt_030', name: 'Uniswap V3 USDC/USDT (0.30%)', dex: 'Uniswap V3', pair: 'USDC/USDT', address: '0x82ccD0de0293CCBD2184901a69fdc2dd8073320E', fee: 0.30, kind: 'v3', base: BASE_T.USDC, quote: BASE_T.USDT },
+  { id: 'base_pancake_v3_usdc_usdt_001', name: 'PancakeSwap V3 USDC/USDT (0.01%)', dex: 'PancakeSwap V3', pair: 'USDC/USDT', address: '0x5f07bb9fEE6062e9D09A52E6d587c64bAD6bA706', fee: 0.01, kind: 'v3', base: BASE_T.USDC, quote: BASE_T.USDT },
+  { id: 'base_pancake_v3_usdc_usdt_005', name: 'PancakeSwap V3 USDC/USDT (0.05%)', dex: 'PancakeSwap V3', pair: 'USDC/USDT', address: '0x2dB0FFf9f1aFcEf3A77e673DfBA9883C036ebD53', fee: 0.05, kind: 'v3', base: BASE_T.USDC, quote: BASE_T.USDT },
+  { id: 'base_pancake_v3_usdc_usdt_100', name: 'PancakeSwap V3 USDC/USDT (1.00%)', dex: 'PancakeSwap V3', pair: 'USDC/USDT', address: '0x0BFFF3A8f90FBdd39a5dDD1eE9eb2F9a11E79b86', fee: 1.00, kind: 'v3', base: BASE_T.USDC, quote: BASE_T.USDT },
+  { id: 'base_sushiv3_usdc_usdt_001', name: 'SushiSwap V3 USDC/USDT (0.01%)', dex: 'SushiSwap V3', pair: 'USDC/USDT', address: '0xfeAf8296CE905884a528DA784A52964d9F614F00', fee: 0.01, kind: 'v3', base: BASE_T.USDC, quote: BASE_T.USDT },
+  { id: 'base_aero_slip_usdc_usdt_ts1', name: 'Aerodrome Slipstream USDC/USDT (CL-1)', dex: 'Aerodrome Slipstream', pair: 'USDC/USDT', address: '0xa41Bc0AFfbA7Fd420d186b84899d7ab2aC57fcD1', fee: 0.0008, kind: 'slipstream', base: BASE_T.USDC, quote: BASE_T.USDT },
+
   { id: 'base_univ3_usdc_dai_005', name: 'Uniswap V3 USDC/DAI (0.05%)', dex: 'Uniswap V3', pair: 'USDC/DAI', address: '0x19a8B1542B807Cd6a76fcbb5fF5F53c6169F36d7', fee: 0.05, kind: 'v3', base: BASE_T.USDC, quote: BASE_T.DAI },
+  { id: 'base_univ3_usdc_dai_001', name: 'Uniswap V3 USDC/DAI (0.01%)', dex: 'Uniswap V3', pair: 'USDC/DAI', address: '0xC18F50d6A832f12F6DcAaeEe8D0c87A65B96787E', fee: 0.01, kind: 'v3', base: BASE_T.USDC, quote: BASE_T.DAI },
   { id: 'base_pancake_v3_usdc_dai_001', name: 'PancakeSwap V3 USDC/DAI (0.01%)', dex: 'PancakeSwap V3', pair: 'USDC/DAI', address: '0x345825A980BD94e1480bC4f20FE4e3DAE2F23Dd3', fee: 0.01, kind: 'v3', base: BASE_T.USDC, quote: BASE_T.DAI },
+  { id: 'base_pancake_v3_usdc_dai_005', name: 'PancakeSwap V3 USDC/DAI (0.05%)', dex: 'PancakeSwap V3', pair: 'USDC/DAI', address: '0x486D1e5e5F97F44ea8dB217598c1e61e21f54084', fee: 0.05, kind: 'v3', base: BASE_T.USDC, quote: BASE_T.DAI },
   { id: 'base_sushiv3_usdc_dai_001', name: 'SushiSwap V3 USDC/DAI (0.01%)', dex: 'SushiSwap V3', pair: 'USDC/DAI', address: '0x3BD740dc10864f35001AAB7771C56a85C48c901B', fee: 0.01, kind: 'v3', base: BASE_T.USDC, quote: BASE_T.DAI },
+
   { id: 'base_univ3_usdc_usdbc_001', name: 'Uniswap V3 USDC/USDbC (0.01%)', dex: 'Uniswap V3', pair: 'USDC/USDbC', address: '0x06959273E9A65433De71F5A452D529544E07dDD0', fee: 0.01, kind: 'v3', base: BASE_T.USDC, quote: BASE_T.USDbC },
+  { id: 'base_univ3_usdc_usdbc_005', name: 'Uniswap V3 USDC/USDbC (0.05%)', dex: 'Uniswap V3', pair: 'USDC/USDbC', address: '0x92722287D2819012dD8EC07b4e426AC00Dd11103', fee: 0.05, kind: 'v3', base: BASE_T.USDC, quote: BASE_T.USDbC },
   { id: 'base_pancake_v3_usdc_usdbc_001', name: 'PancakeSwap V3 USDC/USDbC (0.01%)', dex: 'PancakeSwap V3', pair: 'USDC/USDbC', address: '0x29Ed55B18Af0Add137952CB3E29FB77B32fCE426', fee: 0.01, kind: 'v3', base: BASE_T.USDC, quote: BASE_T.USDbC },
+  { id: 'base_pancake_v3_usdc_usdbc_025', name: 'PancakeSwap V3 USDC/USDbC (0.25%)', dex: 'PancakeSwap V3', pair: 'USDC/USDbC', address: '0xa002b68292131d2f70518d7dFf63bd9D99d189F2', fee: 0.25, kind: 'v3', base: BASE_T.USDC, quote: BASE_T.USDbC },
   { id: 'base_sushiv3_usdc_usdbc_001', name: 'SushiSwap V3 USDC/USDbC (0.01%)', dex: 'SushiSwap V3', pair: 'USDC/USDbC', address: '0xD3f749adA01aF29a713545Fb6b8E782B49A75a20', fee: 0.01, kind: 'v3', base: BASE_T.USDC, quote: BASE_T.USDbC },
-  { id: 'base_univ3_weth_usdbc_005', name: 'Uniswap V3 WETH/USDbC (0.05%)', dex: 'Uniswap V3', pair: 'WETH/USDbC', address: '0x4C36388bE6F416A29C8d8Eee81C771cE6bE14B18', fee: 0.05, kind: 'v3', base: BASE_T.WETH, quote: BASE_T.USDbC },
-  { id: 'base_baseswap_weth_usdbc', name: 'BaseSwap V2 WETH/USDbC (0.30%)', dex: 'BaseSwap V2', pair: 'WETH/USDbC', address: '0x41d160033C222E6f3722EC97379867324567d883', fee: 0.30, kind: 'v2', base: BASE_T.WETH, quote: BASE_T.USDbC },
+  { id: 'base_sushiv3_usdc_usdbc_005', name: 'SushiSwap V3 USDC/USDbC (0.05%)', dex: 'SushiSwap V3', pair: 'USDC/USDbC', address: '0x27D8d938d9cfb97A85CA70DefA4D44762A2e1884', fee: 0.05, kind: 'v3', base: BASE_T.USDC, quote: BASE_T.USDbC },
+  { id: 'base_aero_slip_usdc_usdbc_ts1', name: 'Aerodrome Slipstream USDC/USDbC (CL-1)', dex: 'Aerodrome Slipstream', pair: 'USDC/USDbC', address: '0x98c7A2338336d2d354663246F64676009c7bDa97', fee: 0.01, kind: 'slipstream', base: BASE_T.USDC, quote: BASE_T.USDbC },
 ];
 
 // ---- Monitored Optimism Mainnet pools (verified on-chain via factory getPool with >= $5K depth) ----
@@ -1485,6 +1698,11 @@ class LiveMevAgent {
     sweptAmount?: string;
     sweptToken?: string;
     recipient?: string;
+    gasSavedUsd?: number;
+    loanFeeSavedUsd?: number;
+    gasSavedEthSwept?: string;
+    gasSweepTxHash?: string;
+    gasSweepNote?: string;
   }> {
     const chain = options?.chain || opp.chain || 'arbitrum';
     const rpcInfo = RPC_ENDPOINTS[chain] || RPC_ENDPOINTS.arbitrum;
@@ -1525,13 +1743,61 @@ class LiveMevAgent {
       };
     }
 
-    const candidates = resolveArbitrageCandidates({ ...routeInput, chain }, profitWallet);
-    if (candidates.length === 0) {
+    // Check raw unscaled route router support first
+    const baseRoutersCheck = resolveArbitrageCandidates({ ...routeInput, chain }, profitWallet);
+    if (baseRoutersCheck.length === 0) {
       return {
         ok: false,
         statusCode: 422,
         simulationFailed: true,
         error: `Route ${routeInput.buyDex} -> ${routeInput.sellDex} on ${rpcInfo.name} uses an unsupported router. Pick a FlashArbOptimized-supported pool pair (Uniswap V3, PancakeSwap V3, SushiSwap V3, Uniswap V2, Sushiswap V2, BaseSwap V2).`,
+      };
+    }
+
+    // Read live Balancer V2 Vault liquidity for both base and quote tokens to cap V3/V2 flash borrow size
+    let balancerVaultBalances: Record<string, bigint> | undefined;
+    try {
+      const paddedVault = rpcInfo.balancerVault.toLowerCase().replace('0x', '').padStart(64, '0');
+      const vaultCalls = [
+        { target: routeInput.baseToken.addr, allowFailure: true, callData: `0x70a08231${paddedVault}` },
+        { target: routeInput.quoteToken.addr, allowFailure: true, callData: `0x70a08231${paddedVault}` },
+      ];
+      const mcVaultData = multicallIface.encodeFunctionData('aggregate3', [vaultCalls]);
+      const { result: mcVaultRes } = await fetchRpcSingleWithFailover(
+        chain,
+        'eth_call',
+        [{ to: MULTICALL3_ADDRESS, data: mcVaultData }, 'latest'],
+        false
+      );
+      if (typeof mcVaultRes === 'string' && mcVaultRes !== '0x') {
+        const [decodedVault] = multicallIface.decodeFunctionResult('aggregate3', mcVaultRes);
+        const parsed: Record<string, bigint> = {};
+        if (decodedVault[0]?.success && decodedVault[0]?.returnData?.length >= 66) {
+          parsed[routeInput.baseToken.addr.toLowerCase()] = BigInt(decodedVault[0].returnData.slice(0, 66));
+        }
+        if (decodedVault[1]?.success && decodedVault[1]?.returnData?.length >= 66) {
+          parsed[routeInput.quoteToken.addr.toLowerCase()] = BigInt(decodedVault[1].returnData.slice(0, 66));
+        }
+        if (Object.keys(parsed).length > 0) {
+          balancerVaultBalances = parsed;
+        }
+      }
+    } catch {
+      // If Vault pre-check RPC call fails transiently, proceed with un-capped progressive clips
+    }
+
+    const candidates = buildScaledArbitrageCandidates(
+      { ...routeInput, chain },
+      profitWallet,
+      balancerVaultBalances,
+      [1, 0.5, 0.25, 0.1]
+    );
+    if (candidates.length === 0) {
+      return {
+        ok: false,
+        statusCode: 422,
+        simulationFailed: true,
+        error: `Balancer V2 Vault has insufficient liquidity in both ${routeInput.baseToken.sym} and ${routeInput.quoteToken.sym} on ${rpcInfo.name} for this flash loan.`,
       };
     }
 
@@ -1696,7 +1962,52 @@ class LiveMevAgent {
         ? Number(sweptAmount) * ethUsd
         : decodedSwap && opp.buyPrice > 0
         ? Number(sweptAmount) * opp.buyPrice
-        : opp.estNetProfitUsd;
+        : opp.estNetProfitUsd * (verifiedCandidate.scaleFactor ?? 1);
+
+    const borrowedHuman = Number(ethers.formatUnits(verifiedCandidate.amountUnits, verifiedCandidate.borrowedToken.dec));
+    const borrowedTokenPriceUsd =
+      ['USDC', 'USDC.E', 'USDBC', 'USDT', 'DAI'].includes(borrowedSym.toUpperCase())
+        ? 1
+        : borrowedSym.toUpperCase() === 'WETH'
+        ? ethUsd
+        : getLiveTokenUsdPrice(borrowedSym, chain) || opp.buyPrice;
+    const actualLoanNotionalUsd = borrowedHuman * (borrowedTokenPriceUsd > 0 ? borrowedTokenPriceUsd : opp.buyPrice);
+
+    const extraMetrics = computeTradeGasAndFinancingExtra({
+      gasUsed: receipt.gasUsed,
+      effectiveGasPriceWei: receipt.effectiveGasPrice,
+      ethPriceUsd: ethUsd,
+      loanNotionalUsd: actualLoanNotionalUsd,
+      loanFeePercent: 0,
+    });
+
+    let gasSavedEthSwept = '0';
+    let gasSweepTxHash: string | undefined;
+    let gasSweepNote: string | undefined;
+    let gasForwardedUsd = 0;
+
+    if (isSuccess && signerAddress.toLowerCase() !== profitWallet.toLowerCase() && extraMetrics.gasSavedWei > 0n) {
+      try {
+        const gasSweep = await sweepGasWalletEthSurplus({
+          chain,
+          cleanKey,
+          signerAddress,
+          recipient: profitWallet,
+          maxSendWei: extraMetrics.gasSavedWei,
+        });
+        if (gasSweep.swept && gasSweep.txHash) {
+          gasSavedEthSwept = gasSweep.sentEthFormatted;
+          gasSweepTxHash = gasSweep.txHash;
+          gasForwardedUsd = Number((Number(gasSweep.sentEthFormatted) * ethUsd).toFixed(4));
+        } else if (gasSweep.reason) {
+          gasSweepNote = gasSweep.reason;
+        }
+      } catch (sweepErr: any) {
+        gasSweepNote = sweepErr?.message || 'Gas surplus sweep skipped';
+      }
+    }
+
+    const totalNetProfitUsd = isSuccess ? Number((realizedUsd + gasForwardedUsd).toFixed(4)) : 0;
 
     const executedTrade: ExecutedAgentTrade = {
       id: `arb-${Date.now()}-${sentTxHash.slice(2, 8)}`,
@@ -1708,8 +2019,12 @@ class LiveMevAgent {
       buyDex: opp.buyDex,
       sellDex: opp.sellDex,
       grossSpreadUsd: opp.grossSpreadUsd,
-      netProfitUsd: isSuccess ? Number(realizedUsd.toFixed(4)) : 0,
+      netProfitUsd: totalNetProfitUsd,
       gasCostEth,
+      gasSavedUsd: extraMetrics.gasSavedUsd,
+      loanFeeSavedUsd: extraMetrics.loanFeeSavedUsd,
+      gasSavedEthSwept: gasSweepTxHash ? gasSavedEthSwept : null,
+      gasSweepTxHash: gasSweepTxHash || null,
       status: isSuccess ? 'CONFIRMED' : 'REVERTED',
       explorerUrl: `${rpcInfo.explorer}/tx/${sentTxHash}`,
       profitRecipient: sweptRecipient,
@@ -1722,7 +2037,8 @@ class LiveMevAgent {
       this.lastConfirmedTxHash = sentTxHash;
       this.lastConfirmedBlock = receipt.blockNumber;
       this.agentState = 'TRADE_CONFIRMED';
-      this.lastExecutionNotice = `Confirmed ${verifiedCandidate.label}: swept ${sweptAmount} ${verifiedCandidate.borrowedToken.sym} to ${sweptRecipient}`;
+      const gasSuffix = gasSweepTxHash ? ` + ${gasSavedEthSwept} ETH gas surplus` : '';
+      this.lastExecutionNotice = `Confirmed ${verifiedCandidate.label}: swept ${sweptAmount} ${verifiedCandidate.borrowedToken.sym}${gasSuffix} to ${sweptRecipient}`;
       return {
         ok: true,
         statusCode: 200,
@@ -1734,6 +2050,11 @@ class LiveMevAgent {
         sweptAmount,
         sweptToken: verifiedCandidate.borrowedToken.sym,
         recipient: sweptRecipient,
+        gasSavedUsd: extraMetrics.gasSavedUsd,
+        loanFeeSavedUsd: extraMetrics.loanFeeSavedUsd,
+        gasSavedEthSwept,
+        gasSweepTxHash,
+        gasSweepNote,
       };
     }
 
@@ -1839,12 +2160,14 @@ class LiveMevAgent {
     const chainRouters = getChainDexRouters(chain);
     const rpcLabel = RPC_ENDPOINTS[chain]?.name || chain;
 
-    interface SubCallRef { poolIdx: number; kind: 'state' | 'liquidity' | 'fee' }
+    interface SubCallRef { poolIdx: number; kind: 'state' | 'liquidity' | 'fee' | 'balBase' | 'balQuote' }
     const subCalls: Array<{ target: string; allowFailure: boolean; callData: string }> = [];
     const subRefs: SubCallRef[] = [];
     const stateCallIdxByPool = new Array<number>(specs.length).fill(-1);
     const liqCallIdxByPool = new Array<number>(specs.length).fill(-1);
     const feeCallIdxByPool = new Array<number>(specs.length).fill(-1);
+    const balBaseCallIdxByPool = new Array<number>(specs.length).fill(-1);
+    const balQuoteCallIdxByPool = new Array<number>(specs.length).fill(-1);
 
     specs.forEach((p, i) => {
       const stateSel =
@@ -1856,6 +2179,17 @@ class LiveMevAgent {
         liqCallIdxByPool[i] = subCalls.length;
         subCalls.push({ target: p.address, allowFailure: true, callData: '0x1a686502' });
         subRefs.push({ poolIdx: i, kind: 'liquidity' });
+
+        // Query actual ERC-20 token balances inside V3/Algebra/Slipstream pools so narrow out-of-market
+        // concentrated ticks with ~$1 real liquidity never create phantom multi-thousand-bps spreads.
+        const paddedPool = p.address.toLowerCase().replace('0x', '').padStart(64, '0');
+        const balCallData = `0x70a08231${paddedPool}`;
+        balBaseCallIdxByPool[i] = subCalls.length;
+        subCalls.push({ target: p.base.addr, allowFailure: true, callData: balCallData });
+        subRefs.push({ poolIdx: i, kind: 'balBase' });
+        balQuoteCallIdxByPool[i] = subCalls.length;
+        subCalls.push({ target: p.quote.addr, allowFailure: true, callData: balCallData });
+        subRefs.push({ poolIdx: i, kind: 'balQuote' });
       }
       if (p.kind === 'slipstream') {
         feeCallIdxByPool[i] = subCalls.length;
@@ -1918,7 +2252,14 @@ class LiveMevAgent {
     const word = (hex: string, i: number) => BigInt('0x' + hex.slice(2 + i * 64, 2 + (i + 1) * 64));
     const Q96 = 2 ** 96;
 
-    interface Read { spec: PoolSpec; basePerQuote: number; depthQuote: number /* in-range, in quote units */; liveFeePercent: number }
+    interface Read {
+      spec: PoolSpec;
+      basePerQuote: number;
+      depthQuote: number; /* virtual in-range, in quote units */
+      actualBaseHuman: number | null;
+      actualQuoteHuman: number | null;
+      liveFeePercent: number;
+    }
     const reads: Read[] = [];
     specs.forEach((p, i) => {
       const state = returnDatas[stateCallIdxByPool[i]];
@@ -1927,6 +2268,8 @@ class LiveMevAgent {
       let token1PerToken0: number;
       let depthQuote: number;
       let liveFeePercent = p.fee;
+      let actualBaseHuman: number | null = null;
+      let actualQuoteHuman: number | null = null;
       try {
         if (p.kind === 'v2') {
           if (state.length < 130) return;
@@ -1957,6 +2300,15 @@ class LiveMevAgent {
               }
             }
           }
+          const balBaseHex = balBaseCallIdxByPool[i] >= 0 ? returnDatas[balBaseCallIdxByPool[i]] : null;
+          const balQuoteHex = balQuoteCallIdxByPool[i] >= 0 ? returnDatas[balQuoteCallIdxByPool[i]] : null;
+          if (balBaseHex && balBaseHex.length >= 66) {
+            actualBaseHuman = Number(BigInt(balBaseHex.slice(0, 66))) / 10 ** p.base.dec;
+          }
+          if (balQuoteHex && balQuoteHex.length >= 66) {
+            actualQuoteHuman = Number(BigInt(balQuoteHex.slice(0, 66))) / 10 ** p.quote.dec;
+          }
+
           token1PerToken0 = sqrt * sqrt * 10 ** (t0.dec - t1.dec);
           // virtual in-range reserve of the quote token, in raw units -> whole tokens
           const quoteRaw = p.quote === t1 ? L * sqrt : L / sqrt;
@@ -1967,7 +2319,7 @@ class LiveMevAgent {
       }
       const quotePerBase = p.base === t0 ? token1PerToken0 : 1 / token1PerToken0;
       if (!Number.isFinite(quotePerBase) || quotePerBase <= 0) return;
-      reads.push({ spec: p, basePerQuote: quotePerBase, depthQuote, liveFeePercent });
+      reads.push({ spec: p, basePerQuote: quotePerBase, depthQuote, actualBaseHuman, actualQuoteHuman, liveFeePercent });
     });
 
     // ETH/USD reference = the real Uniswap V3 WETH/USDC 0.05% pool on this chain
@@ -1982,9 +2334,23 @@ class LiveMevAgent {
     for (const r of reads) {
       const qUsd = quoteUsd(r.spec.quote);
       if (qUsd === null) continue; // needs ETH/USD and it is unavailable: omit, do not guess
-      const depthUsd = r.depthQuote * qUsd;
+      const priceUsd = r.basePerQuote * qUsd;
+      let depthUsd = r.depthQuote * qUsd;
+
+      if (r.spec.kind !== 'v2' && r.actualBaseHuman !== null && r.actualQuoteHuman !== null) {
+        const actualBaseUsd = r.actualBaseHuman * priceUsd;
+        const actualQuoteUsd = r.actualQuoteHuman * qUsd;
+        const actualTvlUsd = actualBaseUsd + actualQuoteUsd;
+        // Require real two-sided ERC-20 TVL in V3/Slipstream/Algebra pools (>= $5K total & >= $250 on each side)
+        // to reject abandoned / single-sided narrow concentrated ticks with illusory virtual L depth.
+        if (actualTvlUsd < 5000 || Math.min(actualBaseUsd, actualQuoteUsd) < 250) {
+          continue;
+        }
+        depthUsd = Math.min(depthUsd, actualTvlUsd);
+      }
+
       if (depthUsd < 5000) continue; // exclude dust/dormant pools
-      priced.push({ ...r, priceUsd: r.basePerQuote * qUsd, depthUsd });
+      priced.push({ ...r, priceUsd, depthUsd });
     }
 
     const fmtUsd = (n: number) => (n >= 1e6 ? `$${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `$${(n / 1e3).toFixed(0)}K` : `$${n.toFixed(0)}`);
@@ -1996,7 +2362,7 @@ class LiveMevAgent {
       pair: r.spec.pair,
       poolAddress: r.spec.address,
       feeTierPercent: r.liveFeePercent,
-      priceUsd: Number(r.priceUsd.toFixed(r.priceUsd < 10 ? 4 : 2)),
+      priceUsd: Number(r.priceUsd.toFixed(r.priceUsd < 0.1 ? 6 : r.priceUsd < 10 ? 4 : 2)),
       blockNumber: block,
       lastUpdated: now,
       depthSummary: `${fmtUsd(r.depthUsd)} in-range liquidity (on-chain)`,
@@ -2079,6 +2445,12 @@ class LiveMevAgent {
     this.opportunitiesByChain[chain] = opps;
     this.lastErrorByChain[chain] = null;
     this.lastSuccessfulScanByChain[chain] = now;
+    const prefix = `opp-${chain}-`;
+    for (const existingKey of this.routeInputsByOppId.keys()) {
+      if (existingKey.startsWith(prefix) && !chainRouteInputs.has(existingKey)) {
+        this.routeInputsByOppId.delete(existingKey);
+      }
+    }
     for (const [oppId, routeInput] of chainRouteInputs.entries()) {
       this.routeInputsByOppId.set(oppId, routeInput);
     }
@@ -2343,6 +2715,11 @@ flashArbRouter.post('/agent/trigger', async (req: Request, res: Response) => {
       sweptAmount: result.sweptAmount,
       sweptToken: result.sweptToken,
       recipient: result.recipient,
+      gasSavedUsd: result.gasSavedUsd,
+      loanFeeSavedUsd: result.loanFeeSavedUsd,
+      gasSavedEthSwept: result.gasSavedEthSwept,
+      gasSweepTxHash: result.gasSweepTxHash,
+      gasSweepNote: result.gasSweepNote,
       opportunity: opp,
     });
   } catch (err: any) {
@@ -2511,17 +2888,247 @@ function decodeStringOrBytes32(hex: string | undefined): string | null {
   return null;
 }
 
+export interface LiveTokenPriceEntry {
+  symbol: string;
+  priceUsd: number;
+  source: string;
+  updatedAt: number;
+  change24h?: number;
+}
+
+export interface LiveTokenPriceFeedResult {
+  prices: Record<string, LiveTokenPriceEntry>;
+  byChain: Record<SupportedArbChain, Record<string, LiveTokenPriceEntry>>;
+  ethUsd: number | null;
+  tokenCount: number;
+  updatedAt: number;
+  sources: string[];
+}
+
+export const EXTRA_LLAMA_TOKEN_KEYS: Record<string, { key: string; symbol: string }> = {
+  ETH: { key: 'coingecko:ethereum', symbol: 'ETH' },
+  BTC: { key: 'coingecko:bitcoin', symbol: 'BTC' },
+  SOL: { key: 'coingecko:solana', symbol: 'SOL' },
+  TBTC: { key: 'arbitrum:0x6c84a8f1c29108F47a79964b5Fe888D4f4D0dE40', symbol: 'tBTC' },
+  RETH: { key: 'arbitrum:0xEC70Dcb4A1EFa46b8F2D97C310C9c4790ba5ffA8', symbol: 'rETH' },
+  WEETH: { key: 'coingecko:wrapped-eeth', symbol: 'weETH' },
+  LDO: { key: 'arbitrum:0x13Ad51ed4F1B7e9Dc168d8a00cB3f4dDD85EfA60', symbol: 'LDO' },
+  CRVUSD: { key: 'coingecko:crvusd', symbol: 'crvUSD' },
+  SPA: { key: 'coingecko:sperax', symbol: 'SPA' },
+  PEPE: { key: 'coingecko:pepe', symbol: 'PEPE' },
+  SHIB: { key: 'coingecko:shiba-inu', symbol: 'SHIB' },
+  VELO: { key: 'optimism:0x9560e827aF36c94D2Ac33a39bCE1Fe78631088Db', symbol: 'VELO' },
+  AERO: { key: 'base:0x940181a94A35A4569E4529A3CDfB74e38FD98631', symbol: 'AERO' },
+  OP: { key: 'optimism:0x4200000000000000000000000000000000000042', symbol: 'OP' },
+  SUSDE: { key: 'coingecko:ethena-staked-usde', symbol: 'sUSDe' },
+};
+
+export function buildLlamaPriceQueryKeys(): {
+  allKeys: string[];
+  chainEntries: Array<{ key: string; chain: SupportedArbChain; sym: string }>;
+  extraEntries: Array<{ key: string; symbol: string }>;
+} {
+  const keySet = new Set<string>();
+  const chainEntries: Array<{ key: string; chain: SupportedArbChain; sym: string }> = [];
+  const extraEntries: Array<{ key: string; symbol: string }> = [];
+
+  for (const chain of SUPPORTED_SCAN_CHAINS) {
+    for (const tok of Object.values(CHAIN_TOKENS[chain])) {
+      const key = `${chain}:${tok.addr}`;
+      keySet.add(key);
+      chainEntries.push({ key, chain, sym: tok.sym });
+    }
+  }
+  for (const extra of Object.values(EXTRA_LLAMA_TOKEN_KEYS)) {
+    keySet.add(extra.key);
+    extraEntries.push(extra);
+  }
+  return {
+    allKeys: Array.from(keySet),
+    chainEntries,
+    extraEntries,
+  };
+}
+
+let cachedPriceFeed: LiveTokenPriceFeedResult | null = null;
+let cachedPriceFeedExpiry = 0;
+let inFlightPriceFeedPromise: Promise<LiveTokenPriceFeedResult> | null = null;
+
+export async function getLiveTokenPriceFeed(forceRefresh = false): Promise<LiveTokenPriceFeedResult> {
+  const now = Date.now();
+  if (!forceRefresh && cachedPriceFeed && now < cachedPriceFeedExpiry) {
+    return cachedPriceFeed;
+  }
+  if (inFlightPriceFeedPromise) {
+    return inFlightPriceFeedPromise;
+  }
+
+  inFlightPriceFeedPromise = (async () => {
+    const updatedAt = Date.now();
+    const prices: Record<string, LiveTokenPriceEntry> = {};
+    const byChain: Record<SupportedArbChain, Record<string, LiveTokenPriceEntry>> = {
+      arbitrum: {},
+      base: {},
+      optimism: {},
+    };
+    const sourcesUsed = new Set<string>();
+
+    const upsertGlobal = (sym: string, entry: LiveTokenPriceEntry, prefer = false) => {
+      const upper = sym.toUpperCase();
+      if (prefer || !prices[sym]) prices[sym] = entry;
+      if (prefer || !prices[upper]) prices[upper] = entry;
+    };
+
+    // 1. Live CEX tickers (Binance US / Kraken / Coinbase / NonKYC)
+    const cexResult = await fetchLiveTickers().catch(() => null);
+    if (cexResult && Array.isArray(cexResult.tickers) && cexResult.tickers.length > 0) {
+      sourcesUsed.add('CEX_TICKERS');
+      for (const t of cexResult.tickers) {
+        if (!(t.price > 0)) continue;
+        const baseSym = t.symbol.split('/')[0].toUpperCase();
+        const entry: LiveTokenPriceEntry = {
+          symbol: baseSym,
+          priceUsd: t.price,
+          source: cexResult.source || 'CEX',
+          updatedAt: t.lastUpdated || updatedAt,
+          change24h: t.change24h,
+        };
+        upsertGlobal(baseSym, entry);
+        if (baseSym === 'ETH') upsertGlobal('WETH', { ...entry, symbol: 'WETH' });
+        if (baseSym === 'BTC') {
+          upsertGlobal('WBTC', { ...entry, symbol: 'WBTC' });
+          upsertGlobal('cbBTC', { ...entry, symbol: 'cbBTC' });
+        }
+      }
+    }
+
+    // 2. Live DeFiLlama multi-chain contract & CoinGecko feed (resolves all 41 chain tokens + Sizer tokens)
+    const { allKeys, chainEntries, extraEntries } = buildLlamaPriceQueryKeys();
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 5500);
+      const url = `https://coins.llama.fi/prices/current/${allKeys.map((k) => encodeURIComponent(k)).join(',')}`;
+      const resp = await fetch(url, { signal: controller.signal });
+      clearTimeout(timeoutId);
+      if (resp.ok) {
+        const json: any = await resp.json();
+        const coins: Record<string, { price?: number; timestamp?: number; symbol?: string }> = json?.coins || {};
+        if (Object.keys(coins).length > 0) {
+          sourcesUsed.add('DEFILLAMA');
+        }
+        const findCoin = (key: string) => coins[key] || coins[key.toLowerCase()];
+
+        for (const item of chainEntries) {
+          const c = findCoin(item.key);
+          if (c && typeof c.price === 'number' && c.price > 0) {
+            const entry: LiveTokenPriceEntry = {
+              symbol: item.sym,
+              priceUsd: c.price,
+              source: 'DEFILLAMA_ONCHAIN',
+              updatedAt: c.timestamp ? c.timestamp * 1000 : updatedAt,
+            };
+            byChain[item.chain][item.sym] = entry;
+            byChain[item.chain][item.sym.toUpperCase()] = entry;
+            upsertGlobal(item.sym, entry, true);
+          }
+        }
+        for (const extra of extraEntries) {
+          const c = findCoin(extra.key);
+          if (c && typeof c.price === 'number' && c.price > 0) {
+            const entry: LiveTokenPriceEntry = {
+              symbol: extra.symbol,
+              priceUsd: c.price,
+              source: extra.key.startsWith('coingecko:') ? 'DEFILLAMA_CG' : 'DEFILLAMA_ONCHAIN',
+              updatedAt: c.timestamp ? c.timestamp * 1000 : updatedAt,
+            };
+            upsertGlobal(extra.symbol, entry, !prices[extra.symbol]);
+          }
+        }
+      }
+    } catch {
+      // keep CEX & on-chain pool prices if DeFiLlama transiently times out
+    }
+
+    // 3. Live on-chain DEX pool reads (liveAgent.poolsByChain) override/enrich chain prices
+    for (const chain of SUPPORTED_SCAN_CHAINS) {
+      const chainPools = liveAgent.poolsByChain[chain] || [];
+      for (const pool of chainPools) {
+        if (!(pool.priceUsd > 0)) continue;
+        const baseSym = pool.pair.split('/')[0];
+        if (!baseSym) continue;
+        sourcesUsed.add('ONCHAIN_DEX');
+        const entry: LiveTokenPriceEntry = {
+          symbol: baseSym,
+          priceUsd: pool.priceUsd,
+          source: `ONCHAIN_${pool.dex.toUpperCase().replace(/\s+/g, '_')}`,
+          updatedAt: pool.lastUpdated || updatedAt,
+        };
+        byChain[chain][baseSym] = entry;
+        byChain[chain][baseSym.toUpperCase()] = entry;
+        if (!prices[baseSym] || baseSym === 'WETH' || baseSym === 'ETH') {
+          upsertGlobal(baseSym, entry, baseSym === 'WETH');
+        }
+      }
+    }
+
+    if (prices['WETH']?.priceUsd > 0 && !prices['ETH']) {
+      upsertGlobal('ETH', { ...prices['WETH'], symbol: 'ETH' });
+    }
+
+    const ethUsd =
+      byChain.arbitrum['WETH']?.priceUsd ||
+      prices['WETH']?.priceUsd ||
+      prices['ETH']?.priceUsd ||
+      null;
+
+    const uniqueSymbols = new Set(Object.values(prices).map((v) => v.symbol.toUpperCase()));
+    const result: LiveTokenPriceFeedResult = {
+      prices,
+      byChain,
+      ethUsd,
+      tokenCount: uniqueSymbols.size,
+      updatedAt,
+      sources: Array.from(sourcesUsed),
+    };
+
+    cachedPriceFeed = result;
+    cachedPriceFeedExpiry = Date.now() + 15000;
+    return result;
+  })().finally(() => {
+    inFlightPriceFeedPromise = null;
+  });
+
+  return inFlightPriceFeedPromise;
+}
+
+flashArbRouter.get('/token-prices', async (req: Request, res: Response) => {
+  try {
+    const force = req.query.refresh === '1' || req.query.refresh === 'true';
+    const feed = await getLiveTokenPriceFeed(force);
+    return res.json({
+      success: true,
+      ...feed,
+    });
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err?.message || 'Failed fetching live token prices' });
+  }
+});
+
 function getLiveTokenUsdPrice(symbol: string, chain: SupportedArbChain = 'arbitrum'): number | null {
   const sym = symbol.toUpperCase();
-  if (['USDC', 'USDC.E', 'USDBC', 'USDT', 'DAI', 'FRAX', 'USDE'].includes(sym)) return 1.0;
-  if (sym === 'SUSDE') return 1.12;
   const preferredPools = liveAgent.poolsByChain[chain] || [];
   const allPools = [
     ...preferredPools,
     ...SUPPORTED_SCAN_CHAINS.flatMap((c) => (c === chain ? [] : liveAgent.poolsByChain[c] || [])),
   ];
   const ethPool = allPools.find((p) => p.pair === 'WETH/USDC');
-  const ethUsd = ethPool?.priceUsd || null;
+  const cachedChainPrice = cachedPriceFeed?.byChain?.[chain]?.[sym]?.priceUsd;
+  if (typeof cachedChainPrice === 'number' && cachedChainPrice > 0) return cachedChainPrice;
+  const cachedGlobalPrice = cachedPriceFeed?.prices?.[sym]?.priceUsd;
+  if (typeof cachedGlobalPrice === 'number' && cachedGlobalPrice > 0) return cachedGlobalPrice;
+
+  if (['USDC', 'USDC.E', 'USDBC', 'USDT', 'DAI', 'FRAX', 'USDE'].includes(sym)) return 1.0;
+  const ethUsd = ethPool?.priceUsd || cachedPriceFeed?.ethUsd || null;
   if (sym === 'ETH' || sym === 'WETH') return ethUsd;
   const directPool = allPools.find((p) => p.pair.toUpperCase().startsWith(`${sym}/`));
   if (directPool && directPool.priceUsd > 0) return directPool.priceUsd;
@@ -2996,7 +3603,9 @@ flashArbRouter.get('/holdings-overview', async (req: Request, res: Response) => 
     const defaultExtras =
       chain === 'arbitrum'
         ? ['0xeee31ff9e69904b43c124095b6f33aa61505bcc2', '0x19359c6C418669FCfC46196970814353b8766BE0']
-        : [];
+        : chain === 'base'
+          ? ['0x37440674a814f24d9C6ea0990b272215D40c4512', '0xBBA273E057cDa31bB359d8AA8749256246B6d0cC']
+          : [];
     const contractAddrs = normalizeExtraAddresses([
       DEPLOYED_CONTRACTS[chain],
       ...rawContracts,
@@ -3106,11 +3715,44 @@ flashArbRouter.get('/holdings-overview', async (req: Request, res: Response) => 
         ? connectedWallet
         : '';
 
-    const [gasWalletInfo, connectedWalletInfo, profitWalletInfo] = await Promise.all([
+    const [gasWalletRaw, connectedWalletInfo, profitWalletInfo, gasPriceResp] = await Promise.all([
       walletInspect(gasWallet),
       distinctConnected ? walletInspect(distinctConnected) : Promise.resolve(null),
       walletInspect(profitWallet),
+      fetchRpcSingleWithFailover(chain, 'eth_gasPrice', [], true).catch(() => ({ result: '0x5f5e100' })),
     ]);
+
+    const currentGasPriceWei =
+      typeof gasPriceResp?.result === 'string' && gasPriceResp.result.startsWith('0x')
+        ? BigInt(gasPriceResp.result)
+        : 100000000n;
+
+    let gasWalletInfo: (typeof gasWalletRaw & {
+      ethReserveFormatted?: string;
+      sweepableEthWei?: string;
+      sweepableEthFormatted?: string;
+      sweepableEthUsd?: number;
+    }) | null = gasWalletRaw;
+
+    if (gasWalletRaw) {
+      const gasBalWei = BigInt(gasWalletRaw.ethWei || '0');
+      const alloc = computeGasSurplusAllocation({
+        balanceWei: gasBalWei,
+        minReserveWei: DEFAULT_MIN_GAS_RESERVE_WEI,
+        transferGasUnits: 25000n,
+        gasPriceWei: currentGasPriceWei,
+      });
+      const ethNum = Number(ethers.formatEther(gasBalWei));
+      const ethPrice = ethNum > 0 && gasWalletRaw.ethUsd ? gasWalletRaw.ethUsd / ethNum : (getLiveTokenUsdPrice('WETH', chain) || 0);
+      const sweepableEthNum = Number(ethers.formatEther(alloc.sendWei));
+      gasWalletInfo = {
+        ...gasWalletRaw,
+        ethReserveFormatted: Number(ethers.formatEther(DEFAULT_MIN_GAS_RESERVE_WEI)).toFixed(4),
+        sweepableEthWei: alloc.sendWei.toString(),
+        sweepableEthFormatted: sweepableEthNum.toFixed(6),
+        sweepableEthUsd: Number((sweepableEthNum * ethPrice).toFixed(2)),
+      };
+    }
 
     const inspectedExtras =
       extraTokens.length > 0 ? await resolveVerifiedTokenList(chain, extraTokens) : [];
@@ -3141,6 +3783,8 @@ flashArbRouter.get('/holdings-overview', async (req: Request, res: Response) => 
 
     const sweepableContractCount = contracts.reduce((sum, c) => sum + c.compatibleNonZeroCount, 0);
     const sweepableGasCount = gasWalletInfo?.compatibleNonZeroCount || 0;
+    const sweepableGasEthCount =
+      gasWalletInfo?.sweepableEthWei && BigInt(gasWalletInfo.sweepableEthWei) > 0n ? 1 : 0;
     const sweepableConnectedCount = connectedWalletInfo?.compatibleNonZeroCount || 0;
 
     return res.json({
@@ -3160,8 +3804,10 @@ flashArbRouter.get('/holdings-overview', async (req: Request, res: Response) => 
         accessibleContractsCount: contracts.filter((c) => c.accessibleForSweep).length,
         sweepableContractAssetsCount: sweepableContractCount,
         sweepableGasWalletTokensCount: sweepableGasCount,
+        sweepableGasWalletEthCount: sweepableGasEthCount,
         sweepableConnectedWalletTokensCount: sweepableConnectedCount,
-        totalSweepableAssetsCount: sweepableContractCount + sweepableGasCount + sweepableConnectedCount,
+        totalSweepableAssetsCount:
+          sweepableContractCount + sweepableGasCount + sweepableGasEthCount + sweepableConnectedCount,
       },
       timestamp: Date.now(),
     });
@@ -3190,6 +3836,12 @@ flashArbRouter.post('/sweep-all', async (req: Request, res: Response) => {
     const extraContracts = Array.isArray(req.body?.extraContracts) ? req.body.extraContracts : [];
     const extraTokenSpecs = normalizeExtraTokenSpecs(req.body?.extraTokenAddresses);
     const includeGasWalletTokens = Boolean(req.body?.includeGasWalletTokens);
+    const includeGasWalletEthSurplus = Boolean(req.body?.includeGasWalletEthSurplus);
+    const rawMinReserveEth = Number(req.body?.minGasReserveEth);
+    const minGasReserveWei =
+      Number.isFinite(rawMinReserveEth) && rawMinReserveEth >= 0.001
+        ? ethers.parseEther(rawMinReserveEth.toFixed(6))
+        : DEFAULT_MIN_GAS_RESERVE_WEI;
     const includeConnectedWalletTokens = Boolean(req.body?.includeConnectedWalletTokens);
     const connectedWalletAddress = String(req.body?.connectedWalletAddress || '').trim();
     const compatibleOnly = req.body?.compatibleOnly !== false;
@@ -3606,6 +4258,59 @@ flashArbRouter.post('/sweep-all', async (req: Request, res: Response) => {
       }
     }
 
+    // Phase 2B: Sweep excess native ETH above operational reserve (`minGasReserveWei`, default 0.002 ETH)
+    // from Gas Signer Wallet -> Profit Vault
+    let gasSurplusStatus: {
+      checked: boolean;
+      sweptEth: string;
+      txHash?: string;
+      reserveKeptEth: string;
+      note?: string;
+    } | null = null;
+    if (includeGasWalletEthSurplus && signerAddress && cleanKey && recipient.toLowerCase() !== signerAddress.toLowerCase()) {
+      const reserveEthStr = Number(ethers.formatEther(minGasReserveWei)).toFixed(4);
+      try {
+        const ethSweep = await sweepGasWalletEthSurplus({
+          chain,
+          cleanKey,
+          signerAddress,
+          recipient,
+          minReserveWei: minGasReserveWei,
+        });
+        if (ethSweep.swept && ethSweep.txHash) {
+          sweptAssets.push({
+            source: signerAddress,
+            asset: 'ETH (Gas Surplus)',
+            amount: ethSweep.sentEthFormatted,
+            method: `Gas Wallet Surplus -> Profit Vault (${reserveEthStr} ETH reserve kept)`,
+            txHash: ethSweep.txHash,
+            explorerUrl: ethSweep.explorerUrl || `${rpcInfo.explorer}/tx/${ethSweep.txHash}`,
+            recipient,
+          });
+          gasSurplusStatus = {
+            checked: true,
+            sweptEth: ethSweep.sentEthFormatted,
+            txHash: ethSweep.txHash,
+            reserveKeptEth: reserveEthStr,
+          };
+        } else {
+          gasSurplusStatus = {
+            checked: true,
+            sweptEth: '0',
+            reserveKeptEth: reserveEthStr,
+            note: ethSweep.reason,
+          };
+        }
+      } catch (err: any) {
+        gasSurplusStatus = {
+          checked: true,
+          sweptEth: '0',
+          reserveKeptEth: reserveEthStr,
+          note: err?.message || 'Gas surplus sweep skipped',
+        };
+      }
+    }
+
     // Phase 3: Prepare compatible ERC-20 / ERC-2612 / ERC-4626 / ERC-777 / ERC-721 / ERC-1155 sweeps
     // from Connected Web3 Wallet -> Profit Vault (never drains native ETH!)
     if (
@@ -3700,6 +4405,7 @@ flashArbRouter.post('/sweep-all', async (req: Request, res: Response) => {
       requiresWalletSigning,
       skippedIncompatible,
       errors,
+      gasSurplusStatus,
       message,
       timestamp: Date.now(),
     });

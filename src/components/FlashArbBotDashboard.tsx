@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import {
   Zap,
   Shield,
@@ -47,6 +47,7 @@ import {
 import { buildZipArchive, triggerBinaryZipDownload } from '../utils/zipGenerator';
 import {
   ARB_TOKENS,
+  getChainTokenConfigs,
   SUPPORTED_DEX_POOLS,
   FLASH_LOAN_PROVIDERS,
   GAS_OPTIMIZATION_PROFILES,
@@ -123,7 +124,7 @@ export const CHAIN_CONFIG_MAP: Record<'arbitrum' | 'base' | 'optimism', ChainMet
     chainIdHex: '0x2105',
     chainIdDec: 8453,
     explorer: 'https://basescan.org',
-    contract: '0x29B35c83955146Ba8fd754B4b96956D245A5661e',
+    contract: '0x37440674a814f24d9C6ea0990b272215D40c4512',
     icon: '🟡',
     currency: 'ETH',
     rpcUrl: 'https://mainnet.base.org',
@@ -208,9 +209,20 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
   const [maxSpreadDiscoveredBps, setMaxSpreadDiscoveredBps] = useState<number>(0);
   const [preflightSimulationsCount, setPreflightSimulationsCount] = useState<number>(0);
   const [liveEthPrice, setLiveEthPrice] = useState<number>(() => {
-    const ethAsset = availableAssets.find((a) => a.symbol === 'ETH' || a.symbol === 'WETH');
-    return ethAsset ? ethAsset.price : 0; // 0 = not yet known; never a guessed price
+    const ethAsset = availableAssets.find((a) => {
+      const base = a.symbol.split('/')[0].toUpperCase();
+      return base === 'ETH' || base === 'WETH';
+    });
+    return ethAsset && ethAsset.price > 0 ? ethAsset.price : 0; // 0 = not yet known; never a guessed price
   });
+  const [liveTokenPrices, setLiveTokenPrices] = useState<{
+    prices: Record<string, { symbol: string; priceUsd: number; source: string; updatedAt: number }>;
+    byChain?: Record<string, Record<string, { symbol: string; priceUsd: number; source: string; updatedAt: number }>>;
+    ethUsd?: number | null;
+    tokenCount?: number;
+    updatedAt?: number;
+    sources?: string[];
+  } | null>(null);
 
   // Connected Wallet Live Chain State & Verification
   const [walletChainId, setWalletChainId] = useState<string | null>(null);
@@ -309,9 +321,15 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
       savedArb && savedArb.toLowerCase() !== '0x19359c6c418669fcfc46196970814353b8766be0'
         ? savedArb
         : CHAIN_CONFIG_MAP.arbitrum.contract;
+    const savedBase = localStorage.getItem('flash_arb_contract_base');
+    // Upgrade legacy undeployed Base default 0x29B3...661e to deployed FlashArbOptimized 0x3744...4512
+    const baseContract =
+      savedBase && savedBase.toLowerCase() !== '0x29b35c83955146ba8fd754b4b96956d245a5661e'
+        ? savedBase
+        : CHAIN_CONFIG_MAP.base.contract;
     return {
       arbitrum: arbContract,
-      base: localStorage.getItem('flash_arb_contract_base') || CHAIN_CONFIG_MAP.base.contract,
+      base: baseContract,
       optimism: localStorage.getItem('flash_arb_contract_optimism') || CHAIN_CONFIG_MAP.optimism.contract,
     };
   });
@@ -418,6 +436,10 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
       address: string;
       eth: string;
       ethUsd: number | null;
+      ethReserveFormatted?: string;
+      sweepableEthWei?: string;
+      sweepableEthFormatted?: string;
+      sweepableEthUsd?: number;
       nonZeroTokens: Array<{
         symbol: string;
         address: string;
@@ -497,6 +519,7 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
       accessibleContractsCount: number;
       sweepableContractAssetsCount: number;
       sweepableGasWalletTokensCount: number;
+      sweepableGasWalletEthCount?: number;
       sweepableConnectedWalletTokensCount: number;
       totalSweepableAssetsCount: number;
     };
@@ -505,6 +528,13 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
   const [extraTokensInput, setExtraTokensInput] = useState<string>('');
   const [isSweepingAll, setIsSweepingAll] = useState<boolean>(false);
   const [includeGasWalletTokensInSweep, setIncludeGasWalletTokensInSweep] = useState<boolean>(false);
+  const [includeGasWalletEthSurplusInSweep, setIncludeGasWalletEthSurplusInSweep] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('flash_arb_sweep_gas_eth_surplus') !== 'false';
+    } catch {
+      return true;
+    }
+  });
   const [includeConnectedWalletTokensInSweep, setIncludeConnectedWalletTokensInSweep] = useState<boolean>(false);
   const [autoSweepEndOfCycle, setAutoSweepEndOfCycle] = useState<boolean>(() => {
     try {
@@ -522,6 +552,7 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
     okxConnectedAddress,
     isSignerKeyConfigured: false,
     includeGasWalletTokensInSweep,
+    includeGasWalletEthSurplusInSweep,
     includeConnectedWalletTokensInSweep,
     profitWalletAddress,
     selectedChain,
@@ -717,7 +748,9 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
       const contractList =
         selectedChain === 'arbitrum'
           ? [primaryAddr, '0xeee31ff9e69904b43c124095b6f33aa61505bcc2', '0x19359c6C418669FCfC46196970814353b8766BE0']
-          : [primaryAddr];
+          : selectedChain === 'base'
+            ? [primaryAddr, '0x37440674a814f24d9C6ea0990b272215D40c4512', '0xBBA273E057cDa31bB359d8AA8749256246B6d0cC']
+            : [primaryAddr];
       const extraList = parseExtraTokenAddresses(extraRaw ?? extraTokensInput);
       const params = new URLSearchParams({
         chain: selectedChain,
@@ -747,6 +780,7 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
     autoTriggered?: boolean;
     cycleLabel?: string;
     includeGasOverride?: boolean;
+    includeGasEthOverride?: boolean;
     includeConnectedOverride?: boolean;
   }) => {
     if (!isValidEvmAddress(profitWalletAddress)) {
@@ -756,6 +790,7 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
       return;
     }
     const includeGas = options?.includeGasOverride ?? includeGasWalletTokensInSweep;
+    const includeGasEthSurplus = options?.includeGasEthOverride ?? includeGasWalletEthSurplusInSweep;
     const includeConnected = options?.includeConnectedOverride ?? includeConnectedWalletTokensInSweep;
 
     setIsSweepingAll(true);
@@ -774,10 +809,14 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
           extraContracts:
             selectedChain === 'arbitrum'
               ? ['0xeee31ff9e69904b43c124095b6f33aa61505bcc2', '0x19359c6C418669FCfC46196970814353b8766BE0']
-              : [],
+              : selectedChain === 'base'
+                ? ['0x37440674a814f24d9C6ea0990b272215D40c4512', '0xBBA273E057cDa31bB359d8AA8749256246B6d0cC']
+                : [],
           extraTokenAddresses,
           recipient: profitWalletAddress.trim(),
           includeGasWalletTokens: includeGas,
+          includeGasWalletEthSurplus: includeGasEthSurplus,
+          minGasReserveEth: 0.002,
           includeConnectedWalletTokens: includeConnected,
           connectedWalletAddress: okxConnectedAddress || undefined,
           compatibleOnly: true,
@@ -835,10 +874,14 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
       const prefix = options?.autoTriggered
         ? `End-of-cycle dust sweep (${options.cycleLabel || 'Cycle Complete'}): `
         : '';
+      const gasNoteSuffix =
+        data.gasSurplusStatus?.note && !data.gasSurplusStatus.swept && includeGasEthSurplus
+          ? ` (${data.gasSurplusStatus.note})`
+          : '';
       const finalMsg =
         combinedSwept.length > 0
-          ? `${prefix}Swept ${combinedSwept.length} compatible ERC-20/1155/ETH asset holding(s) to Profit Vault ${formatShortAddress(profitWalletAddress)}.`
-          : `${prefix}${data.message || 'Sweep check completed cleanly.'}`;
+          ? `${prefix}Swept ${combinedSwept.length} compatible ERC-20/1155/ETH asset holding(s) to Profit Vault ${formatShortAddress(profitWalletAddress)}.${gasNoteSuffix}`
+          : `${prefix}${data.message || 'Sweep check completed cleanly.'}${gasNoteSuffix}`;
 
       setSweepAllNotice({
         success: true,
@@ -887,6 +930,10 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
       const gasDustCount = rt.isSignerKeyConfigured
         ? overview.summary.sweepableGasWalletTokensCount || 0
         : 0;
+      const gasEthDustCount =
+        rt.isSignerKeyConfigured && rt.includeGasWalletEthSurplusInSweep
+          ? overview.summary.sweepableGasWalletEthCount || 0
+          : 0;
       const canSweepConnected = Boolean(
         rt.okxConnectedAddress &&
           rt.okxConnectedAddress.toLowerCase() !== rt.profitWalletAddress.toLowerCase() &&
@@ -896,12 +943,12 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
         ? overview.summary.sweepableConnectedWalletTokensCount || 0
         : 0;
 
-      const totalSweepableDust = contractDustCount + gasDustCount + connectedDustCount;
+      const totalSweepableDust = contractDustCount + gasDustCount + gasEthDustCount + connectedDustCount;
 
       if (totalSweepableDust <= 0) {
         setSweepAllNotice({
           success: true,
-          message: `End-of-cycle scan (${cycleLabel}): 0 compatible ERC-20/1155 dust tokens detected across contracts or wallets — Profit Vault ${formatShortAddress(profitWalletAddress)} is clean.`,
+          message: `End-of-cycle scan (${cycleLabel}): 0 compatible dust tokens or excess Gas ETH (> 0.002 ETH reserve) detected — Profit Vault ${formatShortAddress(profitWalletAddress)} is clean.`,
         });
         return;
       }
@@ -909,6 +956,7 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
       if (
         contractDustCount > 0 &&
         gasDustCount === 0 &&
+        gasEthDustCount === 0 &&
         connectedDustCount === 0 &&
         !isSignerKeyConfigured &&
         !options?.allowWalletPrompt
@@ -923,7 +971,8 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
       await executeSweepAllBalances({
         autoTriggered: true,
         cycleLabel,
-        includeGasOverride: gasDustCount > 0 || includeGasWalletTokensInSweep,
+        includeGasOverride: gasDustCount > 0 || rt.includeGasWalletTokensInSweep,
+        includeGasEthOverride: gasEthDustCount > 0 || rt.includeGasWalletEthSurplusInSweep,
         includeConnectedOverride: canSweepConnected && connectedDustCount > 0,
       });
     } finally {
@@ -987,6 +1036,28 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
               recipient: profitWalletAddress,
             }),
           }).catch(() => {});
+          const walletOpp = data.opportunity;
+          const walletProfitUsd = Number(walletOpp?.estNetProfitUsd ?? 0);
+          const walletLoanNotionalUsd = Number(walletOpp?.loanAmount ?? 0) * Number(walletOpp?.buyPrice ?? 0);
+          const walletLoanSavedUsd = walletLoanNotionalUsd > 0 ? Number((walletLoanNotionalUsd * 0.0005).toFixed(4)) : 0;
+          if (walletLoanSavedUsd > 0) {
+            setCumulativeLoanFeesSaved((prev) => {
+              const next = Number((prev + walletLoanSavedUsd).toFixed(2));
+              localStorage.setItem('flash_arb_loan_fees_saved', next.toString());
+              return next;
+            });
+          }
+          if (onArbitrageExecuted && walletProfitUsd > 0) {
+            onArbitrageExecuted({
+              symbol: walletOpp?.loanToken || 'WETH',
+              profitUsd: walletProfitUsd,
+              chain: CHAIN_CONFIG_MAP[selectedChain].name,
+              txHash: hash,
+              token: walletOpp?.loanToken || 'WETH',
+              gasSavedUsd: 0,
+              loanFeeSavedUsd: walletLoanSavedUsd,
+            });
+          }
           await Promise.all([fetchProfitWalletBalances(), fetchContractBalances(), fetchAgentStatus()]);
           if (autoSweepEndOfCycleRef.current) {
             await runEndOfCycleDustSweep('Wallet Execution Cycle', { allowWalletPrompt: true });
@@ -1000,6 +1071,9 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
         lastAutoSweptTradeTxRef.current = txHash;
         setLastConfirmedTxHash(txHash);
         const profitUsd = Number(data.trade?.netProfitUsd ?? data.opportunity?.estNetProfitUsd ?? 0);
+        const gasSavedUsd = Number(data.gasSavedUsd ?? data.trade?.gasSavedUsd ?? 0);
+        const loanFeeSavedUsd = Number(data.loanFeeSavedUsd ?? data.trade?.loanFeeSavedUsd ?? 0);
+
         setLiveExecutionSuccess({
           txHash,
           chain: CHAIN_CONFIG_MAP[selectedChain].name,
@@ -1007,7 +1081,9 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
           profitUsd,
           recipient: data.recipient || profitWalletAddress,
           timestamp: new Date().toLocaleTimeString(),
-          blockLatency: 'verified',
+          blockLatency: data.gasSweepTxHash
+            ? `verified (+${data.gasSavedEthSwept} ETH gas surplus swept)`
+            : 'verified',
         });
         setTotalRealizedAlpha((prev) => {
           const next = Number((prev + Math.max(0, profitUsd)).toFixed(2));
@@ -1019,6 +1095,31 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
           localStorage.setItem('flash_arb_executions_count', next.toString());
           return next;
         });
+        if (gasSavedUsd > 0) {
+          setCumulativeGasSaved((prev) => {
+            const next = Number((prev + gasSavedUsd).toFixed(2));
+            localStorage.setItem('flash_arb_gas_saved', next.toString());
+            return next;
+          });
+        }
+        if (loanFeeSavedUsd > 0) {
+          setCumulativeLoanFeesSaved((prev) => {
+            const next = Number((prev + loanFeeSavedUsd).toFixed(2));
+            localStorage.setItem('flash_arb_loan_fees_saved', next.toString());
+            return next;
+          });
+        }
+        if (onArbitrageExecuted) {
+          onArbitrageExecuted({
+            symbol: data.sweptToken || data.opportunity?.loanToken || 'WETH',
+            profitUsd,
+            chain: CHAIN_CONFIG_MAP[selectedChain].name,
+            txHash,
+            token: data.sweptToken || data.opportunity?.loanToken || 'WETH',
+            gasSavedUsd,
+            loanFeeSavedUsd,
+          });
+        }
       }
       await Promise.all([fetchProfitWalletBalances(), fetchContractBalances(), fetchAgentStatus()]);
       if (autoSweepEndOfCycleRef.current) {
@@ -1229,6 +1330,7 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
       okxConnectedAddress,
       isSignerKeyConfigured,
       includeGasWalletTokensInSweep,
+      includeGasWalletEthSurplusInSweep,
       includeConnectedWalletTokensInSweep,
       profitWalletAddress,
       selectedChain,
@@ -1239,6 +1341,7 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
     okxConnectedAddress,
     isSignerKeyConfigured,
     includeGasWalletTokensInSweep,
+    includeGasWalletEthSurplusInSweep,
     includeConnectedWalletTokensInSweep,
     profitWalletAddress,
     selectedChain,
@@ -1279,9 +1382,77 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
     }
   };
 
-  // Dynamically resolve live ETH price from live quotes or available assets
+  // Fetch real-time multi-source token price feed (On-chain DEX + DeFiLlama + CEX)
+  const fetchLiveTokenPrices = async () => {
+    try {
+      const res = await fetch('/api/flash-arb/token-prices');
+      if (res.ok) {
+        const data = await res.json();
+        if (data.success && data.prices) {
+          setLiveTokenPrices({
+            prices: data.prices,
+            byChain: data.byChain,
+            ethUsd: data.ethUsd,
+            tokenCount: data.tokenCount,
+            updatedAt: data.updatedAt,
+            sources: data.sources,
+          });
+          if (typeof data.ethUsd === 'number' && data.ethUsd > 100) {
+            setLiveEthPrice(Number(data.ethUsd.toFixed(2)));
+          }
+        }
+      }
+    } catch {}
+  };
+
+  // Resolve live token USD price from backend multi-token feed, exact market ticker, or on-chain pool
+  const resolveLiveTokenPrice = (symbol: string): number | null => {
+    const raw = (symbol || '').trim();
+    if (!raw) return null;
+    const upper = raw.toUpperCase();
+
+    const chainEntry =
+      liveTokenPrices?.byChain?.[selectedChain]?.[raw] ||
+      liveTokenPrices?.byChain?.[selectedChain]?.[upper];
+    if (chainEntry && chainEntry.priceUsd > 0) return chainEntry.priceUsd;
+
+    const globalEntry =
+      liveTokenPrices?.prices?.[raw] ||
+      liveTokenPrices?.prices?.[upper];
+    if (globalEntry && globalEntry.priceUsd > 0) return globalEntry.priceUsd;
+
+    const exactAsset = availableAssets.find((a) => {
+      const base = a.symbol.split('/')[0].toUpperCase();
+      return (
+        base === upper ||
+        (upper === 'WETH' && base === 'ETH') ||
+        (upper === 'WBTC' && base === 'BTC') ||
+        (upper === 'CBBTC' && base === 'BTC') ||
+        (upper === 'TBTC' && base === 'BTC')
+      );
+    });
+    if (exactAsset && exactAsset.price > 0) return exactAsset.price;
+
+    const directPool = agentMonitoredPools.find(
+      (p) => typeof p?.pair === 'string' && p.pair.split('/')[0].toUpperCase() === upper && p.priceUsd > 0
+    );
+    if (directPool) return directPool.priceUsd;
+
+    return null;
+  };
+
+  // Dynamically resolve live ETH price from live multi-token feed, available assets, or live market quotes
   useEffect(() => {
-    const ethAsset = availableAssets.find((a) => a.symbol === 'ETH' || a.symbol === 'WETH');
+    const ethFromFeed = liveTokenPrices?.ethUsd;
+    if (typeof ethFromFeed === 'number' && ethFromFeed > 100) {
+      setLiveEthPrice(Number(ethFromFeed.toFixed(2)));
+      return;
+    }
+
+    const ethAsset = availableAssets.find((a) => {
+      const base = a.symbol.split('/')[0].toUpperCase();
+      return base === 'ETH' || base === 'WETH';
+    });
     if (ethAsset && ethAsset.price > 0) {
       setLiveEthPrice(ethAsset.price);
       return;
@@ -1300,7 +1471,13 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
     fetchEth();
     const interval = setInterval(fetchEth, 20000);
     return () => clearInterval(interval);
-  }, [availableAssets]);
+  }, [availableAssets, liveTokenPrices]);
+
+  useEffect(() => {
+    fetchLiveTokenPrices();
+    const priceInterval = setInterval(fetchLiveTokenPrices, 15000);
+    return () => clearInterval(priceInterval);
+  }, []);
 
   // Initial queries + sync wallet config to server runtime
   useEffect(() => {
@@ -1338,9 +1515,14 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
             savedArb && savedArb.toLowerCase() !== '0x19359c6c418669fcfc46196970814353b8766be0'
               ? savedArb
               : data.contracts.arbitrum || CHAIN_CONFIG_MAP.arbitrum.contract;
+          const savedBase = localStorage.getItem('flash_arb_contract_base');
+          const resolvedBase =
+            savedBase && savedBase.toLowerCase() !== '0x29b35c83955146ba8fd754b4b96956d245a5661e'
+              ? savedBase
+              : data.contracts.base || CHAIN_CONFIG_MAP.base.contract;
           setDeployedContracts((prev) => ({
             arbitrum: resolvedArb || prev.arbitrum,
-            base: localStorage.getItem('flash_arb_contract_base') || data.contracts.base || prev.base,
+            base: resolvedBase || prev.base,
             optimism: localStorage.getItem('flash_arb_contract_optimism') || data.contracts.optimism || prev.optimism,
           }));
         }
@@ -1404,7 +1586,11 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
           setDeployedContracts((prev) => ({ ...prev, arbitrum: settings.arbitrumContract! }));
           localStorage.setItem('flash_arb_contract_arbitrum', settings.arbitrumContract);
         }
-        if (settings.baseContract && isValidEvmAddress(settings.baseContract)) {
+        if (
+          settings.baseContract &&
+          isValidEvmAddress(settings.baseContract) &&
+          settings.baseContract.toLowerCase() !== '0x29b35c83955146ba8fd754b4b96956d245a5661e'
+        ) {
           setDeployedContracts((prev) => ({ ...prev, base: settings.baseContract! }));
           localStorage.setItem('flash_arb_contract_base', settings.baseContract);
         }
@@ -1628,16 +1814,33 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
     : 'Unknown Network';
 
   const handleSwitchChain = async (targetChainKey: 'arbitrum' | 'base' | 'optimism') => {
-    setIsSwitchingChain(true);
+    setSelectedChain(targetChainKey);
+    const nextChainTokens = getChainTokenConfigs(targetChainKey);
+    setScanTokenFilter((prev) =>
+      prev === 'ALL' || nextChainTokens.some((t) => t.symbol === prev) ? prev : 'ALL'
+    );
+    setSimToken((prev) =>
+      nextChainTokens.some((t) => t.symbol === prev) ? prev : 'WETH'
+    );
     setLiveExecutionError(null);
+
+    const hasInjectedProvider =
+      Boolean(okxConnectedAddress) ||
+      (typeof window !== 'undefined' && Boolean((window as any).okxwallet || (window as any).ethereum));
+    if (!hasInjectedProvider) {
+      return;
+    }
+
+    setIsSwitchingChain(true);
     try {
       const cfg = CHAIN_CONFIG_MAP[targetChainKey];
       await switchOkxChain(cfg.chainIdHex);
       setWalletChainId(cfg.chainIdHex);
-      setSelectedChain(targetChainKey);
     } catch (e: any) {
       console.warn('Chain switch note:', e);
-      setLiveExecutionError(`Chain switch: ${e.message || 'Please approve network change in your wallet'}`);
+      if (okxConnectedAddress) {
+        setLiveExecutionError(`Wallet network switch note: ${e.message || 'Please approve network change in your wallet'}`);
+      }
     } finally {
       setIsSwitchingChain(false);
     }
@@ -1874,7 +2077,7 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
   const [tokenCategoryFilter, setTokenCategoryFilter] = useState<'All' | 'Major' | 'LST / LRT' | 'Ecosystem' | 'DeFi' | 'Meme' | 'Stablecoin'>('All');
   const [simLoanAmount, setSimLoanAmount] = useState<number>(25);
   const [simDexA, setSimDexA] = useState<string>('Uniswap V3 (0.05% Tick)');
-  const [simDexB, setSimDexB] = useState<string>('Camelot V3 (Algebra Engine)');
+  const [simDexB, setSimDexB] = useState<string>('PancakeSwap V3');
   const [simSpreadBps, setSimSpreadBps] = useState<number>(28);
   const [simMinProfitUsd, setSimMinProfitUsd] = useState<number>(8.0);
   const [selectedFlashProvider, setSelectedFlashProvider] = useState<FlashLoanProviderId>('BALANCER_V2');
@@ -1907,8 +2110,37 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
   const [isDownloading, setIsDownloading] = useState(false);
   const [downloadNotice, setDownloadNotice] = useState<string | null>(null);
 
-  // Active token config helper
-  const currentTokenConfig = ARB_TOKENS.find((t) => t.symbol === simToken) || ARB_TOKENS[0];
+  // Active chain token & DEX helpers
+  const activeChainTokens = useMemo(() => getChainTokenConfigs(selectedChain), [selectedChain]);
+  const activeChainDexPools = useMemo(() => {
+    const chainLabel = selectedChain === 'base' ? 'Base' : selectedChain === 'optimism' ? 'Optimism' : 'Arbitrum';
+    return SUPPORTED_DEX_POOLS.filter((d) => d.chains.includes(chainLabel));
+  }, [selectedChain]);
+
+  useEffect(() => {
+    if (!activeChainTokens.some((t) => t.symbol === simToken) && activeChainTokens[0]) {
+      setSimToken(activeChainTokens[0].symbol);
+      setSimLoanAmount(activeChainTokens[0].defaultLoan);
+      setSimSpreadBps(activeChainTokens[0].typicalSpreadBps);
+    }
+    const dexNames = new Set(activeChainDexPools.map((d) => d.name));
+    if (!dexNames.has(simDexA) && activeChainDexPools[0]) {
+      setSimDexA(activeChainDexPools.find((d) => d.name.includes('0.05%'))?.name || activeChainDexPools[0].name);
+    }
+    if (!dexNames.has(simDexB)) {
+      const preferredB =
+        activeChainDexPools.find((d) => d.name === 'PancakeSwap V3') ||
+        activeChainDexPools.find((d) => d.name === 'SushiSwap V3') ||
+        activeChainDexPools[1] ||
+        activeChainDexPools[0];
+      if (preferredB) setSimDexB(preferredB.name);
+    }
+  }, [selectedChain, activeChainTokens, activeChainDexPools]);
+
+  const currentTokenConfig =
+    activeChainTokens.find((t) => t.symbol === simToken) ||
+    ARB_TOKENS.find((t) => t.symbol === simToken) ||
+    activeChainTokens[0];
   const currentGasProfile = GAS_OPTIMIZATION_PROFILES[selectedGasOptimization];
   const currentFlashProvider = FLASH_LOAN_PROVIDERS.find((p) => p.id === selectedFlashProvider) || FLASH_LOAN_PROVIDERS[0];
 
@@ -1959,10 +2191,10 @@ RPC_BASE_WS=wss://base-mainnet.public.blastapi.io
   const handleRunSimulation = () => {
     setPreflightSimulationsCount((c) => c + 1);
     // Inputs must be REAL. If any is unavailable the calculation is refused rather than guessed.
-    const matchedAsset = availableAssets.find((a) => a.symbol.includes(simToken));
+    const liveTokenPrice = resolveLiveTokenPrice(simToken);
     const gasPriceGweiLive = gasStatus?.[selectedChain]?.gasPriceGwei;
-    if (!matchedAsset || !(matchedAsset.price > 0)) {
-      setSimError(`No live price for ${simToken}; cannot run the calculation.`);
+    if (!(typeof liveTokenPrice === 'number' && liveTokenPrice > 0)) {
+      setSimError(`Live feed price for ${simToken} unavailable yet; click Refresh or wait for next 15s price sync.`);
       return;
     }
     if (!(liveEthPrice > 0)) {
@@ -1974,7 +2206,7 @@ RPC_BASE_WS=wss://base-mainnet.public.blastapi.io
       return;
     }
     setSimError(null);
-    const tokenPrice = matchedAsset.price;
+    const tokenPrice = liveTokenPrice;
     const loanNotionalUsd = simLoanAmount * tokenPrice;
 
     // Flash Loan Protocol Fee (0.00% for Balancer & Spark, 0.05% for Aave/Uniswap)
@@ -2080,7 +2312,7 @@ RPC_BASE_WS=wss://base-mainnet.public.blastapi.io
               <span className="text-emerald-300">0% Balancer Vault + EIP-1153</span>
               <span className="text-slate-600">·</span>
               <span>
-                {ARB_TOKENS.length} Tokens · {agentMonitoredPools.length || (agentCountsByChain ? agentCountsByChain[selectedChain] : (selectedChain === 'base' ? 41 : selectedChain === 'optimism' ? 26 : 70))} {targetChainConfig.name.split(' ')[0]} Pools
+                {activeChainTokens.length} Tokens · {agentMonitoredPools.length || (agentCountsByChain ? agentCountsByChain[selectedChain] : (selectedChain === 'base' ? 95 : selectedChain === 'optimism' ? 26 : 70))} {targetChainConfig.name.split(' ')[0]} Pools
               </span>
             </div>
 
@@ -2088,7 +2320,7 @@ RPC_BASE_WS=wss://base-mainnet.public.blastapi.io
               Multi-Chain Flash Loan Arbitrage Engine
             </h1>
             <p className="text-xs sm:text-sm text-slate-300 max-w-3xl leading-relaxed">
-              Zero-capital atomic arbitrage across <strong className="text-white font-mono">Arbitrum · Base · Optimism</strong> ({agentCountsByChain ? agentCountsByChain.arbitrum + agentCountsByChain.base + agentCountsByChain.optimism : 137} live pools) with direct pool callbacks and EIP-1153 transient storage.
+              Zero-capital atomic arbitrage across <strong className="text-white font-mono">Arbitrum · Base · Optimism</strong> ({agentCountsByChain ? agentCountsByChain.arbitrum + agentCountsByChain.base + agentCountsByChain.optimism : 191} live pools) with direct pool callbacks and EIP-1153 transient storage.
             </p>
           </div>
 
@@ -2566,6 +2798,17 @@ RPC_BASE_WS=wss://base-mainnet.public.blastapi.io
                       </div>
                     ))}
                   </div>
+                  {holdingsOverview?.gasWallet?.sweepableEthFormatted &&
+                    Number(holdingsOverview.gasWallet.sweepableEthFormatted) > 0 && (
+                      <div className="flex items-center justify-between px-2.5 py-1.5 rounded-lg bg-emerald-950/40 border border-emerald-500/30 text-[10px] font-mono">
+                        <span className="text-emerald-300">
+                          Excess above {holdingsOverview.gasWallet.ethReserveFormatted || '0.0020'} ETH reserve:
+                        </span>
+                        <span className="text-emerald-400 font-bold">
+                          +{holdingsOverview.gasWallet.sweepableEthFormatted} ETH (~${(holdingsOverview.gasWallet.sweepableEthUsd || 0).toFixed(2)}) &rarr; Profit Vault
+                        </span>
+                      </div>
+                    )}
                 </div>
 
                 {/* Private Key Signer Status Bar */}
@@ -3060,7 +3303,28 @@ RPC_BASE_WS=wss://base-mainnet.public.blastapi.io
                           onChange={(e) => setIncludeGasWalletTokensInSweep(e.target.checked)}
                           className="rounded bg-slate-900 border-slate-700 text-emerald-500 focus:ring-0 cursor-pointer"
                         />
-                        <span>Also sweep compatible ERC-20/1155s from Gas Wallet (keeps ETH gas)</span>
+                        <span>Also sweep compatible ERC-20/1155s from Gas Wallet (keeps 0.002 ETH reserve)</span>
+                      </label>
+                      <label className="flex items-center gap-1.5 text-[11px] text-emerald-200 font-sans cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={includeGasWalletEthSurplusInSweep}
+                          onChange={(e) => {
+                            const next = e.target.checked;
+                            setIncludeGasWalletEthSurplusInSweep(next);
+                            try {
+                              localStorage.setItem('flash_arb_sweep_gas_eth_surplus', String(next));
+                            } catch {}
+                          }}
+                          className="rounded bg-slate-900 border-slate-700 text-emerald-500 focus:ring-0 cursor-pointer"
+                        />
+                        <span>
+                          Forward excess Gas Wallet ETH savings above 0.002 ETH reserve &rarr; Profit Vault
+                          {holdingsOverview?.gasWallet?.sweepableEthFormatted &&
+                          Number(holdingsOverview.gasWallet.sweepableEthFormatted) > 0
+                            ? ` (+${holdingsOverview.gasWallet.sweepableEthFormatted} ETH ready)`
+                            : ''}
+                        </span>
                       </label>
                       {okxConnectedAddress &&
                         okxConnectedAddress.toLowerCase() !== profitWalletAddress.toLowerCase() &&
@@ -3799,7 +4063,7 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
             <Activity className="h-3 w-3 text-indigo-400" />
           </div>
           <div className="text-lg sm:text-xl font-black text-indigo-300 tracking-tight">
-            {poolsScannedCount > 0 ? poolsScannedCount : (agentCountsByChain?.[selectedChain] ?? (selectedChain === 'base' ? 41 : selectedChain === 'optimism' ? 26 : 70))} <span className="text-xs font-bold">Pools</span>
+            {poolsScannedCount > 0 ? poolsScannedCount : (agentCountsByChain?.[selectedChain] ?? (selectedChain === 'base' ? 95 : selectedChain === 'optimism' ? 26 : 70))} <span className="text-xs font-bold">Pools</span>
           </div>
           <div className="text-[10px] text-slate-400 truncate font-sans">
             Peak Spread: <strong className="text-emerald-400 font-mono">{maxSpreadDiscoveredBps > 0 ? `+${maxSpreadDiscoveredBps.toFixed(1)} bps` : '0.0 bps'}</strong>
@@ -4257,24 +4521,27 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
                 chainKey: 'arbitrum' as const,
                 chain: 'Arbitrum One',
                 chainId: 42161,
+                tokenCount: 20,
                 poolCount: agentCountsByChain?.arbitrum ?? 70,
                 dexes: 'Uniswap V3, PancakeSwap V3, SushiSwap V3, Sushiswap V2, Camelot V3, Camelot V2',
-                executionSupport: 'Full On-Chain Execution',
+                executionSupport: contractDeploymentStatus.arbitrum?.isDeployed === false ? 'Deploy Contract to Exec' : 'Full On-Chain Execution',
                 gasProfile: 'Hyper-Alpha (148k gas)',
               },
               {
                 chainKey: 'base' as const,
                 chain: 'Base L2',
                 chainId: 8453,
-                poolCount: agentCountsByChain?.base ?? 41,
-                dexes: 'Uniswap V3, Aerodrome Slipstream (Monitor), PancakeSwap V3, SushiSwap V3, Uniswap V2, Sushiswap V2, BaseSwap V2',
-                executionSupport: contractDeploymentStatus.base?.isDeployed ? 'Full On-Chain Execution' : 'Live Scan Ready (Deploy Contract to Exec)',
+                tokenCount: 13,
+                poolCount: agentCountsByChain?.base ?? 95,
+                dexes: 'Uniswap V3, PancakeSwap V3, SushiSwap V3, Uniswap V2, BaseSwap V2, Aerodrome Slipstream (Monitor)',
+                executionSupport: contractDeploymentStatus.base?.isDeployed ? 'Full On-Chain Execution' : 'Live Scan Ready (Checking Contract)',
                 gasProfile: 'Hyper-Alpha (145k gas)',
               },
               {
                 chainKey: 'optimism' as const,
                 chain: 'Optimism Mainnet',
                 chainId: 10,
+                tokenCount: 8,
                 poolCount: agentCountsByChain?.optimism ?? 26,
                 dexes: 'Uniswap V3, Velodrome Slipstream (Monitor), SushiSwap V3, Uniswap V2, Sushiswap V2',
                 executionSupport: contractDeploymentStatus.optimism?.isDeployed ? 'Full On-Chain Execution' : 'Live Scan Ready (Deploy Contract to Exec)',
@@ -4282,6 +4549,8 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
               },
             ].map((worker) => {
               const isActiveWorker = selectedChain === worker.chainKey;
+              const workerContract = deployedContracts[worker.chainKey] || CHAIN_CONFIG_MAP[worker.chainKey].contract;
+              const isWorkerDeployed = Boolean(contractDeploymentStatus[worker.chainKey]?.isDeployed);
               return (
                 <button
                   key={worker.chain}
@@ -4295,13 +4564,15 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
                 >
                   <div className="flex items-center justify-between">
                     <div className="flex items-center gap-2">
-                      <span className={`h-2.5 w-2.5 rounded-full ${isActiveWorker ? 'bg-cyan-400 animate-ping' : 'bg-emerald-400'}`} />
+                      <span className={`h-2.5 w-2.5 rounded-full ${isActiveWorker ? 'bg-cyan-400 animate-ping' : isWorkerDeployed ? 'bg-emerald-400' : 'bg-amber-400'}`} />
                       <span className="font-bold text-white text-sm font-mono">{worker.chain}</span>
                     </div>
                     <span className={`text-[10px] font-mono px-2 py-0.5 rounded border ${
                       isActiveWorker
                         ? 'bg-cyan-500/20 text-cyan-300 border-cyan-500/40'
-                        : 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30'
+                        : isWorkerDeployed
+                          ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30'
+                          : 'bg-amber-500/20 text-amber-300 border-amber-500/30'
                     }`}>
                       ID: {worker.chainId}
                     </span>
@@ -4310,7 +4581,13 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
                   <div className="space-y-1.5 text-xs font-mono">
                     <div className="flex justify-between text-slate-400">
                       <span>Pools Monitored:</span>
-                      <span className="text-white font-bold">{worker.poolCount} live pools</span>
+                      <span className="text-white font-bold">{worker.poolCount} pools · {worker.tokenCount} tokens</span>
+                    </div>
+                    <div className="flex justify-between text-slate-400">
+                      <span>FlashArb Contract:</span>
+                      <span className={isWorkerDeployed ? 'text-emerald-300 font-bold' : 'text-amber-300 font-bold'}>
+                        {formatShortAddress(workerContract)} {isWorkerDeployed ? '✓' : ''}
+                      </span>
                     </div>
                     <div className="flex justify-between text-slate-400">
                       <span>Gas Profile:</span>
@@ -4318,7 +4595,7 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
                     </div>
                     <div className="flex justify-between text-slate-400">
                       <span>Execution Status:</span>
-                      <span className={contractDeploymentStatus[worker.chainKey]?.isDeployed ? 'text-emerald-400 font-bold' : 'text-amber-300 font-bold'}>
+                      <span className={isWorkerDeployed ? 'text-emerald-400 font-bold' : 'text-amber-300 font-bold'}>
                         {worker.executionSupport}
                       </span>
                     </div>
@@ -4341,7 +4618,7 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
                   Live Cross-DEX Pool Opportunity Stream ({targetChainConfig.name})
                 </h3>
                 <p className="text-xs text-slate-400 font-mono">
-                  Real price discrepancy scanner evaluating {ARB_TOKENS.length} tokens across {targetChainConfig.name} DEX venues via Multicall3.
+                  Real price discrepancy scanner evaluating {activeChainTokens.length} tokens across {targetChainConfig.name} DEX venues via Multicall3.
                 </p>
               </div>
 
@@ -4366,8 +4643,8 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
                     onChange={(e) => setScanTokenFilter(e.target.value)}
                     className="bg-transparent text-cyan-300 font-bold focus:outline-none cursor-pointer"
                   >
-                    <option value="ALL">All {ARB_TOKENS.length} Tokens (Full Mesh)</option>
-                    {ARB_TOKENS.map((tok) => (
+                    <option value="ALL">All {activeChainTokens.length} Tokens (Full Mesh)</option>
+                    {activeChainTokens.map((tok) => (
                       <option key={tok.symbol} value={tok.symbol}>
                         {tok.symbol} - {tok.name}
                       </option>
@@ -4733,7 +5010,7 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
                                 </td>
                                 <td className="py-2.5 px-3 whitespace-nowrap">
                                   <span className="font-bold text-emerald-400">
-                                    ${pool.priceUsd >= 10 ? pool.priceUsd.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : pool.priceUsd.toFixed(4)}
+                                    ${pool.priceUsd >= 10 ? pool.priceUsd.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : pool.priceUsd < 0.1 ? pool.priceUsd.toFixed(6) : pool.priceUsd.toFixed(4)}
                                   </span>
                                 </td>
                                 <td className="py-2.5 px-3 text-slate-300 text-[11px]">
@@ -4805,8 +5082,15 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
                   <Sliders className="h-4 w-4 text-cyan-400" />
                   Flash Loan Sizer & Router
                 </h3>
-                <span className="text-[11px] text-slate-400 font-mono">
-                  {ARB_TOKENS.length} Tokens · {agentMonitoredPools.length || (agentCountsByChain?.[selectedChain] ?? 70)} Live Pools · 4 Gas Architectures
+                <span className="text-[11px] text-slate-400 font-mono flex items-center gap-2">
+                  <span>
+                    {activeChainTokens.length} Tokens · {agentMonitoredPools.length || (agentCountsByChain?.[selectedChain] ?? (selectedChain === 'base' ? 95 : selectedChain === 'optimism' ? 26 : 70))} Live Pools · 4 Gas Architectures
+                  </span>
+                  {liveTokenPrices && (liveTokenPrices.tokenCount ?? 0) > 0 && (
+                    <span className="text-[10px] text-emerald-400 font-bold">
+                      · Live Feed ({liveTokenPrices.tokenCount} Tokens)
+                    </span>
+                  )}
                 </span>
               </div>
               <span className={`text-[10px] font-mono px-2 py-0.5 rounded border ${currentFlashProvider.badgeColor}`}>
@@ -4818,7 +5102,17 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
               {/* 1. Token Category Filter & Selector */}
               <div>
                 <div className="flex justify-between items-center mb-1.5 text-xs font-mono">
-                  <span className="text-slate-400">Target Asset</span>
+                  <span className="text-slate-400 flex items-center gap-2">
+                    <span>Target Asset</span>
+                    <button
+                      type="button"
+                      onClick={() => fetchLiveTokenPrices()}
+                      className="text-[10px] text-cyan-400 hover:text-cyan-300 underline cursor-pointer"
+                      title="Refresh multi-source live token price feed"
+                    >
+                      Sync Feed
+                    </button>
+                  </span>
                   <div className="flex gap-1 text-[10px]">
                     {(['All', 'Major', 'LST / LRT', 'Ecosystem', 'DeFi', 'Meme', 'Stablecoin'] as const).map((cat) => (
                       <button
@@ -4838,25 +5132,39 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
                 </div>
 
                 <div className="grid grid-cols-4 gap-1.5 max-h-36 overflow-y-auto pr-1">
-                  {ARB_TOKENS.filter((t) => tokenCategoryFilter === 'All' || t.category === tokenCategoryFilter).map((tok) => (
-                    <button
-                      key={tok.symbol}
-                      type="button"
-                      onClick={() => handleSelectToken(tok)}
-                      className={`p-1.5 rounded-xl border text-left cursor-pointer transition-all ${
-                        simToken === tok.symbol
-                          ? 'bg-cyan-500/20 border-cyan-400 text-cyan-300 font-bold shadow-sm'
-                          : 'bg-slate-950/60 border-slate-800 text-slate-400 hover:text-white hover:bg-slate-800/80'
-                      }`}
-                    >
-                      <div className="text-xs font-mono flex items-center justify-between">
-                        <span>{tok.symbol}</span>
-                      </div>
-                      <div className="text-[10px] text-slate-500 font-mono truncate">
-                        ${tok.price >= 1 ? tok.price.toLocaleString() : tok.price.toFixed(4)}
-                      </div>
-                    </button>
-                  ))}
+                  {activeChainTokens.filter((t) => tokenCategoryFilter === 'All' || t.category === tokenCategoryFilter).map((tok) => {
+                    const livePx = resolveLiveTokenPrice(tok.symbol);
+                    return (
+                      <button
+                        key={tok.symbol}
+                        type="button"
+                        onClick={() => handleSelectToken(tok)}
+                        className={`p-1.5 rounded-xl border text-left cursor-pointer transition-all ${
+                          simToken === tok.symbol
+                            ? 'bg-cyan-500/20 border-cyan-400 text-cyan-300 font-bold shadow-sm'
+                            : 'bg-slate-950/60 border-slate-800 text-slate-400 hover:text-white hover:bg-slate-800/80'
+                        }`}
+                      >
+                        <div className="text-xs font-mono flex items-center justify-between">
+                          <span>{tok.symbol}</span>
+                          {livePx !== null && (
+                            <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" title="Live market price" />
+                          )}
+                        </div>
+                        <div className="text-[10px] text-slate-400 font-mono truncate">
+                          {livePx === null
+                            ? 'Fetching...'
+                            : livePx >= 100
+                              ? `$${livePx.toLocaleString(undefined, { maximumFractionDigits: 2 })}`
+                              : livePx >= 1
+                                ? `$${livePx.toFixed(2)}`
+                                : livePx >= 0.01
+                                  ? `$${livePx.toFixed(4)}`
+                                  : `$${livePx.toFixed(7)}`}
+                        </div>
+                      </button>
+                    );
+                  })}
                 </div>
               </div>
 
@@ -4897,7 +5205,7 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
                 <div className="flex justify-between text-xs font-mono mb-1">
                   <span className="text-slate-400">Flash Loan Borrow Amount</span>
                   <span className="text-cyan-300 font-bold">
-                    {simLoanAmount.toLocaleString()} {simToken}{(() => { const a = availableAssets.find((x) => x.symbol.includes(simToken)); return a && a.price > 0 ? ` (~$${Math.round(simLoanAmount * a.price).toLocaleString()})` : ' (no live price)'; })()}
+                    {simLoanAmount.toLocaleString()} {simToken}{(() => { const px = resolveLiveTokenPrice(simToken); return px && px > 0 ? ` (~$${Math.round(simLoanAmount * px).toLocaleString()})` : ' (fetching live price...)'; })()}
                   </span>
                 </div>
                 <input
@@ -4919,36 +5227,43 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
               </div>
 
               {/* 4. DEX Route Selectors */}
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="text-xs font-mono text-slate-400 block mb-1">Buy DEX (Low Price)</label>
-                  <select
-                    value={simDexA}
-                    onChange={(e) => setSimDexA(e.target.value)}
-                    className="w-full bg-slate-950 border border-slate-800 rounded-xl px-2.5 py-2 text-xs font-mono text-white focus:outline-none focus:border-cyan-400"
-                  >
-                    {SUPPORTED_DEX_POOLS.map((dex) => (
-                      <option key={`buy-${dex.name}`} value={dex.name}>
-                        {dex.name} ({dex.feeTier})
-                      </option>
-                    ))}
-                  </select>
-                </div>
+              <div className="space-y-1.5">
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="text-xs font-mono text-slate-400 block mb-1">Buy DEX (Low Price)</label>
+                    <select
+                      value={simDexA}
+                      onChange={(e) => setSimDexA(e.target.value)}
+                      className="w-full bg-slate-950 border border-slate-800 rounded-xl px-2.5 py-2 text-xs font-mono text-white focus:outline-none focus:border-cyan-400"
+                    >
+                      {activeChainDexPools.map((dex) => (
+                        <option key={`buy-${dex.name}`} value={dex.name}>
+                          {dex.name} ({dex.feeTier})
+                        </option>
+                      ))}
+                    </select>
+                  </div>
 
-                <div>
-                  <label className="text-xs font-mono text-slate-400 block mb-1">Sell DEX (High Price)</label>
-                  <select
-                    value={simDexB}
-                    onChange={(e) => setSimDexB(e.target.value)}
-                    className="w-full bg-slate-950 border border-slate-800 rounded-xl px-2.5 py-2 text-xs font-mono text-white focus:outline-none focus:border-cyan-400"
-                  >
-                    {SUPPORTED_DEX_POOLS.map((dex) => (
-                      <option key={`sell-${dex.name}`} value={dex.name}>
-                        {dex.name} ({dex.feeTier})
-                      </option>
-                    ))}
-                  </select>
+                  <div>
+                    <label className="text-xs font-mono text-slate-400 block mb-1">Sell DEX (High Price)</label>
+                    <select
+                      value={simDexB}
+                      onChange={(e) => setSimDexB(e.target.value)}
+                      className="w-full bg-slate-950 border border-slate-800 rounded-xl px-2.5 py-2 text-xs font-mono text-white focus:outline-none focus:border-cyan-400"
+                    >
+                      {activeChainDexPools.map((dex) => (
+                        <option key={`sell-${dex.name}`} value={dex.name}>
+                          {dex.name} ({dex.feeTier})
+                        </option>
+                      ))}
+                    </select>
+                  </div>
                 </div>
+                {(simDexA.includes('Camelot') || simDexB.includes('Camelot') || simDexA.includes('Slipstream') || simDexB.includes('Slipstream') || simDexA.includes('Curve') || simDexB.includes('Curve') || simDexA.includes('Balancer') || simDexB.includes('Balancer') || simDexA.includes('Trader Joe') || simDexB.includes('Trader Joe')) && (
+                  <div className="text-[10px] font-mono text-amber-300/90 bg-amber-950/30 border border-amber-500/20 rounded-lg px-2.5 py-1">
+                    Note: FlashArbOptimized executes V3/V2 routes atomically on Uniswap V3, PancakeSwap V3, SushiSwap V3, Uniswap V2, Sushiswap V2 &amp; BaseSwap V2. Selected monitor-only venues are modeled for spread analysis.
+                  </div>
+                )}
               </div>
 
               {/* 5. Gas Cost Optimization Selector (Crucial Enhancement!) */}
@@ -4966,6 +5281,11 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
                 <div className="grid grid-cols-2 gap-2">
                   {(Object.keys(GAS_OPTIMIZATION_PROFILES) as GasOptimizationLevel[]).map((level) => {
                     const profile = GAS_OPTIMIZATION_PROFILES[level];
+                    const liveGwei = gasStatus?.[selectedChain]?.gasPriceGwei;
+                    const liveProfileGasUsd =
+                      typeof liveGwei === 'number' && liveGwei > 0 && liveEthPrice > 0
+                        ? (profile.gasUnits * liveGwei * 1e-9) * liveEthPrice
+                        : null;
                     return (
                       <button
                         key={level}
@@ -4985,7 +5305,9 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
                         </div>
                         <div className="flex justify-between text-[10px] text-slate-500 mt-1">
                           <span>{profile.gasUnits.toLocaleString()} gas</span>
-                          <span className="text-slate-300 font-bold">${profile.gasCostUsd.toFixed(2)}</span>
+                          <span className="text-slate-300 font-bold">
+                            {liveProfileGasUsd !== null ? `$${liveProfileGasUsd.toFixed(4)}` : 'Live gas...'}
+                          </span>
                         </div>
                       </button>
                     );
@@ -5141,13 +5463,15 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
                     <div className="p-2 rounded-lg bg-slate-900 border border-slate-800">
                       <span className="text-[10px] text-slate-400 block">Optimized Gas Cost</span>
                       <span className="text-xs font-bold text-amber-300">${simResult.gasCostUsd.toFixed(2)}</span>
-                      <span className="text-[9px] text-slate-400 block">was ${simResult.baselineGasCostUsd.toFixed(2)}</span>
+                      <span className="text-[9px] text-emerald-400 block">
+                        Saved +${simResult.gasSavedUsd.toFixed(2)} ETH
+                      </span>
                     </div>
 
                     <div className="p-2 rounded-lg bg-slate-900 border border-slate-800">
                       <span className="text-[10px] text-slate-400 block">Loan Fee ({currentFlashProvider.feePercent}%)</span>
                       <span className="text-xs font-bold text-emerald-400">${simResult.loanFeeUsd.toFixed(2)}</span>
-                      <span className="text-[9px] text-emerald-400 block">Saved ${simResult.loanFeeSavedUsd.toFixed(2)}</span>
+                      <span className="text-[9px] text-emerald-400 block">In ERC-20 Profit (+${simResult.loanFeeSavedUsd.toFixed(2)})</span>
                     </div>
 
                     <div className="p-2 rounded-lg bg-slate-900 border border-slate-800">
@@ -5157,6 +5481,9 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
                       </span>
                       <span className="text-[9px] text-slate-400 block">from low gas + 0% fee</span>
                     </div>
+                  </div>
+                  <div className="text-[10px] text-slate-400 font-sans border-t border-slate-800/80 pt-2">
+                    <span className="text-emerald-300 font-semibold">Profit Routing:</span> 0% {currentFlashProvider.name} financing savings (+${simResult.loanFeeSavedUsd.toFixed(2)}) remain inside ERC-20 <code className="text-emerald-300 font-mono">netProfit</code> swept on-chain to Profit Vault; Cancun EIP-1153 gas savings (+${simResult.gasSavedUsd.toFixed(2)}) accrue in Gas Wallet and are forwarded above the 0.002 ETH reserve.
                   </div>
                 </div>
 
@@ -5224,7 +5551,7 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
                   <div className="flex items-center gap-2 text-slate-300 flex-wrap">
                     <span className="px-1.5 py-0.5 rounded bg-slate-800 text-emerald-400 shrink-0">5</span>
                     <span>
-                      Repay {simLoanAmount} {simToken} (Fee: ${simResult.loanFeeUsd.toFixed(2)}) &rarr; Sweep +${simResult.netProfitUsd.toFixed(2)} to profit wallet:
+                      Repay {simLoanAmount} {simToken} (Fee: ${simResult.loanFeeUsd.toFixed(2)}) &rarr; Sweep +${simResult.netProfitUsd.toFixed(2)} ERC-20 net profit (+${simResult.loanFeeSavedUsd.toFixed(2)} fee saved) + excess Gas ETH &gt; 0.002 reserve to profit wallet:
                     </span>
                     <span className="text-emerald-400 font-bold bg-emerald-950/40 px-1.5 py-0.5 rounded border border-emerald-500/30 font-mono">
                       {formatShortAddress(profitWalletAddress)} ({profitWalletLabel})

@@ -117,7 +117,7 @@ export const OkxWalletModal: React.FC<OkxWalletModalProps> = ({
     setSigningMsg(true);
     setErrorMsg(null);
     try {
-      const challenge = `Apex Quant Platform Authentication\nWallet: ${address}\nTimestamp: ${new Date().toISOString()}\nNonce: ${Math.random().toString(36).substring(2, 10)}`;
+      const challenge = `Onset-Traids Platform Authentication\nWallet: ${address}\nTimestamp: ${new Date().toISOString()}\nNonce: ${Math.random().toString(36).substring(2, 10)}`;
       const sig = await signOkxMessage(challenge, address);
       setSignatureResult(sig);
     } catch (err: any) {

@@ -1338,8 +1338,15 @@ function AppInner({ initialAssets, initialCandles }: { initialAssets: CryptoAsse
       };
     });
 
+    const gasSavedUsd = Number(trade.gasSavedUsd || 0);
+    const loanFeeSavedUsd = Number(trade.loanFeeSavedUsd || 0);
+    const extraParts: string[] = [];
+    if (loanFeeSavedUsd > 0) extraParts.push(`+$${loanFeeSavedUsd.toFixed(2)} 0% financing saved in netProfit`);
+    if (gasSavedUsd > 0) extraParts.push(`+$${gasSavedUsd.toFixed(2)} gas savings surplus`);
+    const extraNote = extraParts.length > 0 ? ` (${extraParts.join(', ')})` : '';
+
     setBotLogs((prev) => [
-      `[${new Date().toLocaleTimeString()}] ⚡ LIVE FLASH ARBITRAGE EXECUTED on ${trade.chain}: Borrowed 0% Balancer liquidity for ${trade.symbol}, routed direct pool swap, +$${profit.toFixed(2)} USD net alpha swept to profit vault. (Tx: ${trade.txHash.slice(0, 10)}...)`,
+      `[${new Date().toLocaleTimeString()}] ⚡ LIVE FLASH ARBITRAGE EXECUTED on ${trade.chain}: Borrowed 0% Balancer liquidity for ${trade.symbol}, routed direct pool swap, +$${profit.toFixed(2)} USD net alpha swept to profit vault${extraNote}. (Tx: ${trade.txHash.slice(0, 10)}...)`,
       ...prev,
     ]);
   };

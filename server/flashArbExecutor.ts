@@ -52,10 +52,16 @@ export const CHAIN_TOKENS: Record<SupportedArbChain, Record<string, ArbitrumToke
     WETH: { sym: 'WETH', addr: '0x4200000000000000000000000000000000000006', dec: 18, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 (WETH9) · FlashArb & Sweep Compatible' },
     USDC: { sym: 'USDC', addr: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913', dec: 6, ercStandard: 'ERC-2612', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 + ERC-2612 Permit · FlashArb & Sweep Compatible' },
     USDbC: { sym: 'USDbC', addr: '0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA', dec: 6, ercStandard: 'ERC-2612', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 + ERC-2612 Permit · FlashArb & Sweep Compatible' },
+    USDT: { sym: 'USDT', addr: '0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2', dec: 6, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 (SafeERC20) · FlashArb & Sweep Compatible' },
     cbETH: { sym: 'cbETH', addr: '0x2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22', dec: 18, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 LST · FlashArb & Sweep Compatible' },
+    wstETH: { sym: 'wstETH', addr: '0xc1CBa3fCea344f92D9239c08C0568f6F2F0ee452', dec: 18, ercStandard: 'ERC-2612', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 + ERC-2612 Non-rebasing LST · FlashArb & Sweep Compatible' },
+    ezETH: { sym: 'ezETH', addr: '0x2416092f143378750bb29b79eD961ab195CcEea5', dec: 18, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 LRT · FlashArb & Sweep Compatible' },
     AERO: { sym: 'AERO', addr: '0x940181a94A35A4569E4529A3CDfB74e38FD98631', dec: 18, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 · FlashArb & Sweep Compatible' },
     DAI: { sym: 'DAI', addr: '0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb', dec: 18, ercStandard: 'ERC-2612', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 + ERC-2612 Permit · FlashArb & Sweep Compatible' },
     cbBTC: { sym: 'cbBTC', addr: '0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf', dec: 8, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 · FlashArb & Sweep Compatible' },
+    DEGEN: { sym: 'DEGEN', addr: '0x4ed4E862860beD51a9570b96d89aF5E1B0Efefed', dec: 18, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 · FlashArb & Sweep Compatible' },
+    VIRTUAL: { sym: 'VIRTUAL', addr: '0x0b3e328455c4059EEb9e3f84b5543F74E24e7E1b', dec: 18, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 · FlashArb & Sweep Compatible' },
+    MORPHO: { sym: 'MORPHO', addr: '0xBAa5CC21fd487B8Fcc2F632f3F4E8D37262a0842', dec: 18, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 · FlashArb & Sweep Compatible' },
   },
   optimism: {
     WETH: { sym: 'WETH', addr: '0x4200000000000000000000000000000000000006', dec: 18, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 (WETH9) · FlashArb & Sweep Compatible' },
@@ -164,7 +170,7 @@ export const CHAIN_DEX_ROUTERS: Record<SupportedArbChain, Record<string, DexRout
       supported: true,
     },
     'SushiSwap V3': {
-      router: '0xFB7eF66a7e61224DD6FcD0D7d9C3be5C8B049b9f',
+      router: '0x8c32Fd078B89Eccb06B40289A539D84A4aA9FDA6',
       isV3: true,
       supported: true,
     },
@@ -262,11 +268,13 @@ export interface EncodedArbitrageCandidate {
   minProfitUnits: bigint;
   recipient: string;
   calldata: string;
+  scaleFactor?: number;
 }
 
 export function resolveArbitrageCandidates(
   input: RouteExecutionInput,
-  recipient: string
+  recipient: string,
+  scaleFactor = 1
 ): EncodedArbitrageCandidate[] {
   const routers = getChainDexRouters(input.chain);
   const buySpec = routers[input.buyDex];
@@ -275,6 +283,8 @@ export function resolveArbitrageCandidates(
     return [];
   }
 
+  const safeScale = Number.isFinite(scaleFactor) && scaleFactor > 0 ? Math.min(1, scaleFactor) : 1;
+  const scaleSuffix = safeScale < 0.999 ? ` (${Math.round(safeScale * 100)}% clip)` : '';
   const buyFeePpm = Math.round(input.buyFeePercent * 10000);
   const sellFeePpm = Math.round(input.sellFeePercent * 10000);
 
@@ -283,9 +293,9 @@ export function resolveArbitrageCandidates(
   // Candidate 1: Borrow BASE token
   // Because `sell` pool prices BASE higher in QUOTE than `buy` pool,
   // Leg 1 swaps BASE -> QUOTE on `sell` pool; Leg 2 swaps QUOTE -> BASE on `buy` pool.
-  const baseLoanUnits = toTokenUnits(input.optimalLoanBaseUnits, input.baseToken.dec);
+  const baseLoanUnits = toTokenUnits(input.optimalLoanBaseUnits * safeScale, input.baseToken.dec);
   if (baseLoanUnits > 0n) {
-    const estProfitUsdPositive = Math.max(0.01, input.estNetProfitUsd);
+    const estProfitUsdPositive = Math.max(0.01, input.estNetProfitUsd * safeScale);
     const estProfitBaseHuman = input.buyPriceUsd > 0 ? estProfitUsdPositive / input.buyPriceUsd : 0;
     const halfProfitBase = toTokenUnits(estProfitBaseHuman / 2, input.baseToken.dec);
     const minProfitBase = halfProfitBase > 1n ? halfProfitBase : 1n;
@@ -294,7 +304,7 @@ export function resolveArbitrageCandidates(
     const routeType = getContractRouteType(sellSpec.isV3, buySpec.isV3);
 
     candidates.push({
-      label: `Borrow ${input.baseToken.sym}: ${input.sellDex} -> ${input.buyDex}`,
+      label: `Borrow ${input.baseToken.sym}: ${input.sellDex} -> ${input.buyDex}${scaleSuffix}`,
       borrowedToken: input.baseToken,
       intermediateToken: input.quoteToken,
       amountUnits: baseLoanUnits,
@@ -305,6 +315,7 @@ export function resolveArbitrageCandidates(
       routeType,
       minProfitUnits: minProfitBase,
       recipient,
+      scaleFactor: safeScale,
       calldata: encodeExecuteOptimizedArbitrage({
         tokenIn: input.baseToken.addr,
         tokenOut: input.quoteToken.addr,
@@ -322,14 +333,14 @@ export function resolveArbitrageCandidates(
 
   // Candidate 2: Borrow QUOTE token
   // Leg 1 swaps QUOTE -> BASE on `buy` pool (where BASE is cheaper); Leg 2 swaps BASE -> QUOTE on `sell` pool.
-  const quoteLoanHuman = input.optimalLoanBaseUnits * input.buyPriceQuotePerBase;
+  const quoteLoanHuman = input.optimalLoanBaseUnits * input.buyPriceQuotePerBase * safeScale;
   const quoteLoanUnits = toTokenUnits(quoteLoanHuman, input.quoteToken.dec);
   if (quoteLoanUnits > 0n) {
     const quoteUsdPrice =
       input.buyPriceQuotePerBase > 0 && input.buyPriceUsd > 0
         ? input.buyPriceUsd / input.buyPriceQuotePerBase
         : 1;
-    const estProfitUsdPositive = Math.max(0.01, input.estNetProfitUsd);
+    const estProfitUsdPositive = Math.max(0.01, input.estNetProfitUsd * safeScale);
     const estProfitQuoteHuman = quoteUsdPrice > 0 ? estProfitUsdPositive / quoteUsdPrice : 0;
     const halfProfitQuote = toTokenUnits(estProfitQuoteHuman / 2, input.quoteToken.dec);
     const minProfitQuote = halfProfitQuote > 1n ? halfProfitQuote : 1n;
@@ -338,7 +349,7 @@ export function resolveArbitrageCandidates(
     const routeType = getContractRouteType(buySpec.isV3, sellSpec.isV3);
 
     candidates.push({
-      label: `Borrow ${input.quoteToken.sym}: ${input.buyDex} -> ${input.sellDex}`,
+      label: `Borrow ${input.quoteToken.sym}: ${input.buyDex} -> ${input.sellDex}${scaleSuffix}`,
       borrowedToken: input.quoteToken,
       intermediateToken: input.baseToken,
       amountUnits: quoteLoanUnits,
@@ -349,6 +360,7 @@ export function resolveArbitrageCandidates(
       routeType,
       minProfitUnits: minProfitQuote,
       recipient,
+      scaleFactor: safeScale,
       calldata: encodeExecuteOptimizedArbitrage({
         tokenIn: input.quoteToken.addr,
         tokenOut: input.baseToken.addr,
@@ -365,6 +377,91 @@ export function resolveArbitrageCandidates(
   }
 
   return candidates;
+}
+
+/**
+ * Generates execution candidates across progressive clip sizes ([100%, 50%, 25%, 10%])
+ * filtered and capped against live Balancer V2 Vault ERC-20 liquidity (`max 85% of Vault balance`).
+ * Prevents V3 tick-range exhaustion and Balancer zero-liquidity reverts during `eth_estimateGas`.
+ */
+export function buildScaledArbitrageCandidates(
+  input: RouteExecutionInput,
+  recipient: string,
+  balancerVaultBalances?: Record<string, bigint>,
+  scaleFactors: number[] = [1, 0.5, 0.25, 0.1]
+): EncodedArbitrageCandidate[] {
+  const full = resolveArbitrageCandidates(input, recipient, 1);
+  if (full.length === 0) return [];
+
+  const seenKeys = new Set<string>();
+  const out: EncodedArbitrageCandidate[] = [];
+
+  // Prioritize whichever borrow token has deeper Balancer Vault coverage for its target borrow size
+  const scoredDirections = full.map((baseCand, idx) => {
+    const tokenKey = baseCand.borrowedToken.addr.toLowerCase();
+    const vaultBal = balancerVaultBalances?.[tokenKey];
+    const maxSafe = vaultBal !== undefined ? (vaultBal * 85n) / 100n : undefined;
+    const viable = maxSafe === undefined || maxSafe > 0n;
+    const fullFits = maxSafe === undefined || baseCand.amountUnits <= maxSafe;
+    return { baseCand, idx, tokenKey, maxSafe, viable, fullFits };
+  });
+
+  scoredDirections.sort((a, b) => {
+    if (a.viable !== b.viable) return Number(b.viable) - Number(a.viable);
+    if (a.fullFits !== b.fullFits) return Number(b.fullFits) - Number(a.fullFits);
+    return a.idx - b.idx;
+  });
+
+  for (const dir of scoredDirections) {
+    if (!dir.viable) continue;
+    const baseAmount = dir.baseCand.amountUnits;
+    const baseMinProfit = dir.baseCand.minProfitUnits;
+
+    for (const scale of scaleFactors) {
+      if (!(Number.isFinite(scale) && scale > 0 && scale <= 1)) continue;
+      const scaleBps = BigInt(Math.max(1, Math.round(scale * 10000)));
+      let scaledAmount = (baseAmount * scaleBps) / 10000n;
+      if (dir.maxSafe !== undefined && scaledAmount > dir.maxSafe) {
+        scaledAmount = dir.maxSafe;
+      }
+      if (scaledAmount <= 0n) continue;
+
+      const dedupKey = `${dir.tokenKey}:${scaledAmount.toString()}`;
+      if (seenKeys.has(dedupKey)) continue;
+      seenKeys.add(dedupKey);
+
+      const effectiveRatioNum = Number((scaledAmount * 10000n) / baseAmount) / 10000;
+      const effectiveBps = BigInt(Math.max(1, Math.round(effectiveRatioNum * 10000)));
+      const scaledMinProfitRaw = (baseMinProfit * effectiveBps) / 10000n;
+      const scaledMinProfit = scaledMinProfitRaw > 1n ? scaledMinProfitRaw : 1n;
+
+      const pctLabel = Math.round(effectiveRatioNum * 100);
+      const baseLabel = dir.baseCand.label.replace(/\s*\(\d+%\s*clip\)$/, '');
+      const label = pctLabel < 100 ? `${baseLabel} (${pctLabel}% clip)` : baseLabel;
+
+      out.push({
+        ...dir.baseCand,
+        label,
+        amountUnits: scaledAmount,
+        minProfitUnits: scaledMinProfit,
+        scaleFactor: effectiveRatioNum,
+        calldata: encodeExecuteOptimizedArbitrage({
+          tokenIn: dir.baseCand.borrowedToken.addr,
+          tokenOut: dir.baseCand.intermediateToken.addr,
+          amount: scaledAmount,
+          routerA: dir.baseCand.routerA,
+          routerB: dir.baseCand.routerB,
+          feeA: dir.baseCand.feeA,
+          feeB: dir.baseCand.feeB,
+          routeType: dir.baseCand.routeType,
+          minProfit: scaledMinProfit,
+          recipient,
+        }),
+      });
+    }
+  }
+
+  return out;
 }
 
 export function encodeExecuteOptimizedArbitrage(params: {
@@ -600,3 +697,105 @@ export function classifyDetectedErcStandard(flags: {
     compatibilityNote: 'Incompatible: contract does not expose ERC-20, ERC-4626, ERC-721, or ERC-1155 interfaces',
   };
 }
+
+export const DEFAULT_MIN_GAS_RESERVE_WEI = ethers.parseEther('0.002');
+export const STANDARD_BASELINE_GAS_UNITS = 350000n;
+
+export interface TradeGasAndFinancingExtra {
+  gasSavedWei: bigint;
+  gasSavedEth: number;
+  gasSavedUsd: number;
+  loanFeeSavedUsd: number;
+  totalExtraUsd: number;
+}
+
+/**
+ * Calculates realized gas savings (vs standard 350k unoptimized router+SSTORE execution)
+ * and financing savings (0% Balancer V2 vs 5 bps Aave V3) for an executed trade.
+ */
+export function computeTradeGasAndFinancingExtra(params: {
+  gasUsed: bigint;
+  effectiveGasPriceWei: bigint | null;
+  ethPriceUsd: number;
+  loanNotionalUsd: number;
+  loanFeePercent?: number;
+  baselineGasUnits?: bigint;
+}): TradeGasAndFinancingExtra {
+  const baseline = params.baselineGasUnits ?? STANDARD_BASELINE_GAS_UNITS;
+  const gasSavedWei =
+    params.effectiveGasPriceWei !== null &&
+    params.effectiveGasPriceWei > 0n &&
+    params.gasUsed > 0n &&
+    params.gasUsed < baseline
+      ? (baseline - params.gasUsed) * params.effectiveGasPriceWei
+      : 0n;
+  const gasSavedEth = Number(ethers.formatEther(gasSavedWei));
+  const ethUsd = Number.isFinite(params.ethPriceUsd) && params.ethPriceUsd > 0 ? params.ethPriceUsd : 0;
+  const gasSavedUsd = Number((gasSavedEth * ethUsd).toFixed(4));
+  const actualLoanFeePct = params.loanFeePercent ?? 0;
+  const standardAaveFeePct = 0.05;
+  const notional = Number.isFinite(params.loanNotionalUsd) && params.loanNotionalUsd > 0 ? params.loanNotionalUsd : 0;
+  const loanFeeSavedUsd = Number(
+    Math.max(0, notional * ((standardAaveFeePct - actualLoanFeePct) / 100)).toFixed(4)
+  );
+  return {
+    gasSavedWei,
+    gasSavedEth,
+    gasSavedUsd,
+    loanFeeSavedUsd,
+    totalExtraUsd: Number((gasSavedUsd + loanFeeSavedUsd).toFixed(4)),
+  };
+}
+
+export interface GasSurplusAllocation {
+  sendWei: bigint;
+  maxSendableWei: bigint;
+  gasLimit: bigint;
+  txFeeWei: bigint;
+  worthSending: boolean;
+  remainingReserveWei: bigint;
+}
+
+/**
+ * Computes how much native ETH surplus sits above the Gas Wallet's operational reserve
+ * (`DEFAULT_MIN_GAS_RESERVE_WEI` = 0.002 ETH) after reserving L2 transfer gas + 20% fee headroom.
+ * Never drains below `minReserveWei` and refuses dust transfers where `targetWei <= txFeeWei * 2`.
+ */
+export function computeGasSurplusAllocation(params: {
+  balanceWei: bigint;
+  minReserveWei?: bigint;
+  transferGasUnits?: bigint;
+  gasPriceWei: bigint;
+  maxSendWei?: bigint;
+}): GasSurplusAllocation {
+  const minReserve = params.minReserveWei ?? DEFAULT_MIN_GAS_RESERVE_WEI;
+  const baseGas = params.transferGasUnits && params.transferGasUnits >= 21000n ? params.transferGasUnits : 21000n;
+  const gasLimit = (baseGas * 125n) / 100n;
+  const safeGasPrice = params.gasPriceWei > 0n ? params.gasPriceWei : 0n;
+  // Reserve 120% of estimated transfer fee so signer never reverts out-of-gas or underflows reserve
+  const txFeeWei = (gasLimit * safeGasPrice * 120n) / 100n;
+  const maxSendableWei =
+    params.balanceWei > minReserve + txFeeWei ? params.balanceWei - minReserve - txFeeWei : 0n;
+
+  const targetWei =
+    params.maxSendWei !== undefined && params.maxSendWei > 0n && params.maxSendWei < maxSendableWei
+      ? params.maxSendWei
+      : maxSendableWei;
+
+  const worthSending = targetWei > 0n && targetWei > txFeeWei * 2n;
+  const sendWei = worthSending ? targetWei : 0n;
+  const remainingReserveWei =
+    worthSending && params.balanceWei > sendWei + txFeeWei
+      ? params.balanceWei - sendWei - txFeeWei
+      : params.balanceWei;
+
+  return {
+    sendWei,
+    maxSendableWei,
+    gasLimit,
+    txFeeWei,
+    worthSending,
+    remainingReserveWei,
+  };
+}
+

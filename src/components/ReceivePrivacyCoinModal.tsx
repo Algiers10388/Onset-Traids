@@ -58,7 +58,7 @@ export const ReceivePrivacyCoinModal: React.FC<ReceivePrivacyCoinModalProps> = (
       const res = await fetch('/api/wallet/receive-address', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ coin: coinId, label: 'Apex Quant Vault Deposit' }),
+        body: JSON.stringify({ coin: coinId, label: 'Onset-Traids Vault Deposit' }),
       });
       const data = await res.json();
       if (data.success) {

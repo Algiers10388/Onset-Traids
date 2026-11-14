@@ -311,7 +311,7 @@ export const CashCheckModalTab: React.FC<CashCheckModalTabProps> = ({
                 <div className="flex-1 flex items-baseline gap-2">
                   <span className="text-[10px] text-slate-400 uppercase font-bold shrink-0">PAY TO THE ORDER OF:</span>
                   <span className="text-white font-bold text-sm underline tracking-wide">
-                    Apex Quant Trading Desk (Live Custodial Account)
+                    Onset-Traids Trading Desk (Live Custodial Account)
                   </span>
                 </div>
 
@@ -384,13 +384,13 @@ export const CashCheckModalTab: React.FC<CashCheckModalTabProps> = ({
               <div className="border-b-2 border-dashed border-slate-700 pb-2">
                 <div className="text-[10px] text-slate-500 uppercase">ENDORSE HERE</div>
                 <div className="font-serif italic text-lg text-emerald-400 font-semibold tracking-wider pt-1">
-                  ✕ Apex Quant Trading Desk - Mobile Deposit
+                  ✕ Onset-Traids Trading Desk - Mobile Deposit
                 </div>
               </div>
 
               <div className="p-3 rounded-lg bg-emerald-950/30 border border-emerald-500/30 text-emerald-200 text-xs font-semibold flex items-center gap-2">
                 <CheckCircle2 className="h-4 w-4 text-emerald-400 shrink-0" />
-                <span>✓ For Mobile Deposit Only at Apex Quant Trading (Account #{fiatAccount.accountId})</span>
+                <span>✓ For Mobile Deposit Only at Onset-Traids Trading (Account #{fiatAccount.accountId})</span>
               </div>
 
               <div className="text-[10px] text-slate-500 text-center uppercase tracking-wider pt-2 border-t border-slate-800">
@@ -536,7 +536,7 @@ export const CashCheckModalTab: React.FC<CashCheckModalTabProps> = ({
               type="text"
               value={payerName}
               onChange={(e) => setPayerName(e.target.value)}
-              placeholder="e.g. John Doe or Apex Quant Inc."
+              placeholder="e.g. John Doe or Onset-Traids Inc."
               className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-slate-700 text-white text-sm focus:border-emerald-500 focus:outline-none"
               required
             />
@@ -694,7 +694,7 @@ export const CashCheckModalTab: React.FC<CashCheckModalTabProps> = ({
             />
             <span>
               I certify that this personal check is properly signed and endorsed on the back with{' '}
-              <strong className="text-emerald-300">"For Mobile Deposit Only at Apex Quant Trading"</strong> and has not been deposited elsewhere.
+              <strong className="text-emerald-300">"For Mobile Deposit Only at Onset-Traids Trading"</strong> and has not been deposited elsewhere.
             </span>
           </label>
         </div>

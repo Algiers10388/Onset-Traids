@@ -55,7 +55,7 @@ export const CakeWalletConnectModal: React.FC<CakeWalletConnectModalProps> = ({
   const generateWcUri = () => {
     const timestamp = Date.now();
     const symKey = Array.from({ length: 64 }, () => Math.floor(Math.random() * 16).toString(16)).join('');
-    const uri = `wc:apex-quant-${timestamp}@2?relay-protocol=irn&symKey=${symKey}`;
+    const uri = `wc:onset-traids-${timestamp}@2?relay-protocol=irn&symKey=${symKey}`;
     setWcUri(uri);
     setIsPairing(true);
   };

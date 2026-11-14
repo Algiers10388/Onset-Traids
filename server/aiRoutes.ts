@@ -33,7 +33,7 @@ async function callWithTimeout<T>(fn: () => Promise<T>, timeoutMs = 30000): Prom
 }
 
 const SYSTEM_INSTRUCTIONS: Record<string, string> = {
-  TROUBLESHOOTING: `You are the Apex Quant System & Compiler Diagnostics Engineer for the Crypto Trading Agent & FlashArb engine.
+  TROUBLESHOOTING: `You are the Onset-Traids System & Compiler Diagnostics Engineer for the Crypto Trading Agent & FlashArb engine.
 Your mission is to provide immediate, actionable, and accurate solutions to developers and traders running the FlashArb DeFi Bot, Foundry smart contracts, and multi-exchange trading agents across Termux on Android, WSL (Windows Subsystem for Linux), and Windows PowerShell.
 
 CRITICAL EXPERTISE & ACCURACY RULES:

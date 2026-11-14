@@ -95,7 +95,7 @@ export const Header: React.FC<HeaderProps> = ({
           </div>
           <div className="flex flex-col leading-none">
             <span className="text-sm font-bold tracking-tight text-white font-mono">
-              APEX<span className="text-cyan-400">QUANT</span>
+              Onset-<span className="text-cyan-400">Traids</span>
             </span>
             <span className="hidden sm:block text-[9px] text-slate-500 font-mono mt-0.5">
               Multi-Exchange SOR
