@@ -193,13 +193,77 @@ export const CHAIN_DEX_ROUTERS: Record<SupportedArbChain, Record<string, DexRout
   },
 };
 
+export const CAMELOT_V3_ROUTER_ADDRESS = '0x1F721E2E82F6676FCE4eA07A5958cF098D339e18';
+export const CAMELOT_V2_ROUTER_ADDRESS = '0xc873fEcbd354f5A56E00E710B90EF4201db2448d';
+
+export interface RouterCapabilityOptions {
+  supportsAlgebra?: boolean;
+  supportsCamelotV2?: boolean;
+  camelotV3Adapter?: string | null;
+}
+
 export function getChainDexRouters(chain?: string): Record<string, DexRouterSpec> {
   const key = (chain || 'arbitrum').toLowerCase() as SupportedArbChain;
   return CHAIN_DEX_ROUTERS[key] || ARBITRUM_DEX_ROUTERS;
 }
 
+/**
+ * Resolves effective DEX router specs for a chain given runtime capabilities:
+ * - If deployed FlashArbOptimized exposes Algebra/Camelot V2 support (`routerCapabilities()`), enables native routers.
+ * - Else if a deployed CamelotV3SwapAdapter address is configured, enables Camelot V3 via the ISwapRouter shim.
+ */
+export function getEffectiveChainDexRouters(
+  chain?: string,
+  caps?: RouterCapabilityOptions
+): Record<string, DexRouterSpec> {
+  const base = getChainDexRouters(chain);
+  const key = (chain || 'arbitrum').toLowerCase() as SupportedArbChain;
+  if (key !== 'arbitrum' || (!caps?.supportsAlgebra && !caps?.supportsCamelotV2 && !caps?.camelotV3Adapter)) {
+    return base;
+  }
+  const out: Record<string, DexRouterSpec> = { ...base };
+  if (caps.supportsAlgebra) {
+    out['Camelot V3'] = {
+      router: CAMELOT_V3_ROUTER_ADDRESS,
+      isV3: true,
+      supported: true,
+    };
+  } else if (caps.camelotV3Adapter && /^0x[a-fA-F0-9]{40}$/.test(caps.camelotV3Adapter)) {
+    out['Camelot V3'] = {
+      router: caps.camelotV3Adapter,
+      isV3: true,
+      supported: true,
+    };
+  }
+  if (caps.supportsCamelotV2) {
+    out['Camelot V2'] = {
+      router: CAMELOT_V2_ROUTER_ADDRESS,
+      isV3: false,
+      supported: true,
+    };
+  }
+  return out;
+}
+
+export const V3_QUOTER_V2_ADDRESSES: Record<SupportedArbChain, Partial<Record<string, string>>> = {
+  arbitrum: {
+    'Uniswap V3': '0x61fFE014bA17989E743c5F6cB21bF9697530B21e',
+    'PancakeSwap V3': '0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997',
+    'SushiSwap V3': '0x0524E833cCD057e4d7A296e3aaAb9f7675964Ce1',
+  },
+  base: {
+    'Uniswap V3': '0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a',
+    'PancakeSwap V3': '0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997',
+    'SushiSwap V3': '0xb1E835Dc2785b52265711e17fCCb0fd018226a6e',
+  },
+  optimism: {
+    'Uniswap V3': '0x61fFE014bA17989E743c5F6cB21bF9697530B21e',
+  },
+};
+
 export const FLASH_ARB_OPTIMIZED_ABI = [
   'function owner() view returns (address)',
+  'function routerCapabilities() pure returns (uint256)',
   'function executeOptimizedArbitrage(address tokenIn, address tokenOut, uint256 amount, address routerA, address routerB, uint24 feeA, uint24 feeB, uint8 routeType, uint256 minProfit, address recipient)',
   'function executeDirectFlashArb(address recipient) payable returns (bool)',
   'function rescueTokens(address token)',
@@ -274,17 +338,19 @@ export interface EncodedArbitrageCandidate {
 export function resolveArbitrageCandidates(
   input: RouteExecutionInput,
   recipient: string,
-  scaleFactor = 1
+  scaleFactor = 1,
+  routerCaps?: RouterCapabilityOptions
 ): EncodedArbitrageCandidate[] {
-  const routers = getChainDexRouters(input.chain);
+  const routers = getEffectiveChainDexRouters(input.chain, routerCaps);
   const buySpec = routers[input.buyDex];
   const sellSpec = routers[input.sellDex];
   if (!buySpec?.supported || !buySpec.router || !sellSpec?.supported || !sellSpec.router) {
     return [];
   }
 
-  const safeScale = Number.isFinite(scaleFactor) && scaleFactor > 0 ? Math.min(1, scaleFactor) : 1;
-  const scaleSuffix = safeScale < 0.999 ? ` (${Math.round(safeScale * 100)}% clip)` : '';
+  const safeScale = Number.isFinite(scaleFactor) && scaleFactor > 0 ? Math.min(5, scaleFactor) : 1;
+  const pctScale = Math.round(safeScale * 100);
+  const scaleSuffix = pctScale !== 100 ? ` (${pctScale}% clip)` : '';
   const buyFeePpm = Math.round(input.buyFeePercent * 10000);
   const sellFeePpm = Math.round(input.sellFeePercent * 10000);
 
@@ -295,10 +361,10 @@ export function resolveArbitrageCandidates(
   // Leg 1 swaps BASE -> QUOTE on `sell` pool; Leg 2 swaps QUOTE -> BASE on `buy` pool.
   const baseLoanUnits = toTokenUnits(input.optimalLoanBaseUnits * safeScale, input.baseToken.dec);
   if (baseLoanUnits > 0n) {
-    const estProfitUsdPositive = Math.max(0.01, input.estNetProfitUsd * safeScale);
+    const estProfitUsdPositive = input.estNetProfitUsd > 0 ? input.estNetProfitUsd * safeScale : 0;
     const estProfitBaseHuman = input.buyPriceUsd > 0 ? estProfitUsdPositive / input.buyPriceUsd : 0;
-    const halfProfitBase = toTokenUnits(estProfitBaseHuman / 2, input.baseToken.dec);
-    const minProfitBase = halfProfitBase > 1n ? halfProfitBase : 1n;
+    const targetMinProfitBase = toTokenUnits(estProfitBaseHuman * 0.25, input.baseToken.dec);
+    const minProfitBase = targetMinProfitBase > 1n ? targetMinProfitBase : 1n;
     const feeA = sellSpec.isV3 ? sellFeePpm : 0;
     const feeB = buySpec.isV3 ? buyFeePpm : 0;
     const routeType = getContractRouteType(sellSpec.isV3, buySpec.isV3);
@@ -340,10 +406,10 @@ export function resolveArbitrageCandidates(
       input.buyPriceQuotePerBase > 0 && input.buyPriceUsd > 0
         ? input.buyPriceUsd / input.buyPriceQuotePerBase
         : 1;
-    const estProfitUsdPositive = Math.max(0.01, input.estNetProfitUsd * safeScale);
+    const estProfitUsdPositive = input.estNetProfitUsd > 0 ? input.estNetProfitUsd * safeScale : 0;
     const estProfitQuoteHuman = quoteUsdPrice > 0 ? estProfitUsdPositive / quoteUsdPrice : 0;
-    const halfProfitQuote = toTokenUnits(estProfitQuoteHuman / 2, input.quoteToken.dec);
-    const minProfitQuote = halfProfitQuote > 1n ? halfProfitQuote : 1n;
+    const targetMinProfitQuote = toTokenUnits(estProfitQuoteHuman * 0.25, input.quoteToken.dec);
+    const minProfitQuote = targetMinProfitQuote > 1n ? targetMinProfitQuote : 1n;
     const feeA = buySpec.isV3 ? buyFeePpm : 0;
     const feeB = sellSpec.isV3 ? sellFeePpm : 0;
     const routeType = getContractRouteType(buySpec.isV3, sellSpec.isV3);
@@ -388,9 +454,10 @@ export function buildScaledArbitrageCandidates(
   input: RouteExecutionInput,
   recipient: string,
   balancerVaultBalances?: Record<string, bigint>,
-  scaleFactors: number[] = [1, 0.5, 0.25, 0.1]
+  scaleFactors: number[] = [1, 0.5, 0.25, 0.1],
+  routerCaps?: RouterCapabilityOptions
 ): EncodedArbitrageCandidate[] {
-  const full = resolveArbitrageCandidates(input, recipient, 1);
+  const full = resolveArbitrageCandidates(input, recipient, 1, routerCaps);
   if (full.length === 0) return [];
 
   const seenKeys = new Set<string>();
@@ -418,7 +485,7 @@ export function buildScaledArbitrageCandidates(
     const baseMinProfit = dir.baseCand.minProfitUnits;
 
     for (const scale of scaleFactors) {
-      if (!(Number.isFinite(scale) && scale > 0 && scale <= 1)) continue;
+      if (!(Number.isFinite(scale) && scale > 0 && scale <= 5)) continue;
       const scaleBps = BigInt(Math.max(1, Math.round(scale * 10000)));
       let scaledAmount = (baseAmount * scaleBps) / 10000n;
       if (dir.maxSafe !== undefined && scaledAmount > dir.maxSafe) {
@@ -437,7 +504,7 @@ export function buildScaledArbitrageCandidates(
 
       const pctLabel = Math.round(effectiveRatioNum * 100);
       const baseLabel = dir.baseCand.label.replace(/\s*\(\d+%\s*clip\)$/, '');
-      const label = pctLabel < 100 ? `${baseLabel} (${pctLabel}% clip)` : baseLabel;
+      const label = pctLabel !== 100 ? `${baseLabel} (${pctLabel}% clip)` : baseLabel;
 
       out.push({
         ...dir.baseCand,
@@ -462,6 +529,49 @@ export function buildScaledArbitrageCandidates(
   }
 
   return out;
+}
+
+export function rebuildCandidateWithMinProfit(
+  candidate: EncodedArbitrageCandidate,
+  minProfitUnits: bigint
+): EncodedArbitrageCandidate {
+  const safeMinProfit = minProfitUnits >= 1n ? minProfitUnits : 1n;
+  return {
+    ...candidate,
+    minProfitUnits: safeMinProfit,
+    calldata: encodeExecuteOptimizedArbitrage({
+      tokenIn: candidate.borrowedToken.addr,
+      tokenOut: candidate.intermediateToken.addr,
+      amount: candidate.amountUnits,
+      routerA: candidate.routerA,
+      routerB: candidate.routerB,
+      feeA: candidate.feeA,
+      feeB: candidate.feeB,
+      routeType: candidate.routeType,
+      minProfit: safeMinProfit,
+      recipient: candidate.recipient,
+    }),
+  };
+}
+
+/**
+ * Encodes `executeOptimizedArbitrage` with `minProfit = MaxUint256` for read-only `eth_call` probing:
+ * FlashArbOptimized executes the Balancer flash loan + both router swaps and reverts with
+ * `InsufficientProfit(actualNetProfitWei, MaxUint256)`, exposing exact on-chain output down to 1 wei.
+ */
+export function buildMaxProfitProbeCalldata(candidate: EncodedArbitrageCandidate): string {
+  return encodeExecuteOptimizedArbitrage({
+    tokenIn: candidate.borrowedToken.addr,
+    tokenOut: candidate.intermediateToken.addr,
+    amount: candidate.amountUnits,
+    routerA: candidate.routerA,
+    routerB: candidate.routerB,
+    feeA: candidate.feeA,
+    feeB: candidate.feeB,
+    routeType: candidate.routeType,
+    minProfit: ethers.MaxUint256,
+    recipient: candidate.recipient,
+  });
 }
 
 export function encodeExecuteOptimizedArbitrage(params: {
@@ -533,6 +643,28 @@ export function decodeArbitrageSwapsExecutedLogs(
     } catch {
       // ignore non-matching logs
     }
+  }
+  return null;
+}
+
+export function parseInsufficientProfitError(errOrHex: any): { actual: bigint; required: bigint } | null {
+  const rawData =
+    typeof errOrHex === 'string'
+      ? errOrHex
+      : errOrHex?.data || errOrHex?.error?.data || errOrHex?.info?.error?.data || null;
+  if (typeof rawData !== 'string' || !rawData.startsWith('0x') || rawData.length < 10) {
+    return null;
+  }
+  try {
+    const parsed = flashArbIface.parseError(rawData);
+    if (parsed && parsed.name === 'InsufficientProfit') {
+      return {
+        actual: BigInt(parsed.args.actual),
+        required: BigInt(parsed.args.required),
+      };
+    }
+  } catch {
+    // ignore non-matching error data
   }
   return null;
 }

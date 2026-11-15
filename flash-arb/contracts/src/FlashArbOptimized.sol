@@ -81,6 +81,33 @@ interface IUniswapV2Router02 {
     ) external returns (uint256[] memory amounts);
 }
 
+// Algebra V1.9 SwapRouter (Camelot V3 on Arbitrum One): omits `uint24 fee` (selector 0xbc651188)
+interface IAlgebraSwapRouter {
+    struct ExactInputSingleParams {
+        address tokenIn;
+        address tokenOut;
+        address recipient;
+        uint256 deadline;
+        uint256 amountIn;
+        uint256 amountOutMinimum;
+        uint160 limitSqrtPrice;
+    }
+
+    function exactInputSingle(ExactInputSingleParams calldata params) external payable returns (uint256 amountOut);
+}
+
+// Camelot V2 6-arg Router (includes referrer address)
+interface ICamelotV2Router {
+    function swapExactTokensForTokensSupportingFeeOnTransferTokens(
+        uint256 amountIn,
+        uint256 amountOutMin,
+        address[] calldata path,
+        address to,
+        address referrer,
+        uint256 deadline
+    ) external;
+}
+
 contract FlashArbOptimized is IFlashLoanRecipient {
     error Unauthorized();
     error InsufficientProfit(uint256 actual, uint256 required);
@@ -200,6 +227,11 @@ contract FlashArbOptimized is IFlashLoanRecipient {
         if (bal > 0) _safeTransfer(token, recipient, bal);
     }
 
+    /// @notice Bitmask of router fallbacks: bit 0 (1) = UniV3/V2, bit 1 (2) = Algebra (Camelot V3), bit 2 (4) = Camelot V2
+    function routerCapabilities() external pure returns (uint256) {
+        return 7;
+    }
+
     // ------------------------------------------------------------------------------------------------
     // Flash loan plumbing
     // ------------------------------------------------------------------------------------------------
@@ -291,17 +323,41 @@ contract FlashArbOptimized is IFlashLoanRecipient {
         }
     }
 
+    /// @dev Tries standard 5-arg Uniswap V2 swapExactTokensForTokens, then falls back to Camelot V2 6-arg router.
     function _swapV2(address router, address tokenIn, address tokenOut, uint256 amountIn) internal returns (uint256) {
         _safeApprove(tokenIn, router, amountIn);
         address[] memory path = new address[](2);
         path[0] = tokenIn;
         path[1] = tokenOut;
         uint256 balBefore = IERC20(tokenOut).balanceOf(address(this));
-        IUniswapV2Router02(router).swapExactTokensForTokens(amountIn, 0, path, address(this), block.timestamp + 300);
+        (bool ok, bytes memory ret) = router.call(
+            abi.encodeWithSelector(
+                IUniswapV2Router02.swapExactTokensForTokens.selector,
+                amountIn,
+                0,
+                path,
+                address(this),
+                block.timestamp + 300
+            )
+        );
+        if (!ok) {
+            (ok, ret) = router.call(
+                abi.encodeWithSelector(
+                    ICamelotV2Router.swapExactTokensForTokensSupportingFeeOnTransferTokens.selector,
+                    amountIn,
+                    0,
+                    path,
+                    address(this),
+                    address(0),
+                    block.timestamp + 300
+                )
+            );
+            if (!ok) _bubble(ret);
+        }
         return IERC20(tokenOut).balanceOf(address(this)) - balBefore;
     }
 
-    /// @dev Tries the SwapRouter (v1) call first and falls back to the SwapRouter02 layout, so one build works on all chains.
+    /// @dev Tries SwapRouter v1 -> SwapRouter02 -> Algebra (Camelot V3), so one contract works across all V3 DEXes.
     function _swapV3(
         address router,
         address tokenIn,
@@ -334,8 +390,22 @@ contract FlashArbOptimized is IFlashLoanRecipient {
                 sqrtPriceLimitX96: 0
             });
             (ok, ret) = router.call(abi.encodeWithSelector(ISwapRouter02.exactInputSingle.selector, p2));
+        }
+
+        if (!ok) {
+            IAlgebraSwapRouter.ExactInputSingleParams memory p3 = IAlgebraSwapRouter.ExactInputSingleParams({
+                tokenIn: tokenIn,
+                tokenOut: tokenOut,
+                recipient: address(this),
+                deadline: block.timestamp + 300,
+                amountIn: amountIn,
+                amountOutMinimum: 0,
+                limitSqrtPrice: 0
+            });
+            (ok, ret) = router.call(abi.encodeWithSelector(IAlgebraSwapRouter.exactInputSingle.selector, p3));
             if (!ok) _bubble(ret);
         }
+
         return abi.decode(ret, (uint256));
     }
 

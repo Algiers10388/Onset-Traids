@@ -355,6 +355,21 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
   const [customContractInput, setCustomContractInput] = useState<string>('');
   const [customContractError, setCustomContractError] = useState<string | null>(null);
   const [isVerifyingCustomContract, setIsVerifyingCustomContract] = useState<boolean>(false);
+  const [arbitrumCapabilities, setArbitrumCapabilities] = useState<{
+    supportsAlgebra: boolean;
+    supportsCamelotV2: boolean;
+    camelotV3Adapter: string | null;
+  }>({ supportsAlgebra: false, supportsCamelotV2: false, camelotV3Adapter: null });
+  const [camelotAdapterInput, setCamelotAdapterInput] = useState<string>(() => {
+    try {
+      return localStorage.getItem('flash_arb_camelot_adapter_arbitrum') || '';
+    } catch {
+      return '';
+    }
+  });
+  const [isDeployingCamelotAdapter, setIsDeployingCamelotAdapter] = useState<boolean>(false);
+  const [camelotAdapterError, setCamelotAdapterError] = useState<string | null>(null);
+  const [camelotAdapterNotice, setCamelotAdapterNotice] = useState<string | null>(null);
 
   // Live Autonomous MEV Agent State & On-Chain Profit Wallet Verification
   const [isAgentRunning, setIsAgentRunning] = useState<boolean>(true);
@@ -373,10 +388,11 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
 
   // Dynamic Parameter Optimizer & Strict Profit Guard State
   const [minProfitThresholdUsd, setMinProfitThresholdUsd] = useState<number>(0.01);
-  const [gasOptimizationMode, setGasOptimizationMode] = useState<'ECO' | 'HYPER_ALPHA' | 'AGGRESSIVE'>('HYPER_ALPHA');
+  const [gasOptimizationMode, setGasOptimizationMode] = useState<'ECO' | 'HYPER_ALPHA' | 'AGGRESSIVE'>('ECO');
   const [autoOptimizeSize, setAutoOptimizeSize] = useState<boolean>(true);
   const [isAutonomousExecutionEnabled, setIsAutonomousExecutionEnabled] = useState<boolean>(false);
   const [isUpdatingAgentConfig, setIsUpdatingAgentConfig] = useState<boolean>(false);
+  const [optimizerFeedback, setOptimizerFeedback] = useState<string | null>(null);
   const [forceTestExecution, setForceTestExecution] = useState<boolean>(false);
 
   const [profitWalletOnChain, setProfitWalletOnChain] = useState<{
@@ -604,6 +620,7 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
           if (data.lastConfirmedTxHash) setLastConfirmedTxHash(data.lastConfirmedTxHash);
           if (data.lastConfirmedBlock) setLastConfirmedBlock(data.lastConfirmedBlock);
           if (Array.isArray(data.executedTrades)) setAgentExecutedTrades(data.executedTrades);
+          if (data.arbitrumCapabilities) setArbitrumCapabilities(data.arbitrumCapabilities);
           if (data.config) {
             if (typeof data.config.minProfitThresholdUsd === 'number') setMinProfitThresholdUsd(data.config.minProfitThresholdUsd);
             if (data.config.gasOptimizationMode) setGasOptimizationMode(data.config.gasOptimizationMode);
@@ -687,6 +704,32 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
       }
     } catch (e) {
       console.warn('Failed updating agent config:', e);
+    } finally {
+      setIsUpdatingAgentConfig(false);
+    }
+  };
+
+  const handleOptimizeAgentParameters = async () => {
+    setIsUpdatingAgentConfig(true);
+    setOptimizerFeedback(null);
+    try {
+      const res = await fetch('/api/flash-arb/agent/optimize', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+      });
+      const data = await res.json();
+      if (data.success && data.config) {
+        if (typeof data.config.minProfitThresholdUsd === 'number') setMinProfitThresholdUsd(data.config.minProfitThresholdUsd);
+        if (data.config.gasOptimizationMode) setGasOptimizationMode(data.config.gasOptimizationMode);
+        if (typeof data.config.autoOptimizeSize === 'boolean') setAutoOptimizeSize(data.config.autoOptimizeSize);
+        if (typeof data.config.isAutonomousExecutionEnabled === 'boolean') setIsAutonomousExecutionEnabled(data.config.isAutonomousExecutionEnabled);
+        setOptimizerFeedback(data.message || 'Optimal L2 parameters applied & pools re-scanned.');
+        await fetchAgentStatus(selectedChain);
+      } else {
+        setOptimizerFeedback(data.error || 'Failed to apply parameter optimization.');
+      }
+    } catch (e: any) {
+      setOptimizerFeedback(e?.message || 'Failed to optimize parameters.');
     } finally {
       setIsUpdatingAgentConfig(false);
     }
@@ -1313,6 +1356,100 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
     }
   };
 
+  const registerCamelotAdapter = async (adapterAddress: string) => {
+    const clean = adapterAddress.trim();
+    localStorage.setItem('flash_arb_camelot_adapter_arbitrum', clean);
+    setCamelotAdapterInput(clean);
+    await fetch('/api/flash-arb/camelot-adapter', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chain: 'arbitrum', address: clean }),
+    });
+    await fetchAgentStatus('arbitrum');
+  };
+
+  const handleSaveCamelotAdapter = async () => {
+    const clean = camelotAdapterInput.trim();
+    if (clean && !isValidEvmAddress(clean)) {
+      setCamelotAdapterError('Invalid EVM address (must be 0x + 40 hex chars).');
+      return;
+    }
+    setCamelotAdapterError(null);
+    setCamelotAdapterNotice(null);
+    setIsDeployingCamelotAdapter(true);
+    try {
+      await registerCamelotAdapter(clean);
+      setCamelotAdapterNotice(clean ? `Camelot V3 Adapter registered: ${clean}` : 'Camelot V3 Adapter cleared.');
+    } catch (err: any) {
+      setCamelotAdapterError(err?.message || 'Failed saving adapter');
+    } finally {
+      setIsDeployingCamelotAdapter(false);
+    }
+  };
+
+  const handleDeployCamelotAdapter = async (preferredMethod?: 'SERVER_SIGNER' | 'CONNECTED_WALLET') => {
+    const cfg = CHAIN_CONFIG_MAP.arbitrum;
+    setIsDeployingCamelotAdapter(true);
+    setCamelotAdapterError(null);
+    setCamelotAdapterNotice(null);
+    const tryServer = preferredMethod === 'SERVER_SIGNER' || (preferredMethod !== 'CONNECTED_WALLET' && isSignerKeyConfigured);
+
+    if (tryServer) {
+      try {
+        const res = await fetch('/api/flash-arb/deploy-camelot-adapter', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ chain: 'arbitrum' }),
+        });
+        const data = await res.json();
+        if (data.success && data.adapterAddress) {
+          await registerCamelotAdapter(data.adapterAddress);
+          setCamelotAdapterNotice(`CamelotV3SwapAdapter deployed via Server Signer: ${data.adapterAddress}`);
+          setIsDeployingCamelotAdapter(false);
+          return;
+        }
+        if (!data.requiresWallet) {
+          throw new Error(data.error || 'Server adapter deployment failed');
+        }
+      } catch (srvErr: any) {
+        if (preferredMethod === 'SERVER_SIGNER') {
+          setCamelotAdapterError(srvErr?.message || 'Adapter deployment failed');
+          setIsDeployingCamelotAdapter(false);
+          return;
+        }
+      }
+    }
+
+    try {
+      let userAddr: string | null = okxConnectedAddress ?? null;
+      if (!userAddr) {
+        const conn = await connectOkxWallet();
+        userAddr = conn.address;
+      }
+      const currentCid = await getConnectedChainId();
+      if (currentCid && currentCid.toLowerCase() !== cfg.chainIdHex.toLowerCase()) {
+        await switchOkxChain(cfg.chainIdHex);
+        setWalletChainId(cfg.chainIdHex);
+      }
+      const payloadRes = await fetch('/api/flash-arb/camelot-adapter-payload?chain=arbitrum');
+      const payloadData = await payloadRes.json();
+      if (!payloadData.success || !payloadData.deployData) {
+        throw new Error(payloadData.error || 'Failed to fetch CamelotV3SwapAdapter payload');
+      }
+      const txHash = await sendOkxTransaction({ data: payloadData.deployData });
+      const receipt = await waitForTxReceipt(txHash, cfg.rpcUrl);
+      if (!receipt || receipt.status !== 1 || !receipt.contractAddress) {
+        throw new Error(`Adapter deployment reverted on Arbitrum One. Tx: ${txHash}`);
+      }
+      await registerCamelotAdapter(receipt.contractAddress);
+      setCamelotAdapterNotice(`CamelotV3SwapAdapter deployed via Wallet: ${receipt.contractAddress}`);
+    } catch (err: any) {
+      setCamelotAdapterError(err?.message || 'Wallet adapter deployment failed');
+    } finally {
+      setIsDeployingCamelotAdapter(false);
+    }
+  };
+
   // Signer Key Modal & Configuration State
   const [isSignerModalOpen, setIsSignerModalOpen] = useState<boolean>(false);
   const [signerKeyInput, setSignerKeyInput] = useState<string>('');
@@ -1528,6 +1665,18 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
         }
       })
       .catch(() => {});
+
+    // Push locally saved Camelot V3 adapter to server if present
+    try {
+      const savedAdapter = localStorage.getItem('flash_arb_camelot_adapter_arbitrum');
+      if (savedAdapter && isValidEvmAddress(savedAdapter)) {
+        fetch('/api/flash-arb/camelot-adapter', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ chain: 'arbitrum', address: savedAdapter }),
+        }).catch(() => {});
+      }
+    } catch {}
 
     return () => clearInterval(agentInterval);
   }, [gasWalletAddress, profitWalletAddress]);
@@ -2079,7 +2228,7 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
   const [simDexA, setSimDexA] = useState<string>('Uniswap V3 (0.05% Tick)');
   const [simDexB, setSimDexB] = useState<string>('PancakeSwap V3');
   const [simSpreadBps, setSimSpreadBps] = useState<number>(28);
-  const [simMinProfitUsd, setSimMinProfitUsd] = useState<number>(8.0);
+  const [simMinProfitUsd, setSimMinProfitUsd] = useState<number>(0.10);
   const [selectedFlashProvider, setSelectedFlashProvider] = useState<FlashLoanProviderId>('BALANCER_V2');
   const [selectedGasOptimization, setSelectedGasOptimization] = useState<GasOptimizationLevel>('HYPER_ALPHA');
 
@@ -2188,13 +2337,30 @@ RPC_BASE_WS=wss://base-mainnet.public.blastapi.io
   };
 
   // Run Real Mathematical Simulation with Gas & Protocol Optimization
-  const handleRunSimulation = () => {
+  const handleRunSimulation = (overrides?: {
+    token?: string;
+    loanAmount?: number;
+    spreadBps?: number;
+    minProfitUsd?: number;
+    flashProviderId?: FlashLoanProviderId;
+    gasOptimization?: GasOptimizationLevel;
+  }) => {
     setPreflightSimulationsCount((c) => c + 1);
+    const activeToken = overrides?.token ?? simToken;
+    const activeLoanAmount = overrides?.loanAmount ?? simLoanAmount;
+    const activeSpreadBps = overrides?.spreadBps ?? simSpreadBps;
+    const activeMinProfitUsd = overrides?.minProfitUsd ?? simMinProfitUsd;
+    const activeProvider =
+      FLASH_LOAN_PROVIDERS.find((p) => p.id === (overrides?.flashProviderId ?? selectedFlashProvider)) ||
+      currentFlashProvider;
+    const activeGasLevel = overrides?.gasOptimization ?? selectedGasOptimization;
+    const activeGasProfile = GAS_OPTIMIZATION_PROFILES[activeGasLevel] || currentGasProfile;
+
     // Inputs must be REAL. If any is unavailable the calculation is refused rather than guessed.
-    const liveTokenPrice = resolveLiveTokenPrice(simToken);
+    const liveTokenPrice = resolveLiveTokenPrice(activeToken);
     const gasPriceGweiLive = gasStatus?.[selectedChain]?.gasPriceGwei;
     if (!(typeof liveTokenPrice === 'number' && liveTokenPrice > 0)) {
-      setSimError(`Live feed price for ${simToken} unavailable yet; click Refresh or wait for next 15s price sync.`);
+      setSimError(`Live feed price for ${activeToken} unavailable yet; click Refresh or wait for next 15s price sync.`);
       return;
     }
     if (!(liveEthPrice > 0)) {
@@ -2207,35 +2373,38 @@ RPC_BASE_WS=wss://base-mainnet.public.blastapi.io
     }
     setSimError(null);
     const tokenPrice = liveTokenPrice;
-    const loanNotionalUsd = simLoanAmount * tokenPrice;
+    const loanNotionalUsd = activeLoanAmount * tokenPrice;
 
     // Flash Loan Protocol Fee (0.00% for Balancer & Spark, 0.05% for Aave/Uniswap)
-    const loanFeeUsd = loanNotionalUsd * (currentFlashProvider.feePercent / 100);
+    const loanFeeUsd = loanNotionalUsd * (activeProvider.feePercent / 100);
     // Loan fee saved compared to standard Aave 0.05%:
     const aaveStandardFeeUsd = loanNotionalUsd * 0.0005;
     const loanFeeSavedUsd = Math.max(0, aaveStandardFeeUsd - loanFeeUsd);
 
     // Gross spread output:
-    const grossSpreadGainUsd = loanNotionalUsd * (simSpreadBps / 10000);
+    const grossSpreadGainUsd = loanNotionalUsd * (activeSpreadBps / 10000);
 
-    // Dynamic gas costs based on dynamically resolved live ETH price:
+    // Dynamic gas costs based on dynamically resolved live ETH price & L2 sequencer mechanics:
     const ethPrice = liveEthPrice;
     const standardGasUnits = GAS_OPTIMIZATION_PROFILES.STANDARD.gasUnits;
-    const currentGasUnits = currentGasProfile.gasUnits;
+    const currentGasUnits = activeGasProfile.gasUnits;
     const gasPriceGwei = gasPriceGweiLive;
 
-    const baselineGasCostUsd = Number(((standardGasUnits * gasPriceGwei * 1e-9) * ethPrice).toFixed(2));
-    const gasCostUsd = Number(((currentGasUnits * gasPriceGwei * 1e-9) * ethPrice).toFixed(2));
-    const gasSavedUsd = Math.max(0, Number((baselineGasCostUsd - gasCostUsd).toFixed(2)));
+    const baselineGasCostUsd = Number(((standardGasUnits * gasPriceGwei * 1e-9) * ethPrice).toFixed(4));
+    const gasCostUsd = Number(((currentGasUnits * gasPriceGwei * 1e-9) * ethPrice).toFixed(4));
+    const gasSavedUsd = Math.max(0, Number((baselineGasCostUsd - gasCostUsd).toFixed(4)));
 
     const grossProfitUsd = grossSpreadGainUsd - loanFeeUsd;
 
-    // Sequencer tip: 55% of net margin after gas
-    const preTipProfit = grossProfitUsd - gasCostUsd;
-    const passedMinProfit = preTipProfit >= simMinProfitUsd;
+    // Calibrated L2 priority tip: Arbitrum uses FCFS (minimal 0.002 Gwei tip on Hyper-Alpha, 0 on lower tiers);
+    // Base/OP OP-Stack uses ultra-lean 0.001 - 0.005 Gwei priority fee instead of forfeiting 55% of spread.
+    const isArb = selectedChain === 'arbitrum';
+    const calibratedTipGwei =
+      activeGasLevel === 'HYPER_ALPHA' ? (isArb ? 0.002 : 0.005) : isArb ? 0 : 0.001;
+    const sequencerTipUsd = Number(((currentGasUnits * calibratedTipGwei * 1e-9) * ethPrice).toFixed(4));
 
-    const sequencerTipUsd = passedMinProfit ? preTipProfit * 0.55 : 0;
-    const netProfitUsd = passedMinProfit ? preTipProfit - sequencerTipUsd : Math.max(0, preTipProfit);
+    const netProfitUsd = grossProfitUsd - gasCostUsd - sequencerTipUsd;
+    const passedMinProfit = netProfitUsd >= activeMinProfitUsd;
 
     setSimResult({
       grossProfitUsd,
@@ -2247,9 +2416,47 @@ RPC_BASE_WS=wss://base-mainnet.public.blastapi.io
       sequencerTipUsd,
       netProfitUsd,
       passedMinProfit,
-      revmVerified: false, // this is an arithmetic estimate; only the Rust searcher's eth_call verifies trades
+      revmVerified: false, // this is an arithmetic estimate; only eth_estimateGas / Rust searcher verifies trades on-chain
       gasUnits: currentGasUnits,
-      gasReductionPercent: currentGasProfile.savingsPercent,
+      gasReductionPercent: activeGasProfile.savingsPercent,
+    });
+  };
+
+  const handleOptimizeSimulatorParameters = () => {
+    const bestOpp =
+      agentOpportunities.find((o) => o.isProfitable && o.contractExecutable) ||
+      agentOpportunities.find((o) => o.grossSpreadBps > o.dexFeeBps && o.contractExecutable) ||
+      agentOpportunities[0];
+
+    const bestTokenSym = bestOpp?.loanToken && activeChainTokens.some((t) => t.symbol === bestOpp.loanToken)
+      ? bestOpp.loanToken
+      : currentTokenConfig.symbol;
+    const bestTokCfg = activeChainTokens.find((t) => t.symbol === bestTokenSym) || currentTokenConfig;
+    const optDexA = activeChainDexPools.find((d) => d.name.includes('0.01%'))?.name ||
+      activeChainDexPools.find((d) => d.name.includes('0.05%'))?.name ||
+      simDexA;
+    const optDexB = activeChainDexPools.find((d) => d.name === 'PancakeSwap V3' || d.name === 'SushiSwap V3' || d.name === 'Uniswap V3')?.name ||
+      simDexB;
+    const optSpread = bestOpp && bestOpp.grossSpreadBps > 0 ? Math.max(5, Math.round(bestOpp.grossSpreadBps)) : bestTokCfg.typicalSpreadBps;
+    const optLoan = bestOpp && bestOpp.optimalLoanAmount > 0 ? bestOpp.optimalLoanAmount : bestTokCfg.defaultLoan;
+    const optMinGuard = 0.10;
+
+    setSelectedFlashProvider('BALANCER_V2');
+    setSelectedGasOptimization('HYPER_ALPHA');
+    setSimToken(bestTokenSym);
+    setSimDexA(optDexA);
+    setSimDexB(optDexB);
+    setSimLoanAmount(optLoan);
+    setSimSpreadBps(optSpread);
+    setSimMinProfitUsd(optMinGuard);
+
+    handleRunSimulation({
+      token: bestTokenSym,
+      loanAmount: optLoan,
+      spreadBps: optSpread,
+      minProfitUsd: optMinGuard,
+      flashProviderId: 'BALANCER_V2',
+      gasOptimization: 'HYPER_ALPHA',
     });
   };
 
@@ -3896,6 +4103,60 @@ RPC_BASE_WS=wss://base-mainnet.public.blastapi.io
                       </button>
                     </div>
                   )}
+
+                  {selectedChain === 'arbitrum' && (
+                    <div className="p-3.5 rounded-xl bg-slate-950/80 border border-amber-500/30 space-y-2.5">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-xs font-bold text-amber-300 font-mono">
+                          Camelot V3 / V2 Arbitrum Execution Options
+                        </span>
+                        <span className={`text-[10px] px-2 py-0.5 rounded font-mono font-bold ${
+                          arbitrumCapabilities.supportsAlgebra
+                            ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
+                            : arbitrumCapabilities.camelotV3Adapter
+                            ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/30'
+                            : 'bg-slate-800 text-slate-400'
+                        }`}>
+                          {arbitrumCapabilities.supportsAlgebra
+                            ? 'Native Camelot V3 + V2 Ready'
+                            : arbitrumCapabilities.camelotV3Adapter
+                            ? 'Adapter Active (Camelot V3 Ready)'
+                            : 'Needs Upgrade or Adapter'}
+                        </span>
+                      </div>
+                      <p className="text-[11px] text-slate-300 font-sans leading-relaxed">
+                        <strong>Option 1:</strong> Deploying <em>FlashArbOptimized</em> above includes built-in native support for Camelot V3 (Algebra) &amp; Camelot V2.{' '}
+                        <strong>Option 2:</strong> Keep existing <code className="text-cyan-300">{formatShortAddress(deployedContracts.arbitrum)}</code> and deploy only the lightweight stateless <code className="text-amber-200">CamelotV3SwapAdapter</code>.
+                      </p>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <button
+                          type="button"
+                          disabled={isDeployingCamelotAdapter}
+                          onClick={() => handleDeployCamelotAdapter()}
+                          className="px-3 py-1.5 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/40 text-amber-200 font-bold text-[11px] font-mono cursor-pointer disabled:opacity-50"
+                        >
+                          {isDeployingCamelotAdapter ? 'Deploying Adapter...' : 'Deploy CamelotV3SwapAdapter'}
+                        </button>
+                        <input
+                          type="text"
+                          value={camelotAdapterInput}
+                          onChange={(e) => setCamelotAdapterInput(e.target.value)}
+                          placeholder="Existing adapter 0x..."
+                          className="flex-1 min-w-[180px] bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-[11px] font-mono text-white placeholder:text-slate-600 focus:outline-none focus:border-cyan-400"
+                        />
+                        <button
+                          type="button"
+                          disabled={isDeployingCamelotAdapter}
+                          onClick={handleSaveCamelotAdapter}
+                          className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-cyan-300 font-bold text-[11px] font-mono cursor-pointer"
+                        >
+                          Save Adapter
+                        </button>
+                      </div>
+                      {camelotAdapterError && <p className="text-[11px] text-rose-300 font-mono">{camelotAdapterError}</p>}
+                      {camelotAdapterNotice && <p className="text-[11px] text-emerald-300 font-mono">{camelotAdapterNotice}</p>}
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -4173,6 +4434,21 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
               </div>
 
               <div className="flex items-center gap-2 flex-wrap">
+                <button
+                  type="button"
+                  disabled={isUpdatingAgentConfig}
+                  onClick={handleOptimizeAgentParameters}
+                  className="px-3 py-1.5 rounded-xl bg-gradient-to-r from-emerald-500 to-cyan-500 hover:from-emerald-400 hover:to-cyan-400 text-slate-950 font-bold text-xs transition-all flex items-center gap-1.5 cursor-pointer shadow-md disabled:opacity-50"
+                  title="Auto-tune ECO L2 zero-tip gas, $1-100 ETH S* liquidity scaling, and $0.01 Profit Guard, then re-scan live pools"
+                >
+                  {isUpdatingAgentConfig ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <Sparkles className="h-3.5 w-3.5" />
+                  )}
+                  <span>Auto-Optimize Parameters</span>
+                </button>
+
                 {lastConfirmedTxHash && (
                   <a
                     href={`${targetChainConfig.explorer}/tx/${lastConfirmedTxHash}`}
@@ -4205,6 +4481,22 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
                 )}
               </div>
             </div>
+
+            {optimizerFeedback && (
+              <div className="p-2.5 rounded-xl bg-emerald-950/50 border border-emerald-500/40 text-emerald-200 text-[11px] font-mono flex items-center justify-between gap-2">
+                <span className="flex items-center gap-1.5">
+                  <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400 shrink-0" />
+                  <span>{optimizerFeedback}</span>
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setOptimizerFeedback(null)}
+                  className="text-slate-400 hover:text-white text-[10px] cursor-pointer"
+                >
+                  ✕
+                </button>
+              </div>
+            )}
 
             {/* Parameter Optimization & Profit Guard Controls Grid */}
             <div className="grid grid-cols-1 md:grid-cols-3 gap-3 pt-1 text-xs">
@@ -4325,9 +4617,9 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
                   <div className="text-[10px] text-slate-400">Gas Calibration Profile:</div>
                   <div className="grid grid-cols-3 gap-1">
                     {[
-                      { id: 'ECO', label: 'Eco (132k)', tip: '0.01 Gwei' },
-                      { id: 'HYPER_ALPHA', label: 'Alpha (148k)', tip: '0.05 Gwei' },
-                      { id: 'AGGRESSIVE', label: 'Speed (165k)', tip: '0.15 Gwei' },
+                      { id: 'ECO', label: 'Eco (122k)', tip: selectedChain === 'arbitrum' ? '0 Gwei (FCFS)' : '0.001 Gwei' },
+                      { id: 'HYPER_ALPHA', label: 'Alpha (130k)', tip: selectedChain === 'arbitrum' ? '0.002 Gwei' : '0.005 Gwei' },
+                      { id: 'AGGRESSIVE', label: 'Speed (149k)', tip: selectedChain === 'arbitrum' ? '0.01 Gwei' : '0.05 Gwei' },
                     ].map((mode) => (
                       <button
                         key={mode.id}
@@ -4339,7 +4631,7 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
                             ? 'bg-purple-600 text-white shadow-md'
                             : 'bg-slate-900 text-slate-400 hover:text-white border border-slate-800'
                         }`}
-                        title={`Tip: ${mode.tip}`}
+                        title={`Calibrated L2 Tip: ${mode.tip}`}
                       >
                         {mode.label}
                       </button>
@@ -4832,10 +5124,20 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
                                   <button
                                     type="button"
                                     onClick={() => {
+                                      const parsedAmt = parseFloat(String(opp.loanAmount).split(' ')[0]);
+                                      const nextLoan = Number.isFinite(parsedAmt) && parsedAmt > 0 ? parsedAmt : currentTokenConfig.defaultLoan;
+                                      const nextSpread = Math.max(1, Math.round(opp.spreadBps));
                                       setSimToken(opp.token);
-                                      setSimSpreadBps(opp.spreadBps);
+                                      setSimLoanAmount(nextLoan);
+                                      setSimSpreadBps(nextSpread);
+                                      setSimMinProfitUsd(minProfitThresholdUsd);
                                       setActiveSubTab('SIMULATOR');
-                                      handleRunSimulation();
+                                      handleRunSimulation({
+                                        token: opp.token,
+                                        loanAmount: nextLoan,
+                                        spreadBps: nextSpread,
+                                        minProfitUsd: minProfitThresholdUsd,
+                                      });
                                     }}
                                     className="px-2 py-1 rounded-lg bg-cyan-500/20 hover:bg-cyan-500/30 border border-cyan-400/40 text-cyan-300 text-[10px] font-bold flex items-center gap-1 cursor-pointer transition-all whitespace-nowrap"
                                     title="Load into revm sizer"
@@ -5032,9 +5334,16 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
                                   <button
                                     type="button"
                                     onClick={() => {
+                                      const tokCfg = activeChainTokens.find((t) => t.symbol === token0) || currentTokenConfig;
                                       setSimToken(token0);
+                                      setSimLoanAmount(tokCfg.defaultLoan);
+                                      setSimSpreadBps(tokCfg.typicalSpreadBps);
                                       setActiveSubTab('SIMULATOR');
-                                      handleRunSimulation();
+                                      handleRunSimulation({
+                                        token: token0,
+                                        loanAmount: tokCfg.defaultLoan,
+                                        spreadBps: tokCfg.typicalSpreadBps,
+                                      });
                                     }}
                                     className="px-2 py-1 rounded bg-slate-800 hover:bg-cyan-500/20 text-slate-300 hover:text-cyan-300 border border-slate-700 text-[10px] font-bold transition-all cursor-pointer whitespace-nowrap"
                                     title={`Inspect ${token0} in revm sizer`}
@@ -5259,9 +5568,11 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
                     </select>
                   </div>
                 </div>
-                {(simDexA.includes('Camelot') || simDexB.includes('Camelot') || simDexA.includes('Slipstream') || simDexB.includes('Slipstream') || simDexA.includes('Curve') || simDexB.includes('Curve') || simDexA.includes('Balancer') || simDexB.includes('Balancer') || simDexA.includes('Trader Joe') || simDexB.includes('Trader Joe')) && (
+                {((simDexA.includes('Camelot V3') || simDexB.includes('Camelot V3')) && !arbitrumCapabilities.supportsAlgebra && !arbitrumCapabilities.camelotV3Adapter ||
+                  (simDexA.includes('Camelot V2') || simDexB.includes('Camelot V2')) && !arbitrumCapabilities.supportsCamelotV2 ||
+                  simDexA.includes('Slipstream') || simDexB.includes('Slipstream') || simDexA.includes('Curve') || simDexB.includes('Curve') || simDexA.includes('Balancer') || simDexB.includes('Balancer') || simDexA.includes('Trader Joe') || simDexB.includes('Trader Joe')) && (
                   <div className="text-[10px] font-mono text-amber-300/90 bg-amber-950/30 border border-amber-500/20 rounded-lg px-2.5 py-1">
-                    Note: FlashArbOptimized executes V3/V2 routes atomically on Uniswap V3, PancakeSwap V3, SushiSwap V3, Uniswap V2, Sushiswap V2 &amp; BaseSwap V2. Selected monitor-only venues are modeled for spread analysis.
+                    Note: Selected monitor-only venue requires deploying the upgraded FlashArbOptimized or CamelotV3SwapAdapter (Deploy Contract modal) before atomic execution.
                   </div>
                 )}
               </div>
@@ -5340,9 +5651,10 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
                   <label className="text-xs font-mono text-slate-400 block mb-1">Min Profit Guard ($)</label>
                   <input
                     type="number"
-                    min="1"
+                    min="0.01"
                     max="100"
-                    value={Number.isFinite(simMinProfitUsd) ? simMinProfitUsd : 8.0}
+                    step="0.05"
+                    value={Number.isFinite(simMinProfitUsd) ? simMinProfitUsd : 0.10}
                     onChange={(e) => {
                       const val = Number(e.target.value);
                       if (Number.isFinite(val)) setSimMinProfitUsd(val);
@@ -5381,15 +5693,26 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
               </div>
 
               {simError && <div className="text-[11px] font-mono text-rose-300">{simError}</div>}
-              {/* Run Pre-Flight revm Test Button */}
-              <button
-                type="button"
-                onClick={handleRunSimulation}
-                className="w-full py-3 rounded-xl bg-gradient-to-r from-cyan-500 via-indigo-600 to-emerald-500 hover:from-cyan-400 hover:to-emerald-400 text-white font-mono font-bold text-xs flex items-center justify-center gap-2 cursor-pointer shadow-lg shadow-cyan-500/20 transition-all"
-              >
-                <Play className="h-4 w-4" />
-                <span>Run Pre-Flight revm Sizer & Sizing Test</span>
-              </button>
+              {/* Run Pre-Flight revm Test & Optimize Parameter Actions */}
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                <button
+                  type="button"
+                  onClick={handleOptimizeSimulatorParameters}
+                  className="py-3 px-3 rounded-xl bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-400/50 text-emerald-200 font-mono font-bold text-xs flex items-center justify-center gap-1.5 cursor-pointer transition-all"
+                  title="Select 0% Balancer Vault, Hyper-Alpha gas, lowest-fee pools, and $0.10 Profit Guard"
+                >
+                  <Sparkles className="h-4 w-4 text-emerald-400 shrink-0" />
+                  <span>Auto-Optimize</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleRunSimulation()}
+                  className="sm:col-span-2 py-3 rounded-xl bg-gradient-to-r from-cyan-500 via-indigo-600 to-emerald-500 hover:from-cyan-400 hover:to-emerald-400 text-white font-mono font-bold text-xs flex items-center justify-center gap-2 cursor-pointer shadow-lg shadow-cyan-500/20 transition-all"
+                >
+                  <Play className="h-4 w-4" />
+                  <span>Run Pre-Flight revm Sizer & Sizing Test</span>
+                </button>
+              </div>
             </div>
           </div>
 

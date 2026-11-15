@@ -1,15 +1,24 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
 import { ethers } from 'ethers';
 import {
   ARBITRUM_TOKENS,
   CHAIN_TOKENS,
   CHAIN_DEX_ROUTERS,
+  V3_QUOTER_V2_ADDRESSES,
+  CAMELOT_V3_ROUTER_ADDRESS,
+  CAMELOT_V2_ROUTER_ADDRESS,
   getChainTokens,
   getChainDexRouters,
+  getEffectiveChainDexRouters,
   FLASH_ARB_OPTIMIZED_ABI,
   resolveArbitrageCandidates,
   buildScaledArbitrageCandidates,
+  buildMaxProfitProbeCalldata,
+  rebuildCandidateWithMinProfit,
+  parseInsufficientProfitError,
   encodeExecuteDirectFlashArb,
   encodeRescueTokens,
   encodeRescueTokensTo,
@@ -498,6 +507,215 @@ test('buildScaledArbitrageCandidates caps by Balancer Vault liquidity and genera
   assert.equal(capped[1].amountUnits, ethers.parseEther('2.75'));
   assert.equal(capped[2].amountUnits, ethers.parseEther('1.1'));
 });
+
+test('resolveArbitrageCandidates scales minProfitUnits proportionally for tight L2 spreads without inflated revert floors', () => {
+  const cands = resolveArbitrageCandidates(
+    {
+      chain: 'arbitrum',
+      baseToken: ARBITRUM_TOKENS.WETH,
+      quoteToken: ARBITRUM_TOKENS.USDC,
+      buyDex: 'PancakeSwap V3',
+      buyFeePercent: 0.01,
+      sellDex: 'Uniswap V3',
+      sellFeePercent: 0.01,
+      optimalLoanBaseUnits: 0.1, // $180 trade
+      buyPriceQuotePerBase: 1800,
+      buyPriceUsd: 1800,
+      estNetProfitUsd: 0.02, // $0.02 expected profit
+    },
+    RECIPIENT,
+    0.1 // 10% fallback clip -> $0.002 expected profit
+  );
+  assert.equal(cands.length, 2);
+  // Quote USDC minProfit should be ~25% of $0.002 = $0.0005 = 500 units (not $0.005 = 5000 units which would revert!)
+  const usdcCand = cands.find((c) => c.borrowedToken.sym === 'USDC')!;
+  assert.ok(usdcCand.minProfitUnits >= 1n && usdcCand.minProfitUnits <= 1000n);
+});
+
+test('V3 profit probe calldata, InsufficientProfit parser, minProfit tightening, and upscale clips work cleanly', () => {
+  const iface = new ethers.Interface(FLASH_ARB_OPTIMIZED_ABI);
+  const input = {
+    chain: 'arbitrum' as const,
+    baseToken: ARBITRUM_TOKENS.WBTC,
+    quoteToken: ARBITRUM_TOKENS.USDT,
+    buyDex: 'Uniswap V3',
+    buyFeePercent: 0.05,
+    sellDex: 'PancakeSwap V3',
+    sellFeePercent: 0.05,
+    optimalLoanBaseUnits: 0.1,
+    buyPriceQuotePerBase: 65000,
+    buyPriceUsd: 65000,
+    estNetProfitUsd: 12,
+  };
+  const cands = buildScaledArbitrageCandidates(
+    input,
+    RECIPIENT,
+    {
+      [ARBITRUM_TOKENS.WBTC.addr.toLowerCase()]: ethers.parseUnits('2', 8),
+      [ARBITRUM_TOKENS.USDT.addr.toLowerCase()]: ethers.parseUnits('50000', 6),
+    },
+    [1.5, 1, 0.5]
+  );
+  assert.ok(cands.some((c) => c.label.includes('150% clip')));
+  const first = cands[0];
+  assert.equal(first.routeType, 3); // V3 -> V3
+
+  const probeData = buildMaxProfitProbeCalldata(first);
+  const decodedProbe = iface.decodeFunctionData('executeOptimizedArbitrage', probeData);
+  assert.equal(decodedProbe.minProfit, ethers.MaxUint256);
+
+  const errHex = iface.encodeErrorResult('InsufficientProfit', [2500000n, ethers.MaxUint256]);
+  const parsed = parseInsufficientProfitError({ error: { data: errHex } });
+  assert.deepEqual(parsed, { actual: 2500000n, required: ethers.MaxUint256 });
+
+  const tightened = rebuildCandidateWithMinProfit(first, (parsed!.actual * 75n) / 100n);
+  assert.equal(tightened.minProfitUnits, 1875000n);
+  const decodedTight = iface.decodeFunctionData('executeOptimizedArbitrage', tightened.calldata);
+  assert.equal(decodedTight.minProfit, 1875000n);
+
+  assert.ok(V3_QUOTER_V2_ADDRESSES.arbitrum['Uniswap V3']);
+  assert.ok(V3_QUOTER_V2_ADDRESSES.arbitrum['PancakeSwap V3']);
+  assert.ok(V3_QUOTER_V2_ADDRESSES.arbitrum['SushiSwap V3']);
+  assert.ok(V3_QUOTER_V2_ADDRESSES.base['Uniswap V3']);
+  assert.ok(V3_QUOTER_V2_ADDRESSES.base['PancakeSwap V3']);
+  assert.ok(V3_QUOTER_V2_ADDRESSES.base['SushiSwap V3']);
+});
+
+test('getEffectiveChainDexRouters enables Camelot V3/V2 for Option 1 (native) and Option 2 (adapter)', () => {
+  const defaultRouters = getEffectiveChainDexRouters('arbitrum');
+  assert.equal(defaultRouters['Camelot V3'].supported, false);
+  assert.equal(defaultRouters['Camelot V2'].supported, false);
+
+  const option1Routers = getEffectiveChainDexRouters('arbitrum', {
+    supportsAlgebra: true,
+    supportsCamelotV2: true,
+  });
+  assert.equal(option1Routers['Camelot V3'].supported, true);
+  assert.equal(option1Routers['Camelot V3'].router, CAMELOT_V3_ROUTER_ADDRESS);
+  assert.equal(option1Routers['Camelot V3'].isV3, true);
+  assert.equal(option1Routers['Camelot V2'].supported, true);
+  assert.equal(option1Routers['Camelot V2'].router, CAMELOT_V2_ROUTER_ADDRESS);
+  assert.equal(option1Routers['Camelot V2'].isV3, false);
+
+  const adapterAddr = '0x1234567890AbcdEF1234567890aBcdef12345678';
+  const option2Routers = getEffectiveChainDexRouters('arbitrum', {
+    camelotV3Adapter: adapterAddr,
+  });
+  assert.equal(option2Routers['Camelot V3'].supported, true);
+  assert.equal(option2Routers['Camelot V3'].router, adapterAddr);
+  assert.equal(option2Routers['Camelot V2'].supported, false);
+
+  // Base remains unaffected by Arbitrum capability flags
+  const baseWithArbCaps = getEffectiveChainDexRouters('base', {
+    supportsAlgebra: true,
+    camelotV3Adapter: adapterAddr,
+  });
+  assert.equal(baseWithArbCaps['Aerodrome Slipstream'].supported, false);
+});
+
+test('resolveArbitrageCandidates & buildScaledArbitrageCandidates encode Camelot V3 <-> PancakeSwap V3 and Camelot V2 under Option 1 & Option 2', () => {
+  const iface = new ethers.Interface(FLASH_ARB_OPTIMIZED_ABI);
+  const camelotToPancakeInput = {
+    chain: 'arbitrum' as const,
+    baseToken: ARBITRUM_TOKENS.WETH,
+    quoteToken: ARBITRUM_TOKENS.USDC,
+    buyDex: 'Camelot V3',
+    buyFeePercent: 0.05,
+    sellDex: 'PancakeSwap V3',
+    sellFeePercent: 0.05,
+    optimalLoanBaseUnits: 1,
+    buyPriceQuotePerBase: 2500,
+    buyPriceUsd: 2500,
+    estNetProfitUsd: 15,
+  };
+
+  // Option 1: Native upgraded FlashArbOptimized with supportsAlgebra
+  const nativeCands = resolveArbitrageCandidates(
+    camelotToPancakeInput,
+    RECIPIENT,
+    1,
+    { supportsAlgebra: true, supportsCamelotV2: true }
+  );
+  assert.equal(nativeCands.length, 2);
+  assert.equal(nativeCands[0].routeType, 3); // V3 -> V3
+  const decodedNativeQuote = iface.decodeFunctionData('executeOptimizedArbitrage', nativeCands[1].calldata);
+  assert.equal(decodedNativeQuote.routerA.toLowerCase(), CAMELOT_V3_ROUTER_ADDRESS.toLowerCase());
+  assert.equal(decodedNativeQuote.routerB.toLowerCase(), '0x1b81d678ffb9c0263b24a97847620c99d213eb14');
+
+  // Option 1: Camelot V2 -> Uniswap V3
+  const camelotV2Cands = resolveArbitrageCandidates(
+    {
+      ...camelotToPancakeInput,
+      buyDex: 'Camelot V2',
+      buyFeePercent: 0.3,
+      sellDex: 'Uniswap V3',
+    },
+    RECIPIENT,
+    1,
+    { supportsAlgebra: true, supportsCamelotV2: true }
+  );
+  assert.equal(camelotV2Cands.length, 2);
+  const decodedV2Base = iface.decodeFunctionData('executeOptimizedArbitrage', camelotV2Cands[0].calldata);
+  assert.equal(Number(decodedV2Base.routeType), 1); // V3 -> V2 (sell on Uniswap V3, buy on Camelot V2)
+  assert.equal(decodedV2Base.routerA.toLowerCase(), '0xe592427a0aece92de3edee1f18e0157c05861564');
+  assert.equal(decodedV2Base.routerB.toLowerCase(), CAMELOT_V2_ROUTER_ADDRESS.toLowerCase());
+
+  const decodedV2Quote = iface.decodeFunctionData('executeOptimizedArbitrage', camelotV2Cands[1].calldata);
+  assert.equal(Number(decodedV2Quote.routeType), 2); // V2 -> V3 (buy on Camelot V2, sell on Uniswap V3)
+  assert.equal(decodedV2Quote.routerA.toLowerCase(), CAMELOT_V2_ROUTER_ADDRESS.toLowerCase());
+  assert.equal(decodedV2Quote.routerB.toLowerCase(), '0xe592427a0aece92de3edee1f18e0157c05861564');
+
+  // Option 2: Existing FlashArbOptimized + CamelotV3SwapAdapter
+  const adapterAddr = '0x1234567890AbcdEF1234567890aBcdef12345678';
+  const scaledAdapterCands = buildScaledArbitrageCandidates(
+    camelotToPancakeInput,
+    RECIPIENT,
+    {
+      [ARBITRUM_TOKENS.WETH.addr.toLowerCase()]: ethers.parseEther('10'),
+      [ARBITRUM_TOKENS.USDC.addr.toLowerCase()]: ethers.parseUnits('25000', 6),
+    },
+    [1, 0.5],
+    { camelotV3Adapter: adapterAddr }
+  );
+  assert.equal(scaledAdapterCands.length, 4);
+  const decodedAdapterQuote = iface.decodeFunctionData(
+    'executeOptimizedArbitrage',
+    scaledAdapterCands.find((c) => c.borrowedToken.sym === 'USDC')!.calldata
+  );
+  assert.equal(decodedAdapterQuote.routerA.toLowerCase(), adapterAddr.toLowerCase());
+
+  // Without native support, Camelot V2 stays excluded even if CamelotV3SwapAdapter is configured
+  const v2ExcludedWithAdapterOnly = resolveArbitrageCandidates(
+    {
+      ...camelotToPancakeInput,
+      buyDex: 'Camelot V2',
+      sellDex: 'Uniswap V3',
+    },
+    RECIPIENT,
+    1,
+    { camelotV3Adapter: adapterAddr }
+  );
+  assert.equal(v2ExcludedWithAdapterOnly.length, 0);
+});
+
+test('compiled FlashArbOptimized and CamelotV3SwapAdapter artifacts exist with expected selectors', () => {
+  const outDir = path.resolve(process.cwd(), 'flash-arb/contracts/out');
+  const mainArtifact = JSON.parse(fs.readFileSync(path.join(outDir, 'FlashArbOptimized.json'), 'utf8'));
+  const adapterArtifact = JSON.parse(fs.readFileSync(path.join(outDir, 'CamelotV3SwapAdapter.json'), 'utf8'));
+
+  assert.ok(typeof mainArtifact.bytecode === 'string' && mainArtifact.bytecode.startsWith('0x'));
+  assert.ok(typeof mainArtifact.deployedBytecode === 'string' && mainArtifact.deployedBytecode.startsWith('0x'));
+  assert.ok(Array.isArray(mainArtifact.abi));
+  assert.ok(mainArtifact.abi.some((entry: { name?: string }) => entry.name === 'routerCapabilities'));
+  assert.ok(mainArtifact.abi.some((entry: { name?: string }) => entry.name === 'executeOptimizedArbitrage'));
+
+  assert.ok(typeof adapterArtifact.bytecode === 'string' && adapterArtifact.bytecode.startsWith('0x'));
+  assert.ok(typeof adapterArtifact.deployedBytecode === 'string' && adapterArtifact.deployedBytecode.startsWith('0x'));
+  assert.ok(Array.isArray(adapterArtifact.abi));
+  assert.ok(adapterArtifact.abi.some((entry: { name?: string }) => entry.name === 'exactInputSingle'));
+  assert.ok(adapterArtifact.abi.some((entry: { name?: string }) => entry.name === 'camelotRouter'));
+});
+
 
 
 

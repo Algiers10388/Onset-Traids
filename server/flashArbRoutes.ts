@@ -8,9 +8,14 @@ import {
   getChainTokens,
   ARBITRUM_DEX_ROUTERS,
   CHAIN_DEX_ROUTERS,
+  CAMELOT_V3_ROUTER_ADDRESS,
   getChainDexRouters,
+  getEffectiveChainDexRouters,
   resolveArbitrageCandidates,
   buildScaledArbitrageCandidates,
+  buildMaxProfitProbeCalldata,
+  rebuildCandidateWithMinProfit,
+  parseInsufficientProfitError,
   encodeExecuteDirectFlashArb,
   encodeRescueTokens,
   encodeRescueTokensTo,
@@ -26,9 +31,11 @@ import {
   computeTradeGasAndFinancingExtra,
   computeGasSurplusAllocation,
   type ArbitrumTokenInfo,
+  type EncodedArbitrageCandidate,
   type ErcStandard,
   type ExtraTokenSpec,
   type RouteExecutionInput,
+  type RouterCapabilityOptions,
   type SupportedArbChain,
 } from './flashArbExecutor.ts';
 
@@ -925,6 +932,7 @@ flashArbRouter.post('/deployed-contracts', (req: Request, res: Response) => {
     return res.status(400).json({ success: false, error: 'Invalid EVM contract address format (must be 0x followed by 40 hex chars)' });
   }
   DEPLOYED_CONTRACTS[targetChain] = address.trim();
+  liveAgent.invalidateChainInfraCache(targetChain as SupportedArbChain);
   return res.json({
     success: true,
     chain: targetChain,
@@ -1031,6 +1039,7 @@ flashArbRouter.post('/deploy-contract', async (req: Request, res: Response) => {
 
     // Register into active deployed contracts store
     DEPLOYED_CONTRACTS[targetChain] = contractAddress;
+    liveAgent.invalidateChainInfraCache(targetChain as SupportedArbChain);
 
     return res.json({
       success: true,
@@ -1050,6 +1059,169 @@ flashArbRouter.post('/deploy-contract', async (req: Request, res: Response) => {
       success: false,
       error: err.message || 'Contract deployment failed',
     });
+  }
+});
+
+// In-memory registry of optional stateless CamelotV3SwapAdapter addresses (lets legacy FlashArbOptimized call Camelot V3)
+const DEPLOYED_CAMELOT_ADAPTERS: Record<string, string> = {
+  arbitrum: (process.env.CAMELOT_V3_ADAPTER_ARBITRUM || '').trim(),
+};
+
+flashArbRouter.get('/camelot-adapter', async (_req: Request, res: Response) => {
+  const arbInfra = await liveAgent.getChainInfra('arbitrum').catch(() => null);
+  res.json({
+    success: true,
+    adapters: DEPLOYED_CAMELOT_ADAPTERS,
+    camelotV3Router: CAMELOT_V3_ROUTER_ADDRESS,
+    arbitrumCapabilities: arbInfra
+      ? {
+          supportsAlgebra: arbInfra.contractSupportsAlgebra,
+          supportsCamelotV2: arbInfra.contractSupportsCamelotV2,
+          camelotV3Adapter: arbInfra.camelotV3Adapter,
+        }
+      : null,
+  });
+});
+
+flashArbRouter.post('/camelot-adapter', (req: Request, res: Response) => {
+  const { chain, address } = req.body || {};
+  const targetChain = String(chain || 'arbitrum').toLowerCase();
+  const cleanAddr = String(address || '').trim();
+  if (cleanAddr && !/^0x[a-fA-F0-9]{40}$/i.test(cleanAddr)) {
+    return res.status(400).json({ success: false, error: 'Invalid adapter address format (must be 0x + 40 hex chars)' });
+  }
+  DEPLOYED_CAMELOT_ADAPTERS[targetChain] = cleanAddr;
+  liveAgent.invalidateChainInfraCache(targetChain as SupportedArbChain);
+  return res.json({
+    success: true,
+    chain: targetChain,
+    adapterAddress: DEPLOYED_CAMELOT_ADAPTERS[targetChain],
+    adapters: DEPLOYED_CAMELOT_ADAPTERS,
+  });
+});
+
+flashArbRouter.get('/camelot-adapter-payload', async (req: Request, res: Response) => {
+  try {
+    const chain = String(req.query.chain || 'arbitrum').toLowerCase();
+    const rpcInfo = RPC_ENDPOINTS[chain] || RPC_ENDPOINTS.arbitrum;
+    const fs = await import('fs');
+    const path = await import('path');
+    const artifactPath = path.join(process.cwd(), 'flash-arb/contracts/out/CamelotV3SwapAdapter.json');
+    if (!fs.existsSync(artifactPath)) {
+      return res.status(500).json({ success: false, error: 'CamelotV3SwapAdapter artifact not found on disk' });
+    }
+    const artifact = JSON.parse(fs.readFileSync(artifactPath, 'utf8'));
+    const { ethers } = await import('ethers');
+    const abiCoder = ethers.AbiCoder.defaultAbiCoder();
+    const encodedArgs = abiCoder.encode(['address'], [CAMELOT_V3_ROUTER_ADDRESS]);
+    const deployData = artifact.bytecode + encodedArgs.slice(2);
+    return res.json({
+      success: true,
+      chain,
+      chainName: rpcInfo.name,
+      chainId: rpcInfo.chainId,
+      constructorArgs: { camelotRouter: CAMELOT_V3_ROUTER_ADDRESS },
+      bytecodeLength: artifact.bytecode.length,
+      deployData,
+      abi: artifact.abi,
+    });
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+flashArbRouter.post('/deploy-camelot-adapter', async (req: Request, res: Response) => {
+  try {
+    const { chain, privateKey: reqPrivateKey } = req.body || {};
+    const targetChain = String(chain || 'arbitrum').toLowerCase();
+    if (targetChain !== 'arbitrum') {
+      return res.status(400).json({ success: false, error: 'CamelotV3SwapAdapter is only needed on Arbitrum One.' });
+    }
+    const rpcInfo = RPC_ENDPOINTS.arbitrum;
+    const fs = await import('fs');
+    const path = await import('path');
+    const artifactPath = path.join(process.cwd(), 'flash-arb/contracts/out/CamelotV3SwapAdapter.json');
+    if (!fs.existsSync(artifactPath)) {
+      return res.status(500).json({ success: false, error: 'CamelotV3SwapAdapter artifact not found on disk' });
+    }
+    const artifact = JSON.parse(fs.readFileSync(artifactPath, 'utf8'));
+    const { ethers } = await import('ethers');
+
+    const signerKey = reqPrivateKey || process.env.FLASH_ARB_SIGNER_KEY;
+    if (!signerKey) {
+      const abiCoder = ethers.AbiCoder.defaultAbiCoder();
+      const encodedArgs = abiCoder.encode(['address'], [CAMELOT_V3_ROUTER_ADDRESS]);
+      return res.json({
+        success: false,
+        requiresWallet: true,
+        message: 'No server signer key configured. Deploy CamelotV3SwapAdapter via connected Web3 wallet.',
+        deployData: artifact.bytecode + encodedArgs.slice(2),
+        chain: targetChain,
+        chainName: rpcInfo.name,
+        chainId: rpcInfo.chainId,
+        constructorArgs: [CAMELOT_V3_ROUTER_ADDRESS],
+      });
+    }
+
+    const txPool = getRpcPool(targetChain, true);
+    const cleanKey = signerKey.startsWith('0x') ? signerKey : `0x${signerKey}`;
+    let deployedAddress: string | null = null;
+    let txHash = '';
+    let walletAddress = '';
+    let lastDeployErr: any = null;
+
+    for (const rpcUrl of txPool) {
+      try {
+        const provider = new ethers.JsonRpcProvider(rpcUrl);
+        const wallet = new ethers.Wallet(cleanKey, provider);
+        walletAddress = wallet.address;
+        const balanceWei = await provider.getBalance(wallet.address);
+        if (balanceWei < 50000000000000n) {
+          return res.status(400).json({
+            success: false,
+            error: `Deployer wallet ${wallet.address} holds ${ethers.formatEther(balanceWei)} ETH on ${rpcInfo.name}. Adapter deployment requires ~0.00008 ETH.`,
+          });
+        }
+        const factory = new ethers.ContractFactory(artifact.abi, artifact.bytecode, wallet);
+        const contract = await factory.deploy(CAMELOT_V3_ROUTER_ADDRESS);
+        const deployTx = contract.deploymentTransaction();
+        txHash = deployTx ? deployTx.hash : '';
+        if (txHash) {
+          const receipt = await waitForReceiptWithFailover(targetChain, txHash, 60000);
+          if (receipt.status !== 1) throw new Error('Adapter deployment transaction reverted on-chain.');
+          deployedAddress = receipt.contractAddress || (await contract.getAddress());
+        } else {
+          await contract.waitForDeployment();
+          deployedAddress = await contract.getAddress();
+        }
+        break;
+      } catch (err: any) {
+        lastDeployErr = err;
+        const msg = String(err?.message || '');
+        if (!/429|403|timeout|fetch|coalesce|archive|network|ECONN|socket/i.test(msg)) throw err;
+      }
+    }
+
+    if (!deployedAddress) {
+      throw lastDeployErr || new Error('CamelotV3SwapAdapter deployment failed on Arbitrum One');
+    }
+
+    DEPLOYED_CAMELOT_ADAPTERS.arbitrum = deployedAddress;
+    liveAgent.invalidateChainInfraCache('arbitrum');
+
+    return res.json({
+      success: true,
+      adapterAddress: deployedAddress,
+      txHash,
+      chain: 'arbitrum',
+      chainName: rpcInfo.name,
+      deployer: walletAddress,
+      camelotV3Router: CAMELOT_V3_ROUTER_ADDRESS,
+      explorerUrl: `${rpcInfo.explorer}/address/${deployedAddress}`,
+      txExplorerUrl: `${rpcInfo.explorer}/tx/${txHash}`,
+    });
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err.message || 'Adapter deployment failed' });
   }
 });
 
@@ -1274,6 +1446,31 @@ const POOL_SPECS: PoolSpec[] = [
   // wstETH / WETH (2 pools across 2 DEXes; excludes Camelot V2 stable-curve pair)
   { id: 'univ3_wsteth_weth_001', name: 'Uniswap V3 wstETH/WETH (0.01%)', dex: 'Uniswap V3', pair: 'wstETH/WETH', address: '0x35218a1cbaC5Bbc3E57fd9Bd38219D37571b3537', fee: 0.01, kind: 'v3', base: T.wstETH, quote: T.WETH },
   { id: 'camelot_v3_wsteth_weth', name: 'Camelot V3 wstETH/WETH', dex: 'Camelot V3', pair: 'wstETH/WETH', address: '0xdEb89DE4bb6ecf5BFeD581EB049308b52d9b2Da7', fee: 0.01, kind: 'algebra', base: T.wstETH, quote: T.WETH },
+
+  // Expanded factory-verified Arbitrum V3 pools (PancakeSwap V3 / SushiSwap V3 / Uniswap V3)
+  { id: 'pancake_v3_arb_usdc_005', name: 'PancakeSwap V3 ARB/USDC (0.05%)', dex: 'PancakeSwap V3', pair: 'ARB/USDC', address: '0x9fFCA51D23Ac7F7df82da414865Ef1055E5aFCc3', fee: 0.05, kind: 'v3', base: T.ARB, quote: T.USDC },
+  { id: 'sushiv3_arb_weth_030', name: 'SushiSwap V3 ARB/WETH (0.30%)', dex: 'SushiSwap V3', pair: 'ARB/WETH', address: '0xB3942c9FFA04efBC1Fa746e146bE7565c76E3dC1', fee: 0.30, kind: 'v3', base: T.ARB, quote: T.WETH },
+  { id: 'pancake_v3_link_weth_005', name: 'PancakeSwap V3 LINK/WETH (0.05%)', dex: 'PancakeSwap V3', pair: 'LINK/WETH', address: '0x977f5D9a39049c73bc26eDb3FA15d5f7C0Ac82E9', fee: 0.05, kind: 'v3', base: T.LINK, quote: T.WETH },
+  { id: 'pancake_v3_pendle_weth_005', name: 'PancakeSwap V3 PENDLE/WETH (0.05%)', dex: 'PancakeSwap V3', pair: 'PENDLE/WETH', address: '0x042691F78269BA3d6325c945044239758aecC275', fee: 0.05, kind: 'v3', base: T.PENDLE, quote: T.WETH },
+  { id: 'sushiv3_usdc_usdt_001', name: 'SushiSwap V3 USDC/USDT (0.01%)', dex: 'SushiSwap V3', pair: 'USDC/USDT', address: '0xD1E1Ac29B31B35646EaBD77163E212b76fE3b6A2', fee: 0.01, kind: 'v3', base: T.USDC, quote: T.USDT },
+  { id: 'univ3_usdc_usdce_001', name: 'Uniswap V3 USDC/USDC.e (0.01%)', dex: 'Uniswap V3', pair: 'USDC/USDC.e', address: '0x8e295789c9465487074a65b1ae9Ce0351172393f', fee: 0.01, kind: 'v3', base: T.USDC, quote: T.USDCe },
+  { id: 'pancake_v3_usdc_usdce_001', name: 'PancakeSwap V3 USDC/USDC.e (0.01%)', dex: 'PancakeSwap V3', pair: 'USDC/USDC.e', address: '0xE8BB56ee968333bf18f9CBbE8eEef350540F9607', fee: 0.01, kind: 'v3', base: T.USDC, quote: T.USDCe },
+  { id: 'univ3_wbtc_usdt_005', name: 'Uniswap V3 WBTC/USDT (0.05%)', dex: 'Uniswap V3', pair: 'WBTC/USDT', address: '0x5969EFddE3cF5C0D9a88aE51E47d721096A97203', fee: 0.05, kind: 'v3', base: T.WBTC, quote: T.USDT },
+  { id: 'univ3_wbtc_usdt_030', name: 'Uniswap V3 WBTC/USDT (0.30%)', dex: 'Uniswap V3', pair: 'WBTC/USDT', address: '0x53C6ca2597711Ca7a73b6921fAf4031EeDf71339', fee: 0.30, kind: 'v3', base: T.WBTC, quote: T.USDT },
+  { id: 'pancake_v3_wbtc_usdt_005', name: 'PancakeSwap V3 WBTC/USDT (0.05%)', dex: 'PancakeSwap V3', pair: 'WBTC/USDT', address: '0xaA89ba37D1975Ae294974eBB33dB9D4b5324f2F2', fee: 0.05, kind: 'v3', base: T.WBTC, quote: T.USDT },
+  { id: 'univ3_usdce_usdt_001', name: 'Uniswap V3 USDC.e/USDT (0.01%)', dex: 'Uniswap V3', pair: 'USDC.e/USDT', address: '0x8c9D230D45d6CfeE39a6680Fb7CB7E8DE7Ea8E71', fee: 0.01, kind: 'v3', base: T.USDCe, quote: T.USDT },
+  { id: 'univ3_usdce_usdt_005', name: 'Uniswap V3 USDC.e/USDT (0.05%)', dex: 'Uniswap V3', pair: 'USDC.e/USDT', address: '0x13398E27a21Be1218b6900cbEDF677571df42A48', fee: 0.05, kind: 'v3', base: T.USDCe, quote: T.USDT },
+  { id: 'univ3_usdce_dai_005', name: 'Uniswap V3 USDC.e/DAI (0.05%)', dex: 'Uniswap V3', pair: 'USDC.e/DAI', address: '0xd37Af656Abf91c7f548FfFC0133175b5e4d3d5e6', fee: 0.05, kind: 'v3', base: T.USDCe, quote: T.DAI },
+  { id: 'univ3_usdt_dai_001', name: 'Uniswap V3 USDT/DAI (0.01%)', dex: 'Uniswap V3', pair: 'USDT/DAI', address: '0x7f580f8A02b759C350E6b8340e7c2d4b8162b6a9', fee: 0.01, kind: 'v3', base: T.USDT, quote: T.DAI },
+  { id: 'univ3_usdt_dai_005', name: 'Uniswap V3 USDT/DAI (0.05%)', dex: 'Uniswap V3', pair: 'USDT/DAI', address: '0x6387b0D5853184645cC9a77D6Db133355d2eb4E4', fee: 0.05, kind: 'v3', base: T.USDT, quote: T.DAI },
+  { id: 'univ3_arb_usdce_005', name: 'Uniswap V3 ARB/USDC.e (0.05%)', dex: 'Uniswap V3', pair: 'ARB/USDC.e', address: '0xcDa53B1F66614552F834cEeF361A8D12a0B8DaD8', fee: 0.05, kind: 'v3', base: T.ARB, quote: T.USDCe },
+  { id: 'univ3_arb_usdt_030', name: 'Uniswap V3 ARB/USDT (0.30%)', dex: 'Uniswap V3', pair: 'ARB/USDT', address: '0x97bca422Ec0Ee4851F2110eA743C1cd0a14835a1', fee: 0.30, kind: 'v3', base: T.ARB, quote: T.USDT },
+  { id: 'univ3_arb_usdt_005', name: 'Uniswap V3 ARB/USDT (0.05%)', dex: 'Uniswap V3', pair: 'ARB/USDT', address: '0xB791Ad21ba45C76629003b4A2f04c0d544406e37', fee: 0.05, kind: 'v3', base: T.ARB, quote: T.USDT },
+  { id: 'univ3_pendle_usdc_030', name: 'Uniswap V3 PENDLE/USDC (0.30%)', dex: 'Uniswap V3', pair: 'PENDLE/USDC', address: '0xc6aF8e73e2261264eF95466B97B13e03Bd88165e', fee: 0.30, kind: 'v3', base: T.PENDLE, quote: T.USDC },
+  { id: 'univ3_pendle_usdt_030', name: 'Uniswap V3 PENDLE/USDT (0.30%)', dex: 'Uniswap V3', pair: 'PENDLE/USDT', address: '0x50e7B9293aeF80c304234e86C84a01bE8401C530', fee: 0.30, kind: 'v3', base: T.PENDLE, quote: T.USDT },
+  { id: 'univ3_aave_usdc_030', name: 'Uniswap V3 AAVE/USDC (0.30%)', dex: 'Uniswap V3', pair: 'AAVE/USDC', address: '0x3Db70832F48F8c01ee041671f7BB1cfaA2677584', fee: 0.30, kind: 'v3', base: T.AAVE, quote: T.USDC },
+  { id: 'univ3_uni_usdc_030', name: 'Uniswap V3 UNI/USDC (0.30%)', dex: 'Uniswap V3', pair: 'UNI/USDC', address: '0x05477c22a5349ceE601500Da0489daD137fd6BfA', fee: 0.30, kind: 'v3', base: T.UNI, quote: T.USDC },
+  { id: 'univ3_link_usdt_030', name: 'Uniswap V3 LINK/USDT (0.30%)', dex: 'Uniswap V3', pair: 'LINK/USDT', address: '0x32A5746bA6826828716Cc1A394bC33301eBC7656', fee: 0.30, kind: 'v3', base: T.LINK, quote: T.USDT },
 ];
 
 // ---- Monitored Base L2 pools (95 verified on-chain pools across 6 DEXes with >= $5K depth) ----
@@ -1402,6 +1599,16 @@ const BASE_POOL_SPECS: PoolSpec[] = [
   { id: 'base_sushiv3_usdc_usdbc_001', name: 'SushiSwap V3 USDC/USDbC (0.01%)', dex: 'SushiSwap V3', pair: 'USDC/USDbC', address: '0xD3f749adA01aF29a713545Fb6b8E782B49A75a20', fee: 0.01, kind: 'v3', base: BASE_T.USDC, quote: BASE_T.USDbC },
   { id: 'base_sushiv3_usdc_usdbc_005', name: 'SushiSwap V3 USDC/USDbC (0.05%)', dex: 'SushiSwap V3', pair: 'USDC/USDbC', address: '0x27D8d938d9cfb97A85CA70DefA4D44762A2e1884', fee: 0.05, kind: 'v3', base: BASE_T.USDC, quote: BASE_T.USDbC },
   { id: 'base_aero_slip_usdc_usdbc_ts1', name: 'Aerodrome Slipstream USDC/USDbC (CL-1)', dex: 'Aerodrome Slipstream', pair: 'USDC/USDbC', address: '0x98c7A2338336d2d354663246F64676009c7bDa97', fee: 0.01, kind: 'slipstream', base: BASE_T.USDC, quote: BASE_T.USDbC },
+
+  // Expanded factory-verified Base V3 pools (PancakeSwap V3 / SushiSwap V3 / Uniswap V3)
+  { id: 'base_pancake_v3_weth_usdt_001', name: 'PancakeSwap V3 WETH/USDT (0.01%)', dex: 'PancakeSwap V3', pair: 'WETH/USDT', address: '0x526d54cD4FAc2e6B2ddCb6bC98b9292603061f85', fee: 0.01, kind: 'v3', base: BASE_T.WETH, quote: BASE_T.USDT },
+  { id: 'base_pancake_v3_weth_usdbc_005', name: 'PancakeSwap V3 WETH/USDbC (0.05%)', dex: 'PancakeSwap V3', pair: 'WETH/USDbC', address: '0xe58b73fF901325b8b2056B29712C50237242F520', fee: 0.05, kind: 'v3', base: BASE_T.WETH, quote: BASE_T.USDbC },
+  { id: 'base_sushiv3_weth_usdbc_005', name: 'SushiSwap V3 WETH/USDbC (0.05%)', dex: 'SushiSwap V3', pair: 'WETH/USDbC', address: '0x22ca6d83aB887A535ae1C6011cc36eA9D1255C31', fee: 0.05, kind: 'v3', base: BASE_T.WETH, quote: BASE_T.USDbC },
+  { id: 'base_univ3_usdbc_dai_001', name: 'Uniswap V3 USDbC/DAI (0.01%)', dex: 'Uniswap V3', pair: 'USDbC/DAI', address: '0x22F9623817F152148B4E080E98Af66FBE9C5AdF8', fee: 0.01, kind: 'v3', base: BASE_T.USDbC, quote: BASE_T.DAI },
+  { id: 'base_pancake_v3_usdbc_dai_001', name: 'PancakeSwap V3 USDbC/DAI (0.01%)', dex: 'PancakeSwap V3', pair: 'USDbC/DAI', address: '0xe4eFf19c7AcE186ba39fD3eD639B2D34171f7efF', fee: 0.01, kind: 'v3', base: BASE_T.USDbC, quote: BASE_T.DAI },
+  { id: 'base_univ3_weth_dai_005', name: 'Uniswap V3 WETH/DAI (0.05%)', dex: 'Uniswap V3', pair: 'WETH/DAI', address: '0x93e8542E6CA0eFFfb9D57a270b76712b968A38f5', fee: 0.05, kind: 'v3', base: BASE_T.WETH, quote: BASE_T.DAI },
+  { id: 'base_pancake_v3_weth_dai_005', name: 'PancakeSwap V3 WETH/DAI (0.05%)', dex: 'PancakeSwap V3', pair: 'WETH/DAI', address: '0x9BFa331679b307Cf358438F45f6413a205FD3EBf', fee: 0.05, kind: 'v3', base: BASE_T.WETH, quote: BASE_T.DAI },
+  { id: 'base_univ3_usdt_dai_001', name: 'Uniswap V3 USDT/DAI (0.01%)', dex: 'Uniswap V3', pair: 'USDT/DAI', address: '0xd64e7bF24eE5CC10B5Ab92525D256300Ad3FB81E', fee: 0.01, kind: 'v3', base: BASE_T.USDT, quote: BASE_T.DAI },
 ];
 
 // ---- Monitored Optimism Mainnet pools (verified on-chain via factory getPool with >= $5K depth) ----
@@ -1508,12 +1715,159 @@ class LiveMevAgent {
   // Dynamic Parameter & Profit Guard Settings (Minimum $0.01 floor, NO maximum cap / unbounded upside)
   public minProfitThresholdUsd: number = 0.01; // Strict Profit Guard threshold ($0.01 min net profit, no maximum limit)
   public maxProfitCap: null = null; // No upper bound or ceiling on profit (unbounded upside)
-  public gasOptimizationMode: 'ECO' | 'HYPER_ALPHA' | 'AGGRESSIVE' = 'HYPER_ALPHA';
-  public autoOptimizeSize: boolean = true; // Dynamically scale loan amount to pool liquidity
+  public gasOptimizationMode: 'ECO' | 'HYPER_ALPHA' | 'AGGRESSIVE' = 'ECO';
+  public autoOptimizeSize: boolean = true; // Dynamically scale loan amount to pool liquidity (S*)
+  public minClipUsd: number = 1; // L2-calibrated lower notional bound ($1+) so small S* routes are never clamped into loss
+  public maxLoanEthEquivalent: number = 100; // Unlock deep $5M-$86M pools up to 100 ETH equivalents
+  public fixedClipUsd: number = 10000; // Used only when autoOptimizeSize is false
   public isAutonomousExecutionEnabled: boolean = false; // Auto-executes live on-chain when profit guard cleared
   public lastExecutionTimestamp: number = 0;
   public lastExecutionNotice: string | null = null;
   private routeInputsByOppId = new Map<string, RouteExecutionInput>();
+  private chainInfraCache = new Map<SupportedArbChain, {
+    contractAddr: string;
+    contractHasExec: boolean;
+    contractOwner: string | null;
+    contractSupportsAlgebra: boolean;
+    contractSupportsCamelotV2: boolean;
+    camelotV3Adapter: string | null;
+    vaultBalances: Record<string, bigint>;
+    fetchedAt: number;
+  }>();
+
+  public invalidateChainInfraCache(chain?: SupportedArbChain) {
+    if (chain) this.chainInfraCache.delete(chain);
+    else this.chainInfraCache.clear();
+  }
+
+  public async getChainInfra(chain: SupportedArbChain, forceRefresh = false): Promise<{
+    contractAddr: string;
+    contractHasExec: boolean;
+    contractOwner: string | null;
+    contractSupportsAlgebra: boolean;
+    contractSupportsCamelotV2: boolean;
+    camelotV3Adapter: string | null;
+    vaultBalances: Record<string, bigint>;
+    fetchedAt: number;
+  }> {
+    const contractAddr = DEPLOYED_CONTRACTS[chain] || '';
+    const configuredAdapter = (chain === 'arbitrum' ? DEPLOYED_CAMELOT_ADAPTERS.arbitrum : '') || '';
+    const existing = this.chainInfraCache.get(chain);
+    if (
+      !forceRefresh &&
+      existing &&
+      existing.contractAddr.toLowerCase() === contractAddr.toLowerCase() &&
+      (existing.camelotV3Adapter || '').toLowerCase() === configuredAdapter.toLowerCase() &&
+      Date.now() - existing.fetchedAt < 60000
+    ) {
+      return existing;
+    }
+
+    const rpcInfo = RPC_ENDPOINTS[chain] || RPC_ENDPOINTS.arbitrum;
+    const tokens = Object.values(CHAIN_TOKENS[chain] || {});
+    const paddedVault = rpcInfo.balancerVault.toLowerCase().replace('0x', '').padStart(64, '0');
+    const hasContract = Boolean(contractAddr && /^0x[a-fA-F0-9]{40}$/.test(contractAddr));
+    const hasAdapter = Boolean(configuredAdapter && /^0x[a-fA-F0-9]{40}$/.test(configuredAdapter));
+    const mcCalls: Array<{ target: string; allowFailure: boolean; callData: string }> = [
+      ...(hasContract
+        ? [
+            { target: contractAddr, allowFailure: true, callData: '0x8da5cb5b' }, // owner()
+            { target: contractAddr, allowFailure: true, callData: '0x459a01ae' }, // routerCapabilities()
+          ]
+        : []),
+      ...tokens.map((t) => ({
+        target: t.addr,
+        allowFailure: true,
+        callData: `0x70a08231${paddedVault}`,
+      })),
+    ];
+
+    const [codeResp, adapterCodeResp, mcResp] = await Promise.all([
+      hasContract
+        ? fetchRpcSingleWithFailover(chain, 'eth_getCode', [contractAddr, 'latest'], true).catch(() => ({ result: '0x' }))
+        : Promise.resolve({ result: '0x' }),
+      hasAdapter
+        ? fetchRpcSingleWithFailover(chain, 'eth_getCode', [configuredAdapter, 'latest'], true).catch(() => ({ result: '0x' }))
+        : Promise.resolve({ result: '0x' }),
+      mcCalls.length > 0
+        ? fetchRpcSingleWithFailover(
+            chain,
+            'eth_call',
+            [{ to: MULTICALL3_ADDRESS, data: multicallIface.encodeFunctionData('aggregate3', [mcCalls]) }, 'latest'],
+            false
+          ).catch(() => ({ result: '0x' }))
+        : Promise.resolve({ result: '0x' }),
+    ]);
+
+    const code = String(codeResp?.result || '0x').toLowerCase();
+    const contractHasExec = code !== '0x' && code.length > 2 && code.includes('23b3aa6b');
+    const adapterCode = String(adapterCodeResp?.result || '0x').toLowerCase();
+    const camelotV3Adapter =
+      hasAdapter && adapterCode !== '0x' && adapterCode.length > 2 && adapterCode.includes('414bf389')
+        ? configuredAdapter
+        : null;
+
+    let contractOwner: string | null = null;
+    let contractSupportsAlgebra = false;
+    let contractSupportsCamelotV2 = false;
+    const vaultBalances: Record<string, bigint> = {};
+    if (typeof mcResp?.result === 'string' && mcResp.result !== '0x') {
+      try {
+        const [decoded] = multicallIface.decodeFunctionResult('aggregate3', mcResp.result);
+        const offset = hasContract ? 2 : 0;
+        if (hasContract) {
+          if (decoded[0]?.success && decoded[0]?.returnData?.length >= 66) {
+            contractOwner = ethers.getAddress(`0x${decoded[0].returnData.slice(-40)}`);
+          }
+          if (decoded[1]?.success && decoded[1]?.returnData?.length >= 66) {
+            const capMask = BigInt(decoded[1].returnData.slice(0, 66));
+            contractSupportsAlgebra = (capMask & 2n) !== 0n;
+            contractSupportsCamelotV2 = (capMask & 4n) !== 0n;
+          }
+        }
+        tokens.forEach((t, idx) => {
+          const entry = decoded[offset + idx];
+          if (entry?.success && typeof entry.returnData === 'string' && entry.returnData.length >= 66) {
+            vaultBalances[t.addr.toLowerCase()] = BigInt(entry.returnData.slice(0, 66));
+          }
+        });
+      } catch {
+        // ignore malformed multicall response
+      }
+    }
+
+    const fresh = {
+      contractAddr,
+      contractHasExec,
+      contractOwner,
+      contractSupportsAlgebra,
+      contractSupportsCamelotV2,
+      camelotV3Adapter,
+      vaultBalances,
+      fetchedAt: Date.now(),
+    };
+    this.chainInfraCache.set(chain, fresh);
+    return fresh;
+  }
+
+  public getCachedChainCapabilities(chain: SupportedArbChain) {
+    const cached = this.chainInfraCache.get(chain);
+    const configuredAdapter = (chain === 'arbitrum' ? DEPLOYED_CAMELOT_ADAPTERS.arbitrum : '') || '';
+    return {
+      contractAddr: DEPLOYED_CONTRACTS[chain] || '',
+      supportsAlgebra: cached?.contractSupportsAlgebra ?? false,
+      supportsCamelotV2: cached?.contractSupportsCamelotV2 ?? false,
+      camelotV3Adapter: cached?.camelotV3Adapter ?? (configuredAdapter || null),
+    };
+  }
+
+  public applyOptimalParametersPreset() {
+    this.minProfitThresholdUsd = 0.01;
+    this.gasOptimizationMode = 'ECO';
+    this.autoOptimizeSize = true;
+    this.minClipUsd = 1;
+    this.maxLoanEthEquivalent = 100;
+  }
 
   constructor() {
     this.start();
@@ -1577,33 +1931,38 @@ class LiveMevAgent {
     ethUsd: number; // real WETH/USDC price from chain
     gasPriceGwei: number; // real eth_gasPrice from the chain RPC
     lighterRoute: boolean; // both legs concentrated-liquidity pools
+    maxTradeUsd?: number; // real physical pool reserve / Balancer Vault liquidity cap
   }): LiveArbitrageOpportunity | null {
     const grossSpreadUsd = Math.max(0, params.sellPrice - params.buyPrice);
     const grossSpreadBps = Number(((grossSpreadUsd / params.buyPrice) * 10000).toFixed(2));
     const dexFeeBps = Math.round((params.feeTierA + params.feeTierB) * 100);
     const netEdgeBps = grossSpreadBps - dexFeeBps;
 
-    // Calibrate lowest safe gas limit based on route architecture
-    const baseGasLimit = params.lighterRoute ? 135000 : 148500; // per-route gas budget (project estimate)
+    // Calibrate lowest safe gas limit based on route architecture and L2 sequencer fee mechanics
+    const baseGasLimit = params.lighterRoute ? 135000 : 148500; // per-route gas budget (EIP-1153 + pre-approved)
+    const isFcfsChain = params.chain === 'arbitrum';
 
-    let gasMultiplier = 1.0;
-    let tipGwei = 0.05;
+    let gasMultiplier = 0.96;
+    let tipGwei = isFcfsChain ? 0.002 : 0.005;
     if (this.gasOptimizationMode === 'ECO') {
       gasMultiplier = 0.90;
-      tipGwei = 0.01;
+      tipGwei = isFcfsChain ? 0 : 0.001;
     } else if (this.gasOptimizationMode === 'AGGRESSIVE') {
-      gasMultiplier = 1.15;
-      tipGwei = 0.15;
+      gasMultiplier = 1.10;
+      tipGwei = isFcfsChain ? 0.01 : 0.05;
     }
 
     const optimalGasLimit = Math.round(baseGasLimit * gasMultiplier);
     const gasSavingsPercent = Number((((300000 - optimalGasLimit) / 300000) * 100).toFixed(1));
-    const effectiveGwei = params.gasPriceGwei + tipGwei; // real chain gas price + configured tip
+    const effectiveGwei = params.gasPriceGwei + tipGwei; // real chain gas price + calibrated L2 tip
     const gasEth = (optimalGasLimit * effectiveGwei) / 1e9;
-    const gasCostUsd = Number((gasEth * params.ethUsd).toFixed(3));
+    const gasCostUsd = Number((gasEth * params.ethUsd).toFixed(4));
 
     // ---- Sizing from MEASURED depth (model + rationale in server/arbSizing.ts) ----------------------------
-    // Loan bounds are 0.5 to 15 WETH-equivalents of notional, expressed in units of the loan token.
+    // Calibrated for L2s: min notional floor scales safely from $1 (not $900) so S* never clamps into slippage loss,
+    // while deep pools can scale up to maxLoanEthEquivalent (default 100 ETH eq) bounded by 5% shallow virtual depth
+    // and single-sided physical pool / Balancer Vault caps.
+    const minNotionalUsd = Math.max(this.minClipUsd, gasCostUsd * 2);
     const sized = sizeArbitrage({
       netEdgeBps,
       depthBuyUsd: params.depthA,
@@ -1611,9 +1970,10 @@ class LiveMevAgent {
       buyPrice: params.buyPrice,
       gasCostUsd,
       autoOptimize: this.autoOptimizeSize,
-      fixedClipUsd: 10000,
-      minLoanUnits: (0.5 * params.ethUsd) / params.buyPrice,
-      maxLoanUnits: (15 * params.ethUsd) / params.buyPrice,
+      fixedClipUsd: this.fixedClipUsd,
+      minLoanUnits: minNotionalUsd / params.buyPrice,
+      maxLoanUnits: (this.maxLoanEthEquivalent * params.ethUsd) / params.buyPrice,
+      maxTradeUsd: params.maxTradeUsd,
     });
     if (!sized) return null; // depth not measured: no opportunity is invented
 
@@ -1743,54 +2103,38 @@ class LiveMevAgent {
       };
     }
 
+    const infra = await this.getChainInfra(chain).catch(() => null);
+    const routerCaps: RouterCapabilityOptions | undefined = infra
+      ? {
+          supportsAlgebra: infra.contractSupportsAlgebra,
+          supportsCamelotV2: infra.contractSupportsCamelotV2,
+          camelotV3Adapter: infra.camelotV3Adapter,
+        }
+      : undefined;
+
     // Check raw unscaled route router support first
-    const baseRoutersCheck = resolveArbitrageCandidates({ ...routeInput, chain }, profitWallet);
+    const baseRoutersCheck = resolveArbitrageCandidates({ ...routeInput, chain }, profitWallet, 1, routerCaps);
     if (baseRoutersCheck.length === 0) {
+      const involvesCamelotV3 = routeInput.buyDex === 'Camelot V3' || routeInput.sellDex === 'Camelot V3';
       return {
         ok: false,
         statusCode: 422,
         simulationFailed: true,
-        error: `Route ${routeInput.buyDex} -> ${routeInput.sellDex} on ${rpcInfo.name} uses an unsupported router. Pick a FlashArbOptimized-supported pool pair (Uniswap V3, PancakeSwap V3, SushiSwap V3, Uniswap V2, Sushiswap V2, BaseSwap V2).`,
+        error: involvesCamelotV3
+          ? `Route ${routeInput.buyDex} -> ${routeInput.sellDex} requires either upgrading FlashArbOptimized on ${rpcInfo.name} or deploying the CamelotV3SwapAdapter in the Contract panel.`
+          : `Route ${routeInput.buyDex} -> ${routeInput.sellDex} on ${rpcInfo.name} uses an unsupported router. Pick a FlashArbOptimized-supported pool pair (Uniswap V3, PancakeSwap V3, SushiSwap V3, Uniswap V2, Sushiswap V2, BaseSwap V2).`,
       };
     }
 
-    // Read live Balancer V2 Vault liquidity for both base and quote tokens to cap V3/V2 flash borrow size
-    let balancerVaultBalances: Record<string, bigint> | undefined;
-    try {
-      const paddedVault = rpcInfo.balancerVault.toLowerCase().replace('0x', '').padStart(64, '0');
-      const vaultCalls = [
-        { target: routeInput.baseToken.addr, allowFailure: true, callData: `0x70a08231${paddedVault}` },
-        { target: routeInput.quoteToken.addr, allowFailure: true, callData: `0x70a08231${paddedVault}` },
-      ];
-      const mcVaultData = multicallIface.encodeFunctionData('aggregate3', [vaultCalls]);
-      const { result: mcVaultRes } = await fetchRpcSingleWithFailover(
-        chain,
-        'eth_call',
-        [{ to: MULTICALL3_ADDRESS, data: mcVaultData }, 'latest'],
-        false
-      );
-      if (typeof mcVaultRes === 'string' && mcVaultRes !== '0x') {
-        const [decodedVault] = multicallIface.decodeFunctionResult('aggregate3', mcVaultRes);
-        const parsed: Record<string, bigint> = {};
-        if (decodedVault[0]?.success && decodedVault[0]?.returnData?.length >= 66) {
-          parsed[routeInput.baseToken.addr.toLowerCase()] = BigInt(decodedVault[0].returnData.slice(0, 66));
-        }
-        if (decodedVault[1]?.success && decodedVault[1]?.returnData?.length >= 66) {
-          parsed[routeInput.quoteToken.addr.toLowerCase()] = BigInt(decodedVault[1].returnData.slice(0, 66));
-        }
-        if (Object.keys(parsed).length > 0) {
-          balancerVaultBalances = parsed;
-        }
-      }
-    } catch {
-      // If Vault pre-check RPC call fails transiently, proceed with un-capped progressive clips
-    }
+    const balancerVaultBalances =
+      infra && Object.keys(infra.vaultBalances).length > 0 ? infra.vaultBalances : undefined;
 
     const candidates = buildScaledArbitrageCandidates(
       { ...routeInput, chain },
       profitWallet,
       balancerVaultBalances,
-      [1, 0.5, 0.25, 0.1]
+      [1.5, 1, 0.75, 0.5, 0.25, 0.1, 0.05],
+      routerCaps
     );
     if (candidates.length === 0) {
       return {
@@ -1862,12 +2206,80 @@ class LiveMevAgent {
       };
     }
 
-    // Pre-flight eth_estimateGas verification across candidate borrow directions (0 gas spent on revert)
-    let verifiedCandidate: (typeof candidates)[0] | null = null;
-    let estimatedGas = 0n;
-    let lastRevertReason = 'Pool price converged / insufficient on-chain arbitrage margin';
+    // Step 1: Profit-maximization batch eth_call across ALL scaled candidates (both Base & Quote borrow directions)
+    // Using minProfit = MaxUint256 exposes exact on-chain output via InsufficientProfit(actualWei, MaxUint256).
+    const chainPoolsPre = this.poolsByChain[chain] || this.pools;
+    const ethUsdPre = chainPoolsPre.find((p) => p.pair === 'WETH/USDC')?.priceUsd || opp.buyPrice || 2000;
+    const quoteUsdPrice =
+      routeInput.buyPriceQuotePerBase > 0 && routeInput.buyPriceUsd > 0
+        ? routeInput.buyPriceUsd / routeInput.buyPriceQuotePerBase
+        : 1;
+    const tokenUsdPrice = (sym: string): number => {
+      const upper = sym.toUpperCase();
+      if (upper === routeInput.baseToken.sym.toUpperCase() && routeInput.buyPriceUsd > 0) return routeInput.buyPriceUsd;
+      if (['USDC', 'USDC.E', 'USDBC', 'USDT', 'DAI'].includes(upper)) return 1;
+      if (upper === 'WETH') return ethUsdPre;
+      return quoteUsdPrice > 0 ? quoteUsdPrice : 1;
+    };
 
-    for (const candidate of candidates) {
+    const orderedCandidates: EncodedArbitrageCandidate[] = [];
+    let bestProbeRevertReason: string | null = null;
+    try {
+      const probeBatch = candidates.map((cand, idx) => ({
+        jsonrpc: '2.0',
+        id: idx + 1,
+        method: 'eth_call',
+        params: [
+          {
+            from: signerAddress,
+            to: contractAddr,
+            data: buildMaxProfitProbeCalldata(cand),
+          },
+          'latest',
+        ],
+      }));
+      const { results: probeResults } = await fetchRpcBatchWithFailover(chain, probeBatch);
+      const scored: Array<{ cand: EncodedArbitrageCandidate; actualProfitUsd: number; actualProfitWei: bigint }> = [];
+
+      for (const item of probeResults) {
+        const idx = Number(item?.id) - 1;
+        const cand = candidates[idx];
+        if (!cand || !item?.error) continue;
+        const ins = parseInsufficientProfitError(item.error);
+        if (ins && ins.actual > 0n) {
+          const actualHuman = Number(ethers.formatUnits(ins.actual, cand.borrowedToken.dec));
+          const actualProfitUsd = actualHuman * tokenUsdPrice(cand.borrowedToken.sym);
+          const minRequiredUsd = options?.forceTestExecution ? 0 : this.minProfitThresholdUsd + (opp.gasCostUsd || 0);
+          if (actualProfitUsd >= minRequiredUsd) {
+            // Tighten minProfit to 75% of exact on-chain output (floored at 1n) for maximum MEV/slippage protection
+            const tightenedMinProfit = (ins.actual * 75n) / 100n;
+            scored.push({
+              cand: rebuildCandidateWithMinProfit(cand, tightenedMinProfit > 1n ? tightenedMinProfit : 1n),
+              actualProfitUsd,
+              actualProfitWei: ins.actual,
+            });
+          } else {
+            bestProbeRevertReason = `InsufficientProfit(actualUsd=$${actualProfitUsd.toFixed(4)}, minRequired=$${minRequiredUsd.toFixed(4)})`;
+          }
+        } else if (!bestProbeRevertReason) {
+          bestProbeRevertReason = decodeFlashArbRevertError(item.error);
+        }
+      }
+
+      scored.sort((a, b) => b.actualProfitUsd - a.actualProfitUsd);
+      for (const s of scored) orderedCandidates.push(s.cand);
+    } catch {
+      // If batch probe RPC call fails transiently, fall back to standard candidate order
+    }
+
+    const executionQueue = orderedCandidates.length > 0 ? orderedCandidates : candidates;
+
+    // Step 2: Pre-flight eth_estimateGas verification on highest-profit candidates (0 gas spent on revert)
+    let verifiedCandidate: EncodedArbitrageCandidate | null = null;
+    let estimatedGas = 0n;
+    let lastRevertReason = bestProbeRevertReason || 'Pool price converged / insufficient on-chain arbitrage margin';
+
+    for (const candidate of executionQueue) {
       try {
         const { result: gasHex } = await fetchRpcSingleWithFailover(
           chain,
@@ -2114,6 +2526,10 @@ class LiveMevAgent {
   // Last scan error (null when the latest scan fully succeeded)
   public lastError: string | null = null;
 
+  public getRouteExecutionInput(oppId: string): RouteExecutionInput | undefined {
+    return this.routeInputsByOppId.get(oppId);
+  }
+
   public getStatusForChain(requestedChain: string) {
     const key = (requestedChain || 'arbitrum').toLowerCase();
     if (key === 'all') {
@@ -2124,6 +2540,8 @@ class LiveMevAgent {
         if (profitFlagDelta !== 0) return profitFlagDelta;
         const execDelta = Number(Boolean(b.contractExecutable)) - Number(Boolean(a.contractExecutable));
         if (execDelta !== 0) return execDelta;
+        const posEdgeDelta = Number(b.grossSpreadBps > b.dexFeeBps) - Number(a.grossSpreadBps > a.dexFeeBps);
+        if (posEdgeDelta !== 0) return posEdgeDelta;
         return b.estNetProfitUsd - a.estNetProfitUsd;
       });
       return {
@@ -2157,7 +2575,17 @@ class LiveMevAgent {
     blockNumber: number;
   }> {
     const specs = POOL_SPECS_BY_CHAIN[chain] || [];
-    const chainRouters = getChainDexRouters(chain);
+    const infra = await this.getChainInfra(chain).catch(() => null);
+    const chainRouters = getEffectiveChainDexRouters(
+      chain,
+      infra
+        ? {
+            supportsAlgebra: infra.contractSupportsAlgebra,
+            supportsCamelotV2: infra.contractSupportsCamelotV2,
+            camelotV3Adapter: infra.camelotV3Adapter,
+          }
+        : undefined
+    );
     const rpcLabel = RPC_ENDPOINTS[chain]?.name || chain;
 
     interface SubCallRef { poolIdx: number; kind: 'state' | 'liquidity' | 'fee' | 'balBase' | 'balQuote' }
@@ -2330,27 +2758,34 @@ class LiveMevAgent {
     const quoteUsd = (q: Tok): number | null => (q.sym === 'WETH' ? ethUsd : 1);
 
     const now = Date.now();
-    const priced: Array<Read & { priceUsd: number; depthUsd: number }> = [];
+    const chainTokenList = Object.values(CHAIN_TOKENS[chain] || {});
+    const isTokenArbCompatible = (addr: string) => {
+      const found = chainTokenList.find((t) => t.addr.toLowerCase() === addr.toLowerCase());
+      return found ? found.arbCompatible !== false : true;
+    };
+
+    const priced: Array<Read & { priceUsd: number; depthUsd: number; actualBaseUsd?: number; actualQuoteUsd?: number }> = [];
     for (const r of reads) {
       const qUsd = quoteUsd(r.spec.quote);
       if (qUsd === null) continue; // needs ETH/USD and it is unavailable: omit, do not guess
       const priceUsd = r.basePerQuote * qUsd;
-      let depthUsd = r.depthQuote * qUsd;
+      const depthUsd = r.depthQuote * qUsd; // Keep true virtual in-range L*sqrtP depth for V3 marginal slippage slope
 
+      let actualBaseUsd: number | undefined;
+      let actualQuoteUsd: number | undefined;
       if (r.spec.kind !== 'v2' && r.actualBaseHuman !== null && r.actualQuoteHuman !== null) {
-        const actualBaseUsd = r.actualBaseHuman * priceUsd;
-        const actualQuoteUsd = r.actualQuoteHuman * qUsd;
+        actualBaseUsd = r.actualBaseHuman * priceUsd;
+        actualQuoteUsd = r.actualQuoteHuman * qUsd;
         const actualTvlUsd = actualBaseUsd + actualQuoteUsd;
         // Require real two-sided ERC-20 TVL in V3/Slipstream/Algebra pools (>= $5K total & >= $250 on each side)
         // to reject abandoned / single-sided narrow concentrated ticks with illusory virtual L depth.
         if (actualTvlUsd < 5000 || Math.min(actualBaseUsd, actualQuoteUsd) < 250) {
           continue;
         }
-        depthUsd = Math.min(depthUsd, actualTvlUsd);
       }
 
       if (depthUsd < 5000) continue; // exclude dust/dormant pools
-      priced.push({ ...r, priceUsd, depthUsd });
+      priced.push({ ...r, priceUsd, depthUsd, actualBaseUsd, actualQuoteUsd });
     }
 
     const fmtUsd = (n: number) => (n >= 1e6 ? `$${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `$${(n / 1e3).toFixed(0)}K` : `$${n.toFixed(0)}`);
@@ -2387,6 +2822,27 @@ class LiveMevAgent {
             const aIsBuy = a.priceUsd <= b.priceUsd;
             const buy = aIsBuy ? a : b;
             const sell = aIsBuy ? b : a;
+
+            // Physical reserve boundary: buying BASE on `buy` pulls BASE out; selling BASE on `sell` pulls QUOTE out.
+            const buyOutCapUsd = buy.actualBaseUsd ?? buy.depthUsd * 0.5;
+            const sellOutCapUsd = sell.actualQuoteUsd ?? sell.depthUsd * 0.5;
+            const physicalPoolCapUsd = 0.35 * Math.min(buyOutCapUsd, sellOutCapUsd);
+
+            const qUsd = quoteUsd(buy.spec.quote) ?? 1;
+            const baseVaultBal = infra?.vaultBalances?.[buy.spec.base.addr.toLowerCase()];
+            const quoteVaultBal = infra?.vaultBalances?.[buy.spec.quote.addr.toLowerCase()];
+            const hasVaultInfo = Boolean(infra && Object.keys(infra.vaultBalances).length > 0);
+            const baseVaultUsd =
+              baseVaultBal !== undefined ? (Number(baseVaultBal) / 10 ** buy.spec.base.dec) * buy.priceUsd : 0;
+            const quoteVaultUsd =
+              quoteVaultBal !== undefined ? (Number(quoteVaultBal) / 10 ** buy.spec.quote.dec) * qUsd : 0;
+            const vaultCapUsd = hasVaultInfo ? 0.85 * Math.max(baseVaultUsd, quoteVaultUsd) : Infinity;
+
+            const maxTradeUsd =
+              Number.isFinite(vaultCapUsd) && vaultCapUsd > 0
+                ? Math.min(physicalPoolCapUsd, vaultCapUsd)
+                : physicalPoolCapUsd;
+
             const opp = this.calculateOptimalParameters({
               chain,
               blockNumber: block,
@@ -2406,11 +2862,19 @@ class LiveMevAgent {
               ethUsd,
               gasPriceGwei,
               lighterRoute: buy.spec.kind !== 'v2' && sell.spec.kind !== 'v2',
+              maxTradeUsd,
             });
             if (opp) {
               const buyRouterOk = Boolean(chainRouters[buy.spec.dex]?.supported);
               const sellRouterOk = Boolean(chainRouters[sell.spec.dex]?.supported);
-              opp.contractExecutable = buyRouterOk && sellRouterOk;
+              const contractDeployedOk = infra ? infra.contractHasExec : true;
+              const tokensCompatibleOk =
+                isTokenArbCompatible(buy.spec.base.addr) && isTokenArbCompatible(buy.spec.quote.addr);
+              const balancerFundedOk = hasVaultInfo
+                ? (baseVaultBal ?? 0n) > 0n || (quoteVaultBal ?? 0n) > 0n
+                : true;
+              opp.contractExecutable =
+                buyRouterOk && sellRouterOk && contractDeployedOk && tokensCompatibleOk && balancerFundedOk;
               opps.push(opp);
               chainRouteInputs.set(opp.id, {
                 chain,
@@ -2436,6 +2900,8 @@ class LiveMevAgent {
       if (profitFlagDelta !== 0) return profitFlagDelta;
       const execDelta = Number(Boolean(b.contractExecutable)) - Number(Boolean(a.contractExecutable));
       if (execDelta !== 0) return execDelta;
+      const posEdgeDelta = Number(b.grossSpreadBps > b.dexFeeBps) - Number(a.grossSpreadBps > a.dexFeeBps);
+      if (posEdgeDelta !== 0) return posEdgeDelta;
       const netDelta = b.estNetProfitUsd - a.estNetProfitUsd;
       if (Math.abs(netDelta) > 1e-6) return netDelta;
       return b.grossSpreadBps - a.grossSpreadBps;
@@ -2552,6 +3018,7 @@ flashArbRouter.get('/agent/status', (req: Request, res: Response) => {
     opportunities: statusView.opportunities,
     executedTrades: liveAgent.executedTrades.slice(-20),
     activeContract: statusView.activeContract,
+    arbitrumCapabilities: liveAgent.getCachedChainCapabilities('arbitrum'),
     countsByChain: {
       arbitrum: liveAgent.poolsByChain.arbitrum.length,
       base: liveAgent.poolsByChain.base.length,
@@ -2572,6 +3039,9 @@ flashArbRouter.get('/agent/status', (req: Request, res: Response) => {
       maxProfitCap: null, // No maximum profit cap (unbounded upside)
       gasOptimizationMode: liveAgent.gasOptimizationMode,
       autoOptimizeSize: liveAgent.autoOptimizeSize,
+      minClipUsd: liveAgent.minClipUsd,
+      maxLoanEthEquivalent: liveAgent.maxLoanEthEquivalent,
+      fixedClipUsd: liveAgent.fixedClipUsd,
       isAutonomousExecutionEnabled: liveAgent.isAutonomousExecutionEnabled,
       profitGuardActive: true,
     },
@@ -2589,6 +3059,9 @@ flashArbRouter.get('/agent/config', (_req: Request, res: Response) => {
     maxProfitCap: null, // No maximum profit cap (unbounded upside)
     gasOptimizationMode: liveAgent.gasOptimizationMode,
     autoOptimizeSize: liveAgent.autoOptimizeSize,
+    minClipUsd: liveAgent.minClipUsd,
+    maxLoanEthEquivalent: liveAgent.maxLoanEthEquivalent,
+    fixedClipUsd: liveAgent.fixedClipUsd,
     isAutonomousExecutionEnabled: liveAgent.isAutonomousExecutionEnabled,
     profitGuardActive: true,
   });
@@ -2600,9 +3073,21 @@ flashArbRouter.get('/agent/config', (_req: Request, res: Response) => {
  */
 flashArbRouter.post('/agent/config', (req: Request, res: Response) => {
   try {
-    const { minProfitThresholdUsd, gasOptimizationMode, autoOptimizeSize, isAutonomousExecutionEnabled } = req.body;
+    const {
+      minProfitThresholdUsd,
+      gasOptimizationMode,
+      autoOptimizeSize,
+      minClipUsd,
+      maxLoanEthEquivalent,
+      fixedClipUsd,
+      isAutonomousExecutionEnabled,
+      optimizePreset,
+    } = req.body || {};
 
-    if (typeof minProfitThresholdUsd === 'number' && minProfitThresholdUsd >= 0) {
+    if (optimizePreset === true) {
+      liveAgent.applyOptimalParametersPreset();
+    }
+    if (typeof minProfitThresholdUsd === 'number' && Number.isFinite(minProfitThresholdUsd) && minProfitThresholdUsd >= 0) {
       liveAgent.minProfitThresholdUsd = minProfitThresholdUsd;
     }
     if (['ECO', 'HYPER_ALPHA', 'AGGRESSIVE'].includes(gasOptimizationMode)) {
@@ -2610,6 +3095,15 @@ flashArbRouter.post('/agent/config', (req: Request, res: Response) => {
     }
     if (typeof autoOptimizeSize === 'boolean') {
       liveAgent.autoOptimizeSize = autoOptimizeSize;
+    }
+    if (typeof minClipUsd === 'number' && Number.isFinite(minClipUsd) && minClipUsd >= 0.5 && minClipUsd <= 10000) {
+      liveAgent.minClipUsd = minClipUsd;
+    }
+    if (typeof maxLoanEthEquivalent === 'number' && Number.isFinite(maxLoanEthEquivalent) && maxLoanEthEquivalent >= 1 && maxLoanEthEquivalent <= 500) {
+      liveAgent.maxLoanEthEquivalent = maxLoanEthEquivalent;
+    }
+    if (typeof fixedClipUsd === 'number' && Number.isFinite(fixedClipUsd) && fixedClipUsd >= 10 && fixedClipUsd <= 500000) {
+      liveAgent.fixedClipUsd = fixedClipUsd;
     }
     if (typeof isAutonomousExecutionEnabled === 'boolean') {
       liveAgent.isAutonomousExecutionEnabled = isAutonomousExecutionEnabled;
@@ -2625,9 +3119,275 @@ flashArbRouter.post('/agent/config', (req: Request, res: Response) => {
         maxProfitCap: null,
         gasOptimizationMode: liveAgent.gasOptimizationMode,
         autoOptimizeSize: liveAgent.autoOptimizeSize,
+        minClipUsd: liveAgent.minClipUsd,
+        maxLoanEthEquivalent: liveAgent.maxLoanEthEquivalent,
+        fixedClipUsd: liveAgent.fixedClipUsd,
         isAutonomousExecutionEnabled: liveAgent.isAutonomousExecutionEnabled,
         profitGuardActive: true,
       },
+    });
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+/**
+ * POST /api/flash-arb/agent/optimize
+ * Applies the L2-calibrated optimal parameter profile (ECO 0-tip FCFS/1-milligwei OP-stack,
+ * closed-form S* depth sizing from $1 to 100 ETH eq, $0.01 strict Profit Guard) and runs a fresh live scan.
+ */
+flashArbRouter.post('/agent/optimize', async (_req: Request, res: Response) => {
+  try {
+    liveAgent.applyOptimalParametersPreset();
+    await liveAgent.scan();
+    const allOpps = SUPPORTED_SCAN_CHAINS.flatMap((c) => liveAgent.opportunitiesByChain[c] || []);
+    const profitableOpps = allOpps.filter((o) => o.isProfitable);
+    const positiveEdgeCount = allOpps.filter((o) => o.grossSpreadBps > o.dexFeeBps).length;
+    const topBest = [...allOpps]
+      .sort((a, b) => {
+        const profitFlagDelta = Number(b.isProfitable) - Number(a.isProfitable);
+        if (profitFlagDelta !== 0) return profitFlagDelta;
+        const execDelta = Number(Boolean(b.contractExecutable)) - Number(Boolean(a.contractExecutable));
+        if (execDelta !== 0) return execDelta;
+        const posEdgeDelta = Number(b.grossSpreadBps > b.dexFeeBps) - Number(a.grossSpreadBps > a.dexFeeBps);
+        if (posEdgeDelta !== 0) return posEdgeDelta;
+        const netDelta = b.estNetProfitUsd - a.estNetProfitUsd;
+        if (Math.abs(netDelta) > 1e-6) return netDelta;
+        return b.grossSpreadBps - a.grossSpreadBps;
+      })
+      .slice(0, 5);
+
+    return res.json({
+      success: true,
+      message: `Optimized parameters applied (ECO L2 gas, Dynamic S* $1–${liveAgent.maxLoanEthEquivalent} ETH eq, Profit Guard $${liveAgent.minProfitThresholdUsd.toFixed(2)}). Found ${profitableOpps.length} profitable / ${positiveEdgeCount} positive-edge routes across ${allOpps.length} evaluated.`,
+      config: {
+        minProfitThresholdUsd: liveAgent.minProfitThresholdUsd,
+        maxProfitCap: null,
+        gasOptimizationMode: liveAgent.gasOptimizationMode,
+        autoOptimizeSize: liveAgent.autoOptimizeSize,
+        minClipUsd: liveAgent.minClipUsd,
+        maxLoanEthEquivalent: liveAgent.maxLoanEthEquivalent,
+        fixedClipUsd: liveAgent.fixedClipUsd,
+        isAutonomousExecutionEnabled: liveAgent.isAutonomousExecutionEnabled,
+        profitGuardActive: true,
+      },
+      summary: {
+        evaluatedRoutes: allOpps.length,
+        positiveEdgeRoutes: positiveEdgeCount,
+        profitableRoutes: profitableOpps.length,
+        executableProfitableRoutes: profitableOpps.filter((o) => o.contractExecutable).length,
+        topRoutes: topBest.map((o) => ({
+          chain: o.chain,
+          pair: o.pair,
+          buyDex: o.buyDex,
+          sellDex: o.sellDex,
+          loanAmount: o.optimalLoanAmount,
+          loanToken: o.loanToken,
+          grossSpreadBps: o.grossSpreadBps,
+          dexFeeBps: o.dexFeeBps,
+          gasCostUsd: o.gasCostUsd,
+          estNetProfitUsd: o.estNetProfitUsd,
+          isProfitable: o.isProfitable,
+          contractExecutable: Boolean(o.contractExecutable),
+        })),
+      },
+    });
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+/**
+ * POST /api/flash-arb/agent/verify-v3
+ * Read-only on-chain verification of executable V3 routes across Arbitrum, Base, and Optimism
+ * using real deployed FlashArbOptimized contracts (`eth_call` with minProfit=1n / MaxUint256, 0 gas spent).
+ */
+flashArbRouter.post('/agent/verify-v3', async (req: Request, res: Response) => {
+  try {
+    const rawChain = String(req.body?.chain || req.query?.chain || 'all').toLowerCase();
+    const chainsToCheck: SupportedArbChain[] =
+      rawChain === 'arbitrum' || rawChain === 'base' || rawChain === 'optimism'
+        ? [rawChain]
+        : ['arbitrum', 'base', 'optimism'];
+
+    await Promise.allSettled(chainsToCheck.map((c) => liveAgent.scan(c)));
+
+    const report: Array<{
+      chain: SupportedArbChain;
+      contractAddress: string;
+      contractDeployed: boolean;
+      contractOwner: string | null;
+      testedRoutes: Array<{
+        pair: string;
+        buyDex: string;
+        sellDex: string;
+        routeType: number;
+        spreadBps: number;
+        dexFeeBps: number;
+        candidateLabel: string;
+        borrowedToken: string;
+        amountFormatted: string;
+        onChainSwapsExecuted: boolean;
+        actualProfitFormatted: string | null;
+        status: 'PROFITABLE' | 'EXECUTED_PROFIT_GUARD_OK' | 'REVERTED' | 'SKIPPED';
+        detail: string;
+      }>;
+    }> = [];
+
+    for (const c of chainsToCheck) {
+      const infra = await liveAgent.getChainInfra(c, true);
+      const chainOpps = (liveAgent.opportunitiesByChain[c] || []).filter((o) => o.contractExecutable);
+      const testedRoutes: (typeof report)[0]['testedRoutes'] = [];
+
+      if (!infra.contractHasExec || !infra.contractOwner) {
+        report.push({
+          chain: c,
+          contractAddress: infra.contractAddr,
+          contractDeployed: infra.contractHasExec,
+          contractOwner: infra.contractOwner,
+          testedRoutes,
+        });
+        continue;
+      }
+
+      const maxPerChain = Math.max(1, Math.min(15, Number(req.body?.maxRoutesPerChain || 6) || 6));
+      // Pick top routes first, ensuring DEX/routeType diversity across UniV3, PancakeV3, SushiV3, and V3<->V2
+      const selectedOpps: LiveArbitrageOpportunity[] = [];
+      const seenOppIds = new Set<string>();
+      const pushOpp = (o: LiveArbitrageOpportunity) => {
+        if (seenOppIds.has(o.id) || selectedOpps.length >= maxPerChain) return;
+        seenOppIds.add(o.id);
+        selectedOpps.push(o);
+      };
+      for (const o of chainOpps.slice(0, Math.min(3, maxPerChain))) pushOpp(o);
+      const dexHighlights = ['Camelot V3', 'PancakeSwap V3', 'SushiSwap V3', 'Sushiswap V2', 'Uniswap V2', 'BaseSwap V2', 'Camelot V2'];
+      for (const dexTag of dexHighlights) {
+        const match = chainOpps.find((o) => !seenOppIds.has(o.id) && (o.buyDex.includes(dexTag) || o.sellDex.includes(dexTag)));
+        if (match) pushOpp(match);
+      }
+      for (const o of chainOpps) {
+        if (selectedOpps.length >= maxPerChain) break;
+        pushOpp(o);
+      }
+
+      const recipient = profitWalletEnv() || infra.contractOwner;
+      const routerCaps: RouterCapabilityOptions = {
+        supportsAlgebra: infra.contractSupportsAlgebra,
+        supportsCamelotV2: infra.contractSupportsCamelotV2,
+        camelotV3Adapter: infra.camelotV3Adapter,
+      };
+      const allBatchCalls: any[] = [];
+      const callMeta: Array<{ oppIdx: number; opp: LiveArbitrageOpportunity; cand: EncodedArbitrageCandidate }> = [];
+
+      selectedOpps.forEach((opp, oppIdx) => {
+        const routeInput = liveAgent.getRouteExecutionInput(opp.id);
+        if (!routeInput) return;
+        const cands = buildScaledArbitrageCandidates(
+          { ...routeInput, chain: c },
+          recipient,
+          infra.vaultBalances,
+          [1, 0.25],
+          routerCaps
+        );
+        // Pick up to 1 candidate per borrow direction (Base & Quote) so zero-balance/tight-vault directions are bypassed automatically
+        const seenDirs = new Set<string>();
+        for (const cand of cands) {
+          const dirKey = cand.borrowedToken.addr.toLowerCase();
+          if (seenDirs.has(dirKey)) continue;
+          seenDirs.add(dirKey);
+          allBatchCalls.push({
+            jsonrpc: '2.0',
+            id: allBatchCalls.length + 1,
+            method: 'eth_call',
+            params: [
+              {
+                from: infra.contractOwner,
+                to: infra.contractAddr,
+                data: buildMaxProfitProbeCalldata(cand),
+              },
+              'latest',
+            ],
+          });
+          callMeta.push({ oppIdx, opp, cand });
+        }
+      });
+
+      if (allBatchCalls.length > 0) {
+        const { results } = await fetchRpcBatchWithFailover(c, allBatchCalls);
+        const bestByOpp = new Map<number, (typeof report)[0]['testedRoutes'][0] & { _score: number }>();
+
+        for (const item of results) {
+          const meta = callMeta[Number(item?.id) - 1];
+          if (!meta) continue;
+          const { oppIdx, opp, cand } = meta;
+          const ins = item?.error ? parseInsufficientProfitError(item.error) : null;
+          if (ins) {
+            const actualFmt = ethers.formatUnits(ins.actual, cand.borrowedToken.dec);
+            const score = ins.actual > 0n ? 2 + Number(actualFmt) : 1;
+            const entry: (typeof report)[0]['testedRoutes'][0] & { _score: number } = {
+              _score: score,
+              pair: opp.pair,
+              buyDex: opp.buyDex,
+              sellDex: opp.sellDex,
+              routeType: cand.routeType,
+              spreadBps: opp.grossSpreadBps,
+              dexFeeBps: opp.dexFeeBps,
+              candidateLabel: cand.label,
+              borrowedToken: cand.borrowedToken.sym,
+              amountFormatted: ethers.formatUnits(cand.amountUnits, cand.borrowedToken.dec),
+              onChainSwapsExecuted: true,
+              actualProfitFormatted: actualFmt,
+              status: ins.actual > 0n ? 'PROFITABLE' : 'EXECUTED_PROFIT_GUARD_OK',
+              detail:
+                ins.actual > 0n
+                  ? `Positive on-chain return: +${actualFmt} ${cand.borrowedToken.sym}`
+                  : 'Flash loan + both V3/V2 router swaps executed cleanly; Profit Guard enforced (0 loss).',
+            };
+            const prev = bestByOpp.get(oppIdx);
+            if (!prev || entry._score > prev._score) bestByOpp.set(oppIdx, entry);
+          } else if (!bestByOpp.has(oppIdx)) {
+            const reason = item?.error ? decodeFlashArbRevertError(item.error) : 'Unexpected return';
+            bestByOpp.set(oppIdx, {
+              _score: 0,
+              pair: opp.pair,
+              buyDex: opp.buyDex,
+              sellDex: opp.sellDex,
+              routeType: cand.routeType,
+              spreadBps: opp.grossSpreadBps,
+              dexFeeBps: opp.dexFeeBps,
+              candidateLabel: cand.label,
+              borrowedToken: cand.borrowedToken.sym,
+              amountFormatted: ethers.formatUnits(cand.amountUnits, cand.borrowedToken.dec),
+              onChainSwapsExecuted: false,
+              actualProfitFormatted: null,
+              status: 'REVERTED',
+              detail: reason,
+            });
+          }
+        }
+
+        for (let idx = 0; idx < selectedOpps.length; idx++) {
+          const hit = bestByOpp.get(idx);
+          if (hit) {
+            const { _score: _unused, ...clean } = hit;
+            testedRoutes.push(clean);
+          }
+        }
+      }
+
+      report.push({
+        chain: c,
+        contractAddress: infra.contractAddr,
+        contractDeployed: infra.contractHasExec,
+        contractOwner: infra.contractOwner,
+        testedRoutes,
+      });
+    }
+
+    return res.json({
+      success: true,
+      timestamp: Date.now(),
+      report,
     });
   } catch (err: any) {
     return res.status(500).json({ success: false, error: err.message });

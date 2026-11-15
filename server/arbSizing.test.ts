@@ -1,7 +1,7 @@
 // Run: npx tsx --test server/arbSizing.test.ts
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { sizeArbitrage } from './arbSizing.ts';
+import { sizeArbitrage, loanUnitPrecision } from './arbSizing.ts';
 
 const base = { netEdgeBps: 20, depthBuyUsd: 50_000_000, depthSellUsd: 5_000_000, buyPrice: 2400, gasCostUsd: 0.05, autoOptimize: true };
 
@@ -38,4 +38,74 @@ test('price impact and slippage grow with size; edge below fees is a modelled lo
   assert.ok(big.priceImpactBps > small.priceImpactBps && big.slippageCostUsd > small.slippageCostUsd);
   const neg = sizeArbitrage({ ...base, netEdgeBps: -5 })!;
   assert.ok(neg.netProfitUsd < 0);
+});
+
+test('L2-calibrated minLoanUnits unlocks profitable S* clips that legacy 0.5 ETH floor turned into losses', () => {
+  // Real L2 scenario: +10 bps edge on $600k vs $400k pools -> S* = $240, max profit = $0.12 - $0.005 gas = +$0.115
+  const l2Scenario = {
+    netEdgeBps: 10,
+    depthBuyUsd: 600_000,
+    depthSellUsd: 400_000,
+    buyPrice: 1800,
+    gasCostUsd: 0.005,
+    autoOptimize: true,
+  };
+  const legacy = sizeArbitrage({ ...l2Scenario, minLoanUnits: 0.5 })!; // $900 clip over-borrows past 2*S* ($480) -> negative!
+  assert.ok(legacy.netProfitUsd < 0);
+
+  const optimized = sizeArbitrage({ ...l2Scenario, minLoanUnits: 1 / 1800, maxLoanUnits: 100 })!;
+  assert.equal(optimized.overDepth, false);
+  assert.ok(optimized.netProfitUsd > 0.10);
+});
+
+test('adaptive loanUnitPrecision preserves high-price WBTC/WETH optimal clips without rounding to zero', () => {
+  assert.equal(loanUnitPrecision(65000), 6);
+  assert.equal(loanUnitPrecision(1800), 5);
+  assert.equal(loanUnitPrecision(1.5), 3);
+
+  const btcArb = sizeArbitrage({
+    netEdgeBps: 12,
+    depthBuyUsd: 800_000,
+    depthSellUsd: 400_000,
+    buyPrice: 65000,
+    gasCostUsd: 0.005,
+    autoOptimize: true,
+    minLoanUnits: 1 / 65000,
+    maxLoanUnits: (100 * 1800) / 65000,
+  })!;
+  // S* = 0.0012 / (1/800k + 1/400k) = $320 -> 0.004923 WBTC (legacy .toFixed(2) rounded this to 0.00!)
+  assert.ok(btcArb.loanUnits > 0.004 && btcArb.loanUnits < 0.006);
+  assert.ok(btcArb.netProfitUsd > 0.15);
+});
+
+test('concentrated V3 virtual depth unlocks higher S* profit while maxTradeUsd caps physical pool reserve', () => {
+  // Concentrated V3 pool: virtual in-range depth = $20M / $10M, physical single-sided reserve cap = $5,000
+  const unclamped = sizeArbitrage({
+    netEdgeBps: 15,
+    depthBuyUsd: 20_000_000,
+    depthSellUsd: 10_000_000,
+    buyPrice: 2000,
+    gasCostUsd: 0.005,
+    autoOptimize: true,
+    minLoanUnits: 0.0005,
+    maxLoanUnits: 100,
+    maxTradeUsd: 5000,
+  })!;
+  // S* = 0.0015 / (1/20M + 1/10M) = $10,000 -> capped cleanly at maxTradeUsd ($5,000 = 2.5 WETH)
+  assert.equal(unclamped.overDepth, false);
+  assert.equal(unclamped.loanUnits, 2.5);
+  assert.ok(unclamped.netProfitUsd > 5.0);
+
+  // If clamped down to TVL ($100k/$100k) instead of virtual depth, S* collapses to $75 and profit drops >60x
+  const clampedToTvl = sizeArbitrage({
+    netEdgeBps: 15,
+    depthBuyUsd: 100_000,
+    depthSellUsd: 100_000,
+    buyPrice: 2000,
+    gasCostUsd: 0.005,
+    autoOptimize: true,
+    minLoanUnits: 0.0005,
+    maxLoanUnits: 100,
+  })!;
+  assert.ok(unclamped.netProfitUsd > clampedToTvl.netProfitUsd * 20);
 });
