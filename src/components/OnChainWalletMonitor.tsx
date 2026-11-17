@@ -133,15 +133,13 @@ const NETWORKS = [
 ];
 
 interface OnChainWalletMonitorProps {
-  onOpenOkxWallet?: () => void;
   targetAddress?: { address: string; network: string } | null;
 }
 
 export const OnChainWalletMonitor: React.FC<OnChainWalletMonitorProps> = ({
-  onOpenOkxWallet,
   targetAddress,
 }) => {
-  const { user, signInWithGoogle } = useAuth();
+  const { firebaseUser, signInWithGoogle } = useAuth();
 
   const [inputAddress, setInputAddress] = useState<string>('44AFFq5kSiGBoZ4NMDwYtN18obc8AemS33DBLWs3H7otXft3XjrpDtQGv7SqSsaBYBb98uNbr2VBBEt7f2wfn3RVGQBEP3A');
   const [selectedNetwork, setSelectedNetwork] = useState<string>('monero');
@@ -220,13 +218,13 @@ export const OnChainWalletMonitor: React.FC<OnChainWalletMonitorProps> = ({
 
   // Listen to Watched Wallets from Firestore
   useEffect(() => {
-    if (!user) {
+    if (!firebaseUser) {
       setWatchedWallets([]);
       setIsBookmarked(false);
       return;
     }
 
-    const colRef = collection(db, 'users', user.uid, 'watched_wallets');
+    const colRef = collection(db, 'users', firebaseUser.uid, 'watched_wallets');
     const unsub = onSnapshot(colRef, (snapshot) => {
       const list: Array<{ address: string; network: string; label: string }> = [];
       snapshot.forEach((d) => {
@@ -241,7 +239,7 @@ export const OnChainWalletMonitor: React.FC<OnChainWalletMonitorProps> = ({
     });
 
     return () => unsub();
-  }, [user]);
+  }, [firebaseUser]);
 
   // Check if current wallet is bookmarked
   useEffect(() => {
@@ -255,13 +253,13 @@ export const OnChainWalletMonitor: React.FC<OnChainWalletMonitorProps> = ({
   // Toggle Bookmark in Firestore
   const handleToggleBookmark = async () => {
     if (!profile) return;
-    if (!user) {
+    if (!firebaseUser) {
       await signInWithGoogle();
       return;
     }
 
     const docId = profile.address.toLowerCase();
-    const docRef = doc(db, 'users', user.uid, 'watched_wallets', docId);
+    const docRef = doc(db, 'users', firebaseUser.uid, 'watched_wallets', docId);
 
     if (isBookmarked) {
       await deleteDoc(docRef);
@@ -531,30 +529,6 @@ export const OnChainWalletMonitor: React.FC<OnChainWalletMonitorProps> = ({
               ))}
             </div>
           )}
-
-          {/* Connect OKX Wallet Button */}
-          {onOpenOkxWallet && (
-            <button
-              onClick={onOpenOkxWallet}
-              className="px-2.5 py-1 rounded-lg bg-black hover:bg-neutral-900 border border-white/30 hover:border-white/60 text-white font-mono text-[11px] font-bold transition-all flex items-center gap-1.5 cursor-pointer shadow-sm active:scale-95 ml-auto"
-              title="Connect OKX Web3 Wallet to auto-inspect"
-            >
-              <div className="w-3.5 h-3.5 rounded bg-black flex items-center justify-center p-0.5 shrink-0">
-                <div className="grid grid-cols-3 gap-0.5 w-full h-full">
-                  <div className="bg-white rounded-[0.5px]" />
-                  <div className="bg-black rounded-[0.5px]" />
-                  <div className="bg-white rounded-[0.5px]" />
-                  <div className="bg-black rounded-[0.5px]" />
-                  <div className="bg-white rounded-[0.5px]" />
-                  <div className="bg-black rounded-[0.5px]" />
-                  <div className="bg-white rounded-[0.5px]" />
-                  <div className="bg-black rounded-[0.5px]" />
-                  <div className="bg-white rounded-[0.5px]" />
-                </div>
-              </div>
-              <span>Connect OKX Wallet</span>
-            </button>
-          )}
         </div>
       </div>
 
@@ -621,7 +595,7 @@ export const OnChainWalletMonitor: React.FC<OnChainWalletMonitorProps> = ({
               <span className="text-xs font-mono text-slate-400 uppercase tracking-wider">Classification</span>
               <button
                 onClick={handleToggleBookmark}
-                title={user ? (isBookmarked ? 'Remove from Firestore' : 'Save to Firestore') : 'Sign in to Bookmark'}
+                title={firebaseUser ? (isBookmarked ? 'Remove from Firestore' : 'Save to Firestore') : 'Sign in with Google to Bookmark'}
                 className="flex items-center gap-1 text-xs font-mono text-slate-300 hover:text-white cursor-pointer px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 border border-slate-700"
               >
                 {isBookmarked ? (

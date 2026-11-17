@@ -54,7 +54,6 @@ interface ExchangeManagerModalProps {
   tradingMode: TradingExecutionMode;
   credentialsSummary: CredentialsSummary | null;
   onRefreshCredentials: () => void;
-  onOpenOkxWallet?: () => void;
 }
 
 export const ExchangeManagerModal: React.FC<ExchangeManagerModalProps> = ({
@@ -66,7 +65,6 @@ export const ExchangeManagerModal: React.FC<ExchangeManagerModalProps> = ({
   tradingMode,
   credentialsSummary,
   onRefreshCredentials,
-  onOpenOkxWallet,
 }) => {
   const [activeTab, setActiveTab] = useState<'WALLETS' | 'ROUTING' | 'HEALTH_CHECK'>('WALLETS');
   const [privacyModalOpen, setPrivacyModalOpen] = useState(false);
@@ -722,29 +720,6 @@ export const ExchangeManagerModal: React.FC<ExchangeManagerModalProps> = ({
                             </button>
                           )}
                         </div>
-
-                        {card.id === 'OKX' && onOpenOkxWallet && (
-                          <button
-                            type="button"
-                            onClick={onOpenOkxWallet}
-                            className="w-full py-2 px-3 rounded-xl bg-white hover:bg-neutral-200 text-black font-bold text-xs transition-all flex items-center justify-center gap-2 cursor-pointer shadow-md active:scale-95"
-                          >
-                            <div className="w-3.5 h-3.5 rounded bg-black flex items-center justify-center p-0.5 shrink-0">
-                              <div className="grid grid-cols-3 gap-0.5 w-full h-full">
-                                <div className="bg-white rounded-[0.5px]" />
-                                <div className="bg-black rounded-[0.5px]" />
-                                <div className="bg-white rounded-[0.5px]" />
-                                <div className="bg-black rounded-[0.5px]" />
-                                <div className="bg-white rounded-[0.5px]" />
-                                <div className="bg-black rounded-[0.5px]" />
-                                <div className="bg-white rounded-[0.5px]" />
-                                <div className="bg-black rounded-[0.5px]" />
-                                <div className="bg-white rounded-[0.5px]" />
-                              </div>
-                            </div>
-                            <span>Connect OKX Web3 Wallet</span>
-                          </button>
-                        )}
                       </div>
                     </div>
                   );

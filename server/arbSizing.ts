@@ -9,6 +9,12 @@
  */
 export const MAX_DEPTH_FRACTION = 0.05;
 
+export function computeAdaptiveDepthFraction(netEdgeBps: number): number {
+  if (!Number.isFinite(netEdgeBps) || netEdgeBps < 12) return MAX_DEPTH_FRACTION;
+  if (netEdgeBps >= 25) return 0.08;
+  return 0.065;
+}
+
 export interface SizingInput {
   netEdgeBps: number;      // spread after DEX fees, in bps
   depthBuyUsd: number;     // measured quote-side virtual reserve of the buy pool

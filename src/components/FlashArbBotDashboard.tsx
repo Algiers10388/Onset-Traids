@@ -64,20 +64,14 @@ import {
   persistExecutionLog,
 } from '../services/firestorePersistence';
 import {
-  switchOkxChain,
-  getConnectedChainId,
-  sendOkxTransaction,
-  registerWalletListeners,
-  connectOkxWallet,
-  waitForTxReceipt,
-  OKX_SUPPORTED_CHAINS,
-} from '../services/okxWallet';
+  DEFAULT_USDT_SWEEP_THRESHOLD,
+  parseUsdtSweepThreshold,
+  evaluateContractUsdtSweep,
+} from '../utils/usdtAutoSweep';
 
 interface FlashArbBotDashboardProps {
   onOpenAiTroubleshooter?: (prompt?: string) => void;
   availableAssets?: CryptoAsset[];
-  okxConnectedAddress?: string | null;
-  onOpenOkxWallet?: () => void;
   onOpenCakeWallet?: () => void;
   onArbitrageExecuted?: (trade: {
     symbol: string;
@@ -177,12 +171,10 @@ interface SimulatedOpp {
 export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
   onOpenAiTroubleshooter,
   availableAssets = [],
-  okxConnectedAddress = null,
-  onOpenOkxWallet,
   onOpenCakeWallet,
   onArbitrageExecuted,
 }) => {
-  const { user } = useAuth();
+  const { firebaseUser } = useAuth();
   const [activeSubTab, setActiveSubTab] = useState<'MONITOR' | 'SIMULATOR' | 'CODE_EXPLORER' | 'RISK_CONTROLS'>('MONITOR');
   const [selectedChain, setSelectedChain] = useState<'arbitrum' | 'base' | 'optimism'>('arbitrum');
   const [circuitBreakerTripped, setCircuitBreakerTripped] = useState<boolean>(false);
@@ -224,9 +216,7 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
     sources?: string[];
   } | null>(null);
 
-  // Connected Wallet Live Chain State & Verification
-  const [walletChainId, setWalletChainId] = useState<string | null>(null);
-  const [isSwitchingChain, setIsSwitchingChain] = useState<boolean>(false);
+  // Live Trade Execution State
   const [isExecutingLiveTrade, setIsExecutingLiveTrade] = useState<boolean>(false);
   const [liveExecutionSuccess, setLiveExecutionSuccess] = useState<{
     txHash: string;
@@ -350,7 +340,7 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
     chainName: string;
     explorerUrl: string;
     txExplorerUrl: string;
-    method: 'SERVER_SIGNER' | 'CONNECTED_WALLET';
+    method: 'SERVER_SIGNER' | 'MANUAL';
   } | null>(null);
   const [customContractInput, setCustomContractInput] = useState<string>('');
   const [customContractError, setCustomContractError] = useState<string | null>(null);
@@ -551,7 +541,6 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
       return true;
     }
   });
-  const [includeConnectedWalletTokensInSweep, setIncludeConnectedWalletTokensInSweep] = useState<boolean>(false);
   const [autoSweepEndOfCycle, setAutoSweepEndOfCycle] = useState<boolean>(() => {
     try {
       return localStorage.getItem('flash_arb_auto_sweep_cycle') !== 'false';
@@ -559,20 +548,50 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
       return true;
     }
   });
+  const [autoSweepUsdtEnabled, setAutoSweepUsdtEnabled] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('flash_arb_auto_sweep_usdt') !== 'false';
+    } catch {
+      return true;
+    }
+  });
+  const [usdtSweepThresholdInput, setUsdtSweepThresholdInput] = useState<string>(() => {
+    try {
+      const saved = localStorage.getItem('flash_arb_usdt_sweep_threshold');
+      if (saved !== null && saved.trim() !== '') {
+        return String(parseUsdtSweepThreshold(saved, DEFAULT_USDT_SWEEP_THRESHOLD));
+      }
+    } catch {}
+    return String(DEFAULT_USDT_SWEEP_THRESHOLD);
+  });
+  const usdtSweepThreshold = useMemo(
+    () => parseUsdtSweepThreshold(usdtSweepThresholdInput, DEFAULT_USDT_SWEEP_THRESHOLD),
+    [usdtSweepThresholdInput]
+  );
   const autoSweepEndOfCycleRef = useRef<boolean>(autoSweepEndOfCycle);
+  const autoSweepUsdtEnabledRef = useRef<boolean>(autoSweepUsdtEnabled);
+  const usdtSweepThresholdRef = useRef<number>(usdtSweepThreshold);
   const isAutoSweepingCycleRef = useRef<boolean>(false);
+  const isAutoSweepingUsdtRef = useRef<boolean>(false);
+  const isLoadingHoldingsOverviewRef = useRef<boolean>(false);
+  const isSweepingAllRef = useRef<boolean>(isSweepingAll);
+  const lastUsdtAutoSweepAttemptRef = useRef<Record<'arbitrum' | 'base' | 'optimism', number>>({
+    arbitrum: 0,
+    base: 0,
+    optimism: 0,
+  });
   const hasInitializedAgentTxRef = useRef<boolean>(false);
   const lastAutoSweptTradeTxRef = useRef<string | null>(null);
   const sweepRuntimeRef = useRef({
     extraTokensInput,
-    okxConnectedAddress,
     isSignerKeyConfigured: false,
     includeGasWalletTokensInSweep,
     includeGasWalletEthSurplusInSweep,
-    includeConnectedWalletTokensInSweep,
     profitWalletAddress,
     selectedChain,
     deployedContracts,
+    autoSweepUsdtEnabled,
+    usdtSweepThreshold,
   });
 
   const selectedChainRef = useRef<'arbitrum' | 'base' | 'optimism'>(selectedChain);
@@ -582,10 +601,23 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
   const [showAllOpportunities, setShowAllOpportunities] = useState<boolean>(false);
   const [showAllPools, setShowAllPools] = useState<boolean>(false);
   const poolsMatrixRef = useRef<HTMLDivElement | null>(null);
+  const simProbeSeqRef = useRef<number>(0);
 
   useEffect(() => {
     autoSweepEndOfCycleRef.current = autoSweepEndOfCycle;
   }, [autoSweepEndOfCycle]);
+
+  useEffect(() => {
+    autoSweepUsdtEnabledRef.current = autoSweepUsdtEnabled;
+  }, [autoSweepUsdtEnabled]);
+
+  useEffect(() => {
+    usdtSweepThresholdRef.current = usdtSweepThreshold;
+  }, [usdtSweepThreshold]);
+
+  useEffect(() => {
+    isSweepingAllRef.current = isSweepingAll;
+  }, [isSweepingAll]);
 
   const [sweepAllNotice, setSweepAllNotice] = useState<{
     success: boolean;
@@ -644,9 +676,7 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
           ) {
             lastAutoSweptTradeTxRef.current = latestConfirmedTx;
             if (autoSweepEndOfCycleRef.current && !isAutoSweepingCycleRef.current) {
-              void runEndOfCycleDustSweep(`Autonomous Cycle (${latestConfirmedTx.slice(0, 8)}...)`, {
-                allowWalletPrompt: sweepRuntimeRef.current.includeConnectedWalletTokensInSweep,
-              });
+              void runEndOfCycleDustSweep(`Autonomous Cycle (${latestConfirmedTx.slice(0, 8)}...)`);
             }
           }
         }
@@ -785,28 +815,29 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
   };
 
   const fetchHoldingsOverview = async (extraRaw?: string) => {
+    const requestedChain = selectedChainRef.current;
+    isLoadingHoldingsOverviewRef.current = true;
     setIsLoadingHoldingsOverview(true);
     try {
-      const primaryAddr = deployedContracts[selectedChain] || CHAIN_CONFIG_MAP[selectedChain].contract;
+      const primaryAddr = deployedContracts[requestedChain] || CHAIN_CONFIG_MAP[requestedChain].contract;
       const contractList =
-        selectedChain === 'arbitrum'
+        requestedChain === 'arbitrum'
           ? [primaryAddr, '0xeee31ff9e69904b43c124095b6f33aa61505bcc2', '0x19359c6C418669FCfC46196970814353b8766BE0']
-          : selectedChain === 'base'
+          : requestedChain === 'base'
             ? [primaryAddr, '0x37440674a814f24d9C6ea0990b272215D40c4512', '0xBBA273E057cDa31bB359d8AA8749256246B6d0cC']
             : [primaryAddr];
       const extraList = parseExtraTokenAddresses(extraRaw ?? extraTokensInput);
       const params = new URLSearchParams({
-        chain: selectedChain,
+        chain: requestedChain,
         contracts: Array.from(new Set(contractList)).join(','),
         gasWallet: gasWalletAddress,
         profitWallet: profitWalletAddress,
       });
-      if (okxConnectedAddress) params.set('connectedWallet', okxConnectedAddress);
       if (extraList.length > 0) params.set('extraTokens', extraList.join(','));
       const res = await fetch(`/api/flash-arb/holdings-overview?${params.toString()}`);
       if (res.ok) {
         const data = await res.json();
-        if (data.success) {
+        if (data.success && requestedChain === selectedChainRef.current) {
           setHoldingsOverview(data);
           return data;
         }
@@ -814,6 +845,7 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
     } catch {
       // keep previous overview
     } finally {
+      isLoadingHoldingsOverviewRef.current = false;
       setIsLoadingHoldingsOverview(false);
     }
     return null;
@@ -821,12 +853,19 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
 
   const executeSweepAllBalances = async (options?: {
     autoTriggered?: boolean;
+    autoReason?: 'CYCLE' | 'USDT_THRESHOLD';
     cycleLabel?: string;
     includeGasOverride?: boolean;
     includeGasEthOverride?: boolean;
-    includeConnectedOverride?: boolean;
+    tokenSymbols?: string[];
+    skipContractEth?: boolean;
+    contractAddressOverride?: string;
+    extraContractsOverride?: string[];
   }) => {
-    if (!isValidEvmAddress(profitWalletAddress)) {
+    const rt = sweepRuntimeRef.current;
+    const targetChain = rt.selectedChain;
+    const targetProfitWallet = rt.profitWalletAddress;
+    if (!isValidEvmAddress(targetProfitWallet)) {
       if (!options?.autoTriggered) {
         setSweepAllNotice({ success: false, message: 'Configure a valid 42-character EVM Profit Vault address first.' });
       }
@@ -834,8 +873,8 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
     }
     const includeGas = options?.includeGasOverride ?? includeGasWalletTokensInSweep;
     const includeGasEthSurplus = options?.includeGasEthOverride ?? includeGasWalletEthSurplusInSweep;
-    const includeConnected = options?.includeConnectedOverride ?? includeConnectedWalletTokensInSweep;
 
+    isSweepingAllRef.current = true;
     setIsSweepingAll(true);
     if (!options?.autoTriggered) {
       setSweepAllNotice(null);
@@ -843,26 +882,38 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
     }
     try {
       const extraTokenAddresses = parseExtraTokenAddresses(extraTokensInput);
+      const contractAddress =
+        options?.contractAddressOverride ||
+        rt.deployedContracts[targetChain] ||
+        CHAIN_CONFIG_MAP[targetChain].contract;
+      const extraContracts =
+        options?.extraContractsOverride ??
+        (targetChain === 'arbitrum'
+          ? ['0xeee31ff9e69904b43c124095b6f33aa61505bcc2', '0x19359c6C418669FCfC46196970814353b8766BE0']
+          : targetChain === 'base'
+            ? ['0x37440674a814f24d9C6ea0990b272215D40c4512', '0xBBA273E057cDa31bB359d8AA8749256246B6d0cC']
+            : []);
+
       const res = await fetch('/api/flash-arb/sweep-all', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          chain: selectedChain,
-          contractAddress: deployedContracts[selectedChain] || CHAIN_CONFIG_MAP[selectedChain].contract,
-          extraContracts:
-            selectedChain === 'arbitrum'
-              ? ['0xeee31ff9e69904b43c124095b6f33aa61505bcc2', '0x19359c6C418669FCfC46196970814353b8766BE0']
-              : selectedChain === 'base'
-                ? ['0x37440674a814f24d9C6ea0990b272215D40c4512', '0xBBA273E057cDa31bB359d8AA8749256246B6d0cC']
-                : [],
+          chain: targetChain,
+          contractAddress,
+          extraContracts,
           extraTokenAddresses,
-          recipient: profitWalletAddress.trim(),
+          recipient: targetProfitWallet.trim(),
           includeGasWalletTokens: includeGas,
           includeGasWalletEthSurplus: includeGasEthSurplus,
           minGasReserveEth: 0.002,
-          includeConnectedWalletTokens: includeConnected,
-          connectedWalletAddress: okxConnectedAddress || undefined,
+          includeConnectedWalletTokens: false,
           compatibleOnly: true,
+          ...(Array.isArray(options?.tokenSymbols) && options.tokenSymbols.length > 0
+            ? { tokenSymbols: options.tokenSymbols }
+            : {}),
+          ...(typeof options?.skipContractEth === 'boolean'
+            ? { skipContractEth: options.skipContractEth }
+            : {}),
         }),
       });
       const data = await res.json();
@@ -875,47 +926,21 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
       const walletFailures: Array<{ source: string; asset: string; amount?: string; reason: string }> =
         Array.isArray(data.skippedIncompatible) ? [...data.skippedIncompatible] : [];
 
-      if (Array.isArray(data.pendingWalletTxs) && data.pendingWalletTxs.length > 0) {
-        if (!okxConnectedAddress) {
-          throw new Error('Wallet signature required for connected/owner holdings. Connect your Web3 wallet first.');
-        }
-        const targetChainHex = CHAIN_CONFIG_MAP[selectedChain].chainIdHex;
-        const currentChainHex = await getConnectedChainId();
-        if (currentChainHex && currentChainHex.toLowerCase() !== targetChainHex.toLowerCase()) {
-          await switchOkxChain(targetChainHex);
-        }
+      if (Array.isArray(data.pendingWalletTxs) && data.pendingWalletTxs.length > 0 && combinedSwept.length === 0) {
         for (const ptx of data.pendingWalletTxs) {
-          if (ptx.signerRequired && ptx.signerRequired.toLowerCase() !== okxConnectedAddress.toLowerCase()) {
-            walletFailures.push({
-              source: ptx.source,
-              asset: ptx.asset,
-              amount: ptx.amount,
-              reason: `Requires owner wallet ${formatShortAddress(ptx.signerRequired)} (connected: ${formatShortAddress(okxConnectedAddress)})`,
-            });
-            continue;
-          }
-          const txHash = await sendOkxTransaction({
-            from: okxConnectedAddress,
-            to: ptx.to,
-            data: ptx.data,
-            gas: ptx.gas,
-          });
-          const receipt = await waitForTxReceipt(txHash, CHAIN_CONFIG_MAP[selectedChain].rpcUrl);
-          if (receipt && receipt.status === 0) {
-            throw new Error(`Wallet transaction ${txHash} reverted on-chain.`);
-          }
-          combinedSwept.push({
+          walletFailures.push({
+            source: ptx.source || 'Owner Signer',
             asset: ptx.asset,
             amount: ptx.amount,
-            method: `${ptx.method} (Wallet)`,
-            txHash,
-            explorerUrl: `${CHAIN_CONFIG_MAP[selectedChain].explorer}/tx/${txHash}`,
+            reason: `Configure owner Signer Key (${ptx.signerRequired ? formatShortAddress(ptx.signerRequired) : 'owner'}) in Signer Key Config to sweep automatically.`,
           });
         }
       }
 
       const prefix = options?.autoTriggered
-        ? `End-of-cycle dust sweep (${options.cycleLabel || 'Cycle Complete'}): `
+        ? options.autoReason === 'USDT_THRESHOLD'
+          ? `USDT Threshold Auto-Sweep (${options.cycleLabel || 'Surplus Detected'}): `
+          : `End-of-cycle dust sweep (${options.cycleLabel || 'Cycle Complete'}): `
         : '';
       const gasNoteSuffix =
         data.gasSurplusStatus?.note && !data.gasSurplusStatus.swept && includeGasEthSurplus
@@ -923,7 +948,7 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
           : '';
       const finalMsg =
         combinedSwept.length > 0
-          ? `${prefix}Swept ${combinedSwept.length} compatible ERC-20/1155/ETH asset holding(s) to Profit Vault ${formatShortAddress(profitWalletAddress)}.${gasNoteSuffix}`
+          ? `${prefix}Swept ${combinedSwept.length} ${options?.autoReason === 'USDT_THRESHOLD' ? 'USDT surplus' : 'compatible ERC-20/1155/ETH'} holding(s) to Profit Vault ${formatShortAddress(targetProfitWallet)}.${gasNoteSuffix}`
           : `${prefix}${data.message || 'Sweep check completed cleanly.'}${gasNoteSuffix}`;
 
       setSweepAllNotice({
@@ -942,10 +967,13 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
       setSweepAllNotice({
         success: false,
         message: options?.autoTriggered
-          ? `End-of-cycle dust sweep (${options.cycleLabel || 'Cycle'}) note: ${err.message || 'Sweep skipped'}`
+          ? options.autoReason === 'USDT_THRESHOLD'
+            ? `USDT Threshold Auto-Sweep (${options.cycleLabel || 'Surplus'}) failed: ${err.message || 'Sweep error'}`
+            : `End-of-cycle dust sweep (${options.cycleLabel || 'Cycle'}) note: ${err.message || 'Sweep skipped'}`
           : err.message || 'Sweep All failed',
       });
     } finally {
+      isSweepingAllRef.current = false;
       setIsSweepingAll(false);
     }
   };
@@ -954,10 +982,45 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
     void executeSweepAllBalances();
   };
 
-  const runEndOfCycleDustSweep = async (
-    cycleLabel: string,
-    options?: { allowWalletPrompt?: boolean }
-  ) => {
+  const evaluateAndTriggerUsdtAutoSweep = async (overviewData: typeof holdingsOverview) => {
+    if (!overviewData || !Array.isArray(overviewData.contracts)) return;
+    const rt = sweepRuntimeRef.current;
+    const targetChain = rt.selectedChain;
+    if (overviewData.chain && overviewData.chain !== targetChain) return;
+
+    const evaluation = evaluateContractUsdtSweep({
+      contracts: overviewData.contracts,
+      thresholdUsdt: usdtSweepThresholdRef.current,
+      enabled: autoSweepUsdtEnabledRef.current,
+      isSignerKeyConfigured: rt.isSignerKeyConfigured,
+      profitWalletAddress: rt.profitWalletAddress,
+      isBusy: isAutoSweepingUsdtRef.current || isAutoSweepingCycleRef.current || isSweepingAllRef.current,
+      lastAttemptAtMs: lastUsdtAutoSweepAttemptRef.current[targetChain] || 0,
+      nowMs: Date.now(),
+    });
+
+    if (!evaluation.shouldTrigger || evaluation.triggerContracts.length === 0) return;
+
+    isAutoSweepingUsdtRef.current = true;
+    lastUsdtAutoSweepAttemptRef.current[targetChain] = Date.now();
+    try {
+      await executeSweepAllBalances({
+        autoTriggered: true,
+        autoReason: 'USDT_THRESHOLD',
+        cycleLabel: `${evaluation.sweepableContractUsdt.toFixed(2)} > ${evaluation.thresholdUsdt} USDT`,
+        tokenSymbols: ['USDT'],
+        skipContractEth: true,
+        includeGasOverride: false,
+        includeGasEthOverride: false,
+        contractAddressOverride: evaluation.triggerContracts[0],
+        extraContractsOverride: evaluation.triggerContracts.slice(1),
+      });
+    } finally {
+      isAutoSweepingUsdtRef.current = false;
+    }
+  };
+
+  const runEndOfCycleDustSweep = async (cycleLabel: string) => {
     const rt = sweepRuntimeRef.current;
     if (isAutoSweepingCycleRef.current) return;
     if (!isValidEvmAddress(rt.profitWalletAddress)) return;
@@ -977,16 +1040,8 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
         rt.isSignerKeyConfigured && rt.includeGasWalletEthSurplusInSweep
           ? overview.summary.sweepableGasWalletEthCount || 0
           : 0;
-      const canSweepConnected = Boolean(
-        rt.okxConnectedAddress &&
-          rt.okxConnectedAddress.toLowerCase() !== rt.profitWalletAddress.toLowerCase() &&
-          (rt.includeConnectedWalletTokensInSweep || options?.allowWalletPrompt)
-      );
-      const connectedDustCount = canSweepConnected
-        ? overview.summary.sweepableConnectedWalletTokensCount || 0
-        : 0;
 
-      const totalSweepableDust = contractDustCount + gasDustCount + gasEthDustCount + connectedDustCount;
+      const totalSweepableDust = contractDustCount + gasDustCount + gasEthDustCount;
 
       if (totalSweepableDust <= 0) {
         setSweepAllNotice({
@@ -1000,23 +1055,21 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
         contractDustCount > 0 &&
         gasDustCount === 0 &&
         gasEthDustCount === 0 &&
-        connectedDustCount === 0 &&
-        !isSignerKeyConfigured &&
-        !options?.allowWalletPrompt
+        !isSignerKeyConfigured
       ) {
         setSweepAllNotice({
           success: true,
-          message: `End-of-cycle scan (${cycleLabel}) detected ${contractDustCount} compatible dust asset(s) on contracts. Configure signer key or click Sweep Compatible Holdings to sign via wallet.`,
+          message: `End-of-cycle scan (${cycleLabel}) detected ${contractDustCount} compatible dust asset(s) on contracts. Configure the Server Signer Key to sweep automatically.`,
         });
         return;
       }
 
       await executeSweepAllBalances({
         autoTriggered: true,
+        autoReason: 'CYCLE',
         cycleLabel,
         includeGasOverride: gasDustCount > 0 || rt.includeGasWalletTokensInSweep,
         includeGasEthOverride: gasEthDustCount > 0 || rt.includeGasWalletEthSurplusInSweep,
-        includeConnectedOverride: canSweepConnected && connectedDustCount > 0,
       });
     } finally {
       isAutoSweepingCycleRef.current = false;
@@ -1059,52 +1112,9 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
           setLiveExecutionError(`🛡️ ${data.error}`);
           return;
         }
-        if (data.requiresWallet && data.txPayload) {
-          const hash = await sendOkxTransaction(data.txPayload);
-          lastAutoSweptTradeTxRef.current = hash;
-          setLastConfirmedTxHash(hash);
-          const receipt = await waitForTxReceipt(hash, CHAIN_CONFIG_MAP[selectedChain].rpcUrl);
-          if (receipt && receipt.status === 0) {
-            throw new Error(`Arbitrage transaction ${hash} reverted on-chain.`);
-          }
-          await fetch('/api/flash-arb/agent/verify-receipt', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              txHash: hash,
-              chain: selectedChain,
-              pair: data.opportunity?.pair || 'WETH/USDC',
-              buyDex: data.opportunity?.buyDex || 'Uniswap V3',
-              sellDex: data.opportunity?.sellDex || 'Sushiswap V2',
-              recipient: profitWalletAddress,
-            }),
-          }).catch(() => {});
-          const walletOpp = data.opportunity;
-          const walletProfitUsd = Number(walletOpp?.estNetProfitUsd ?? 0);
-          const walletLoanNotionalUsd = Number(walletOpp?.loanAmount ?? 0) * Number(walletOpp?.buyPrice ?? 0);
-          const walletLoanSavedUsd = walletLoanNotionalUsd > 0 ? Number((walletLoanNotionalUsd * 0.0005).toFixed(4)) : 0;
-          if (walletLoanSavedUsd > 0) {
-            setCumulativeLoanFeesSaved((prev) => {
-              const next = Number((prev + walletLoanSavedUsd).toFixed(2));
-              localStorage.setItem('flash_arb_loan_fees_saved', next.toString());
-              return next;
-            });
-          }
-          if (onArbitrageExecuted && walletProfitUsd > 0) {
-            onArbitrageExecuted({
-              symbol: walletOpp?.loanToken || 'WETH',
-              profitUsd: walletProfitUsd,
-              chain: CHAIN_CONFIG_MAP[selectedChain].name,
-              txHash: hash,
-              token: walletOpp?.loanToken || 'WETH',
-              gasSavedUsd: 0,
-              loanFeeSavedUsd: walletLoanSavedUsd,
-            });
-          }
-          await Promise.all([fetchProfitWalletBalances(), fetchContractBalances(), fetchAgentStatus()]);
-          if (autoSweepEndOfCycleRef.current) {
-            await runEndOfCycleDustSweep('Wallet Execution Cycle', { allowWalletPrompt: true });
-          }
+        if (data.requiresWallet) {
+          setIsSignerModalOpen(true);
+          setLiveExecutionError('Configure your Server Signer Key to broadcast on-chain arbitrage transactions.');
           return;
         }
         throw new Error(data.error || 'Agent execution failed');
@@ -1113,7 +1123,7 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
         const txHash = data.txHash || data.trade.txHash;
         lastAutoSweptTradeTxRef.current = txHash;
         setLastConfirmedTxHash(txHash);
-        const profitUsd = Number(data.trade?.netProfitUsd ?? data.opportunity?.estNetProfitUsd ?? 0);
+        const profitUsd = Number(data.trade?.netProfitUsd ?? 0);
         const gasSavedUsd = Number(data.gasSavedUsd ?? data.trade?.gasSavedUsd ?? 0);
         const loanFeeSavedUsd = Number(data.loanFeeSavedUsd ?? data.trade?.loanFeeSavedUsd ?? 0);
 
@@ -1166,7 +1176,7 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
       }
       await Promise.all([fetchProfitWalletBalances(), fetchContractBalances(), fetchAgentStatus()]);
       if (autoSweepEndOfCycleRef.current) {
-        await runEndOfCycleDustSweep('Server Execution Cycle', { allowWalletPrompt: false });
+        await runEndOfCycleDustSweep('Server Execution Cycle');
       }
     } catch (err: any) {
       setLiveExecutionError(err.message || 'Agent trade dispatch failed');
@@ -1203,9 +1213,9 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
       });
     } catch {}
 
-    if (user?.uid) {
+    if (firebaseUser?.uid) {
       try {
-        await persistFlashArbSettings(user.uid, {
+        await persistFlashArbSettings(firebaseUser.uid, {
           arbitrumContract: chainKey === 'arbitrum' ? cleanAddr : deployedContracts.arbitrum,
           baseContract: chainKey === 'base' ? cleanAddr : deployedContracts.base,
           optimismContract: chainKey === 'optimism' ? cleanAddr : deployedContracts.optimism,
@@ -1235,7 +1245,7 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
         chainName: CHAIN_CONFIG_MAP[selectedChain].name,
         explorerUrl: `${CHAIN_CONFIG_MAP[selectedChain].explorer}/address/${trimmed}`,
         txExplorerUrl: '',
-        method: 'CONNECTED_WALLET',
+        method: 'MANUAL',
       });
     } catch (e: any) {
       setCustomContractError(e.message || 'Failed saving contract');
@@ -1244,110 +1254,38 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
     }
   };
 
-  const handleDeployContractAgent = async (preferredMethod?: 'SERVER_SIGNER' | 'CONNECTED_WALLET') => {
+  const handleDeployContractAgent = async () => {
     const cfg = CHAIN_CONFIG_MAP[selectedChain];
     setIsDeployingAgent(true);
     setDeployAgentError(null);
     setDeployAgentSuccess(null);
 
-    // If server signer key is configured and method is not explicitly wallet, attempt autonomous server deployment
-    const tryServerDeploy = preferredMethod === 'SERVER_SIGNER' || (preferredMethod !== 'CONNECTED_WALLET' && isSignerKeyConfigured);
-
-    if (tryServerDeploy) {
-      setDeployAgentStep(`🤖 Initializing Server Deployment Agent for ${cfg.name}...`);
-      try {
-        setDeployAgentStep(`Signing & submitting FlashArbOptimized creation transaction to ${cfg.name} via ${formatShortAddress(gasWalletAddress)}...`);
-        const res = await fetch('/api/flash-arb/deploy-contract', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ chain: selectedChain }),
-        });
-        const data = await res.json();
-        if (data.success && data.contractAddress) {
-          setDeployAgentStep(`Contract deployed! Registering on-chain address ${formatShortAddress(data.contractAddress)}...`);
-          await registerDeployedContract(selectedChain, data.contractAddress);
-          setDeployAgentSuccess({
-            contractAddress: data.contractAddress,
-            txHash: data.txHash,
-            chain: selectedChain,
-            chainName: cfg.name,
-            explorerUrl: data.explorerUrl,
-            txExplorerUrl: data.txExplorerUrl,
-            method: 'SERVER_SIGNER',
-          });
-          setIsDeployingAgent(false);
-          setDeployAgentStep(null);
-          return;
-        } else if (data.requiresWallet) {
-          setDeployAgentStep(`Server signer not configured. Switching to Connected Web3 Wallet deployment...`);
-        } else {
-          throw new Error(data.error || 'Server deployment failed');
-        }
-      } catch (srvErr: any) {
-        if (!preferredMethod) {
-          console.warn('Server deployment failed, trying connected wallet:', srvErr);
-          setDeployAgentStep(`Server signer note: ${srvErr.message}. Launching Connected Web3 Wallet deployment...`);
-        } else {
-          setDeployAgentError(`Server Agent Deployment Error: ${srvErr.message}`);
-          setIsDeployingAgent(false);
-          setDeployAgentStep(null);
-          return;
-        }
-      }
-    }
-
-    // Connected Web3 Wallet deployment flow
     try {
-      setDeployAgentStep(`Checking Web3 wallet connection for ${cfg.name}...`);
-      let userAddr: string | null = okxConnectedAddress ?? null;
-      if (!userAddr) {
-        const conn = await connectOkxWallet();
-        userAddr = conn.address;
-      }
-
-      setDeployAgentStep(`Ensuring Web3 wallet is switched to ${cfg.name} (Chain ID: ${cfg.chainIdDec})...`);
-      const currentCid = await getConnectedChainId();
-      if (currentCid && currentCid.toLowerCase() !== cfg.chainIdHex.toLowerCase()) {
-        await switchOkxChain(cfg.chainIdHex);
-        setWalletChainId(cfg.chainIdHex);
-      }
-
-      setDeployAgentStep(`Fetching compiled EVM bytecode & constructor payload for ${cfg.name}...`);
-      const payloadRes = await fetch(`/api/flash-arb/deploy-payload?chain=${selectedChain}`);
-      const payloadData = await payloadRes.json();
-      if (!payloadData.success || !payloadData.deployData) {
-        throw new Error(payloadData.error || 'Failed to retrieve deploy payload from server');
-      }
-
-      setDeployAgentStep(`Awaiting transaction signature in your Web3 wallet (OKX/MetaMask)...`);
-      const txHash = await sendOkxTransaction({
-        data: payloadData.deployData,
+      setDeployAgentStep(`🤖 Initializing Server Deployment Agent for ${cfg.name}...`);
+      setDeployAgentStep(`Signing & submitting FlashArbOptimized creation transaction to ${cfg.name} via ${formatShortAddress(gasWalletAddress)}...`);
+      const res = await fetch('/api/flash-arb/deploy-contract', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chain: selectedChain }),
       });
-
-      setDeployAgentStep(`Contract creation transaction broadcasted! Tx: ${txHash.slice(0, 10)}... Awaiting block confirmation on ${cfg.name}...`);
-
-      const receipt = await waitForTxReceipt(txHash, cfg.rpcUrl);
-      if (!receipt || receipt.status !== 1) {
-        throw new Error(`Deployment transaction failed or reverted on ${cfg.name}. Tx: ${txHash}`);
+      const data = await res.json();
+      if (data.success && data.contractAddress) {
+        setDeployAgentStep(`Contract deployed! Registering on-chain address ${formatShortAddress(data.contractAddress)}...`);
+        await registerDeployedContract(selectedChain, data.contractAddress);
+        setDeployAgentSuccess({
+          contractAddress: data.contractAddress,
+          txHash: data.txHash,
+          chain: selectedChain,
+          chainName: cfg.name,
+          explorerUrl: data.explorerUrl,
+          txExplorerUrl: data.txExplorerUrl,
+          method: 'SERVER_SIGNER',
+        });
+      } else if (data.requiresWallet) {
+        throw new Error('Server Signer Key not configured. Open Signer Key Config to enable autonomous contract deployment, or deploy via Foundry CLI.');
+      } else {
+        throw new Error(data.error || 'Server deployment failed');
       }
-
-      const deployedAddr = receipt.contractAddress;
-      if (!deployedAddr) {
-        throw new Error(`Contract address not found in transaction receipt. Tx: ${txHash}`);
-      }
-
-      setDeployAgentStep(`Contract confirmed on-chain! Registering address ${deployedAddr}...`);
-      await registerDeployedContract(selectedChain, deployedAddr);
-
-      setDeployAgentSuccess({
-        contractAddress: deployedAddr,
-        txHash,
-        chain: selectedChain,
-        chainName: cfg.name,
-        explorerUrl: `${cfg.explorer}/address/${deployedAddr}`,
-        txExplorerUrl: `${cfg.explorer}/tx/${txHash}`,
-        method: 'CONNECTED_WALLET',
-      });
     } catch (err: any) {
       setDeployAgentError(err.message || 'Contract deployment failed');
     } finally {
@@ -1387,64 +1325,28 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
     }
   };
 
-  const handleDeployCamelotAdapter = async (preferredMethod?: 'SERVER_SIGNER' | 'CONNECTED_WALLET') => {
-    const cfg = CHAIN_CONFIG_MAP.arbitrum;
+  const handleDeployCamelotAdapter = async () => {
     setIsDeployingCamelotAdapter(true);
     setCamelotAdapterError(null);
     setCamelotAdapterNotice(null);
-    const tryServer = preferredMethod === 'SERVER_SIGNER' || (preferredMethod !== 'CONNECTED_WALLET' && isSignerKeyConfigured);
-
-    if (tryServer) {
-      try {
-        const res = await fetch('/api/flash-arb/deploy-camelot-adapter', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ chain: 'arbitrum' }),
-        });
-        const data = await res.json();
-        if (data.success && data.adapterAddress) {
-          await registerCamelotAdapter(data.adapterAddress);
-          setCamelotAdapterNotice(`CamelotV3SwapAdapter deployed via Server Signer: ${data.adapterAddress}`);
-          setIsDeployingCamelotAdapter(false);
-          return;
-        }
-        if (!data.requiresWallet) {
-          throw new Error(data.error || 'Server adapter deployment failed');
-        }
-      } catch (srvErr: any) {
-        if (preferredMethod === 'SERVER_SIGNER') {
-          setCamelotAdapterError(srvErr?.message || 'Adapter deployment failed');
-          setIsDeployingCamelotAdapter(false);
-          return;
-        }
-      }
-    }
 
     try {
-      let userAddr: string | null = okxConnectedAddress ?? null;
-      if (!userAddr) {
-        const conn = await connectOkxWallet();
-        userAddr = conn.address;
+      const res = await fetch('/api/flash-arb/deploy-camelot-adapter', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chain: 'arbitrum' }),
+      });
+      const data = await res.json();
+      if (data.success && data.adapterAddress) {
+        await registerCamelotAdapter(data.adapterAddress);
+        setCamelotAdapterNotice(`CamelotV3SwapAdapter deployed via Server Signer: ${data.adapterAddress}`);
+      } else if (data.requiresWallet) {
+        throw new Error('Server Signer Key not configured. Configure it in Signer Key Config to deploy CamelotV3SwapAdapter.');
+      } else {
+        throw new Error(data.error || 'Server adapter deployment failed');
       }
-      const currentCid = await getConnectedChainId();
-      if (currentCid && currentCid.toLowerCase() !== cfg.chainIdHex.toLowerCase()) {
-        await switchOkxChain(cfg.chainIdHex);
-        setWalletChainId(cfg.chainIdHex);
-      }
-      const payloadRes = await fetch('/api/flash-arb/camelot-adapter-payload?chain=arbitrum');
-      const payloadData = await payloadRes.json();
-      if (!payloadData.success || !payloadData.deployData) {
-        throw new Error(payloadData.error || 'Failed to fetch CamelotV3SwapAdapter payload');
-      }
-      const txHash = await sendOkxTransaction({ data: payloadData.deployData });
-      const receipt = await waitForTxReceipt(txHash, cfg.rpcUrl);
-      if (!receipt || receipt.status !== 1 || !receipt.contractAddress) {
-        throw new Error(`Adapter deployment reverted on Arbitrum One. Tx: ${txHash}`);
-      }
-      await registerCamelotAdapter(receipt.contractAddress);
-      setCamelotAdapterNotice(`CamelotV3SwapAdapter deployed via Wallet: ${receipt.contractAddress}`);
-    } catch (err: any) {
-      setCamelotAdapterError(err?.message || 'Wallet adapter deployment failed');
+    } catch (srvErr: any) {
+      setCamelotAdapterError(srvErr?.message || 'Adapter deployment failed');
     } finally {
       setIsDeployingCamelotAdapter(false);
     }
@@ -1464,25 +1366,25 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
     selectedChainRef.current = selectedChain;
     sweepRuntimeRef.current = {
       extraTokensInput,
-      okxConnectedAddress,
       isSignerKeyConfigured,
       includeGasWalletTokensInSweep,
       includeGasWalletEthSurplusInSweep,
-      includeConnectedWalletTokensInSweep,
       profitWalletAddress,
       selectedChain,
       deployedContracts,
+      autoSweepUsdtEnabled,
+      usdtSweepThreshold,
     };
   }, [
     extraTokensInput,
-    okxConnectedAddress,
     isSignerKeyConfigured,
     includeGasWalletTokensInSweep,
     includeGasWalletEthSurplusInSweep,
-    includeConnectedWalletTokensInSweep,
     profitWalletAddress,
     selectedChain,
     deployedContracts,
+    autoSweepUsdtEnabled,
+    usdtSweepThreshold,
   ]);
 
   // Query Real On-Chain Gas Balances
@@ -1642,6 +1544,13 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
       fetchProfitWalletBalances();
     }, 3500);
 
+    const contractMonitorInterval = setInterval(() => {
+      if (!isLoadingHoldingsOverviewRef.current) {
+        void fetchContractBalances();
+        void fetchHoldingsOverview();
+      }
+    }, 10000);
+
     // Sync contracts from server registry (or push upgraded local contract to server)
     fetch('/api/flash-arb/deployed-contracts')
       .then((res) => res.json())
@@ -1678,7 +1587,10 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
       }
     } catch {}
 
-    return () => clearInterval(agentInterval);
+    return () => {
+      clearInterval(agentInterval);
+      clearInterval(contractMonitorInterval);
+    };
   }, [gasWalletAddress, profitWalletAddress]);
 
   useEffect(() => {
@@ -1698,13 +1610,60 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
         body: JSON.stringify({ chain: selectedChain, address: targetAddr }),
       }).catch(() => {});
     }
-  }, [selectedChain, deployedContracts, okxConnectedAddress]);
+  }, [selectedChain, deployedContracts]);
 
-  // Sync from Firestore when user is authenticated
+  // Evaluate automatic USDT threshold sweep whenever contract holdings, threshold, or signer config updates
+  useEffect(() => {
+    if (!holdingsOverview) return;
+    void evaluateAndTriggerUsdtAutoSweep(holdingsOverview);
+  }, [
+    holdingsOverview,
+    autoSweepUsdtEnabled,
+    usdtSweepThreshold,
+    isSignerKeyConfigured,
+    profitWalletAddress,
+    selectedChain,
+    isSweepingAll,
+  ]);
+
+  const persistUsdtAutoSweepPreference = (enabled: boolean, threshold: number) => {
+    try {
+      localStorage.setItem('flash_arb_auto_sweep_usdt', String(enabled));
+      localStorage.setItem('flash_arb_usdt_sweep_threshold', String(threshold));
+    } catch {}
+    if (firebaseUser?.uid) {
+      persistFlashArbSettings(firebaseUser.uid, {
+        autoSweepUsdtEnabled: enabled,
+        usdtSweepThreshold: threshold,
+      }).catch((err) => {
+        console.warn('Failed syncing USDT auto-sweep settings to Firestore:', err);
+      });
+    }
+  };
+
+  const usdtAutoSweepEvaluation = useMemo(() => {
+    return evaluateContractUsdtSweep({
+      contracts: holdingsOverview?.contracts || [],
+      thresholdUsdt: usdtSweepThreshold,
+      enabled: autoSweepUsdtEnabled,
+      isSignerKeyConfigured,
+      profitWalletAddress,
+      isBusy: isSweepingAll || isAutoSweepingUsdtRef.current,
+    });
+  }, [
+    holdingsOverview,
+    usdtSweepThreshold,
+    autoSweepUsdtEnabled,
+    isSignerKeyConfigured,
+    profitWalletAddress,
+    isSweepingAll,
+  ]);
+
+  // Sync from Firestore when user is Firebase-authenticated
   useEffect(() => {
     let isMounted = true;
-    if (user?.uid) {
-      loadFlashArbSettings(user.uid).then((settings) => {
+    if (firebaseUser?.uid) {
+      loadFlashArbSettings(firebaseUser.uid).then((settings) => {
         if (!isMounted || !settings) return;
         if (settings.profitRecipientAddress && isValidEvmAddress(settings.profitRecipientAddress)) {
           setProfitWalletAddress(settings.profitRecipientAddress);
@@ -1747,6 +1706,19 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
           setDeployedContracts((prev) => ({ ...prev, optimism: settings.optimismContract! }));
           localStorage.setItem('flash_arb_contract_optimism', settings.optimismContract);
         }
+        if (typeof settings.autoSweepUsdtEnabled === 'boolean') {
+          setAutoSweepUsdtEnabled(settings.autoSweepUsdtEnabled);
+          try {
+            localStorage.setItem('flash_arb_auto_sweep_usdt', String(settings.autoSweepUsdtEnabled));
+          } catch {}
+        }
+        if (typeof settings.usdtSweepThreshold === 'number' && Number.isFinite(settings.usdtSweepThreshold) && settings.usdtSweepThreshold >= 0) {
+          const parsedThreshold = parseUsdtSweepThreshold(settings.usdtSweepThreshold, DEFAULT_USDT_SWEEP_THRESHOLD);
+          setUsdtSweepThresholdInput(String(parsedThreshold));
+          try {
+            localStorage.setItem('flash_arb_usdt_sweep_threshold', String(parsedThreshold));
+          } catch {}
+        }
       }).catch((e) => {
         console.warn('Failed loading flash arb settings:', e);
       });
@@ -1754,7 +1726,7 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
     return () => {
       isMounted = false;
     };
-  }, [user?.uid]);
+  }, [firebaseUser?.uid]);
 
   useEffect(() => {
     setProfitWalletInput(profitWalletAddress);
@@ -1777,14 +1749,9 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
     setIsSavingWallet(true);
 
     const isMetaMaskDefault = trimmed.toLowerCase() === defaultProfitWallet.toLowerCase();
-    const isOkx = Boolean(okxConnectedAddress && trimmed.toLowerCase() === okxConnectedAddress.toLowerCase());
     const finalLabel = customLabel?.trim() || (
       isMetaMaskDefault
         ? 'MetaMask Profit Vault (..cb9)'
-        : isOkx
-        ? `OKX Web3 Wallet (${trimmed.toLowerCase().endsWith('11') ? '..11' : trimmed.slice(-4)})`
-        : trimmed.toLowerCase().endsWith('11')
-        ? 'OKX Web3 Wallet (..11)'
         : 'Arbitrage Recipient Wallet'
     );
 
@@ -1808,9 +1775,9 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
       console.warn('Failed syncing profit wallet to server:', err);
     }
 
-    if (user?.uid) {
+    if (firebaseUser?.uid) {
       try {
-        await persistFlashArbSettings(user.uid, {
+        await persistFlashArbSettings(firebaseUser.uid, {
           profitRecipientAddress: trimmed,
           label: finalLabel,
           gasWalletAddress: gasWalletAddress,
@@ -1849,9 +1816,9 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
     localStorage.setItem('flash_arb_gas_wallet', trimmed);
     localStorage.setItem('flash_arb_gas_wallet_label', finalLabel);
 
-    if (user?.uid) {
+    if (firebaseUser?.uid) {
       try {
-        await persistFlashArbSettings(user.uid, {
+        await persistFlashArbSettings(firebaseUser.uid, {
           profitRecipientAddress: profitWalletAddress,
           label: profitWalletLabel,
           gasWalletAddress: trimmed,
@@ -1932,37 +1899,9 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
     return `https://arbiscan.io/address/${address}`;
   };
 
-  // Listen for real-time Web3 wallet chain and account changes
-  useEffect(() => {
-    let active = true;
-    getConnectedChainId().then((cid) => {
-      if (active && cid) setWalletChainId(cid);
-    }).catch(() => {});
-
-    const unsubscribe = registerWalletListeners(
-      (_accounts) => {},
-      (newChain) => {
-        if (active) setWalletChainId(newChain);
-      }
-    );
-
-    return () => {
-      active = false;
-      unsubscribe();
-    };
-  }, []);
-
   const targetChainConfig = CHAIN_CONFIG_MAP[selectedChain];
-  const isWalletOnCorrectChain = walletChainId
-    ? walletChainId.toLowerCase() === targetChainConfig.chainIdHex.toLowerCase() ||
-      parseInt(walletChainId, 16) === targetChainConfig.chainIdDec
-    : true;
 
-  const currentWalletChainName = walletChainId
-    ? OKX_SUPPORTED_CHAINS[walletChainId.toLowerCase()]?.name || `Chain ID ${parseInt(walletChainId, 16)}`
-    : 'Unknown Network';
-
-  const handleSwitchChain = async (targetChainKey: 'arbitrum' | 'base' | 'optimism') => {
+  const handleSwitchChain = (targetChainKey: 'arbitrum' | 'base' | 'optimism') => {
     setSelectedChain(targetChainKey);
     const nextChainTokens = getChainTokenConfigs(targetChainKey);
     setScanTokenFilter((prev) =>
@@ -1972,27 +1911,6 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
       nextChainTokens.some((t) => t.symbol === prev) ? prev : 'WETH'
     );
     setLiveExecutionError(null);
-
-    const hasInjectedProvider =
-      Boolean(okxConnectedAddress) ||
-      (typeof window !== 'undefined' && Boolean((window as any).okxwallet || (window as any).ethereum));
-    if (!hasInjectedProvider) {
-      return;
-    }
-
-    setIsSwitchingChain(true);
-    try {
-      const cfg = CHAIN_CONFIG_MAP[targetChainKey];
-      await switchOkxChain(cfg.chainIdHex);
-      setWalletChainId(cfg.chainIdHex);
-    } catch (e: any) {
-      console.warn('Chain switch note:', e);
-      if (okxConnectedAddress) {
-        setLiveExecutionError(`Wallet network switch note: ${e.message || 'Please approve network change in your wallet'}`);
-      }
-    } finally {
-      setIsSwitchingChain(false);
-    }
   };
 
   const handleExecuteLiveOnChainTrade = async (customOpp?: SimulatedOpp) => {
@@ -2007,11 +1925,40 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
       return;
     }
 
-    // Strict Profit Guard: block trade if net profit is negative or below safety threshold
-    if (customOpp && !forceTestExecution) {
-      if (customOpp.isProfitable === false || customOpp.netProfitUsd < minProfitThresholdUsd) {
+    // Simulator & custom execution path: strictly require verified on-chain profitability from eth_call + eth_estimateGas
+    const targetChainKey = customOpp
+      ? (customOpp.chain.toLowerCase() as 'arbitrum' | 'base' | 'optimism')
+      : selectedChain;
+    const cfg = CHAIN_CONFIG_MAP[targetChainKey] || CHAIN_CONFIG_MAP[selectedChain];
+    const tradeToken = customOpp ? customOpp.token : simToken;
+    const targetContract = deployedContracts[targetChainKey] || cfg.contract;
+
+    if (!/^0x[a-fA-F0-9]{40}$/.test(profitWalletAddress.trim())) {
+      setLiveExecutionError('Invalid profit recipient wallet: enter a 42-character hex EVM address (0x...) before broadcasting.');
+      return;
+    }
+
+    const isContractLive = contractDeploymentStatus[targetChainKey]?.isDeployed;
+    if (isContractLive === false) {
+      setLiveExecutionError(
+        `On-Chain Broadcast Halted: FlashArb contract ${formatShortAddress(targetContract)} is not yet deployed on ${cfg.name} (bytecode is 0x). Opening Contract Deployment Agent to deploy FlashArbOptimized.sol now.`
+      );
+      setIsDeployModalOpen(true);
+      return;
+    }
+
+    if (!isSignerKeyConfigured) {
+      setIsSignerModalOpen(true);
+      setLiveExecutionError('Configure your Server Signer Key to broadcast transactions on-chain.');
+      return;
+    }
+
+    if (!customOpp && !forceTestExecution) {
+      if (!simResult || !simResult.revmVerified || !simResult.onChainProfitable) {
         setLiveExecutionError(
-          `🛡️ Execution Blocked by Profit Guard: This trade is projected at $${customOpp.netProfitUsd.toFixed(2)} net profit (below safety threshold of $${minProfitThresholdUsd.toFixed(2)}). Zero loss guaranteed.`
+          simResult?.onChainRevertReason
+            ? `Broadcast Halted (0 gas spent): ${simResult.onChainRevertReason}`
+            : 'Broadcast Halted (0 gas spent): Live on-chain eth_call probe found $0.00 executable profit for this route. Run Pre-Flight Test or wait for a profitable cross-DEX spread.'
         );
         return;
       }
@@ -2021,141 +1968,40 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
     setLiveExecutionError(null);
     setLiveExecutionSuccess(null);
 
-    const targetChainKey = customOpp
-      ? (customOpp.chain.toLowerCase() as 'arbitrum' | 'base' | 'optimism')
-      : selectedChain;
-    const cfg = CHAIN_CONFIG_MAP[targetChainKey] || CHAIN_CONFIG_MAP[selectedChain];
-    const tradeToken = customOpp ? customOpp.token : simToken;
-    const realizedAlpha = customOpp
-      ? customOpp.netProfitUsd
-      : simResult
-      ? simResult.netProfitUsd
-      : 22.40;
-    const gasSaved = customOpp ? customOpp.gasCostUsd * 0.45 : (simResult?.gasSavedUsd || 1.85);
-    const loanSaved = customOpp
-      ? (customOpp.loanFeeUsd === 0 ? 12.50 : 0)
-      : (simResult?.loanFeeSavedUsd || 12.50);
-
     try {
-      const targetContract = deployedContracts[targetChainKey] || cfg.contract;
-
-      // Calibrate minimal gas limit (135k - 148.5k gas)
-      const optimalGasLimit = customOpp?.revmGas ? `0x${customOpp.revmGas.toString(16)}` : '0x24410';
-
-      if (!/^0x[a-fA-F0-9]{40}$/.test(profitWalletAddress.trim())) {
-        setLiveExecutionError('Invalid profit recipient wallet: enter a 42-character hex EVM address (0x...) before broadcasting.');
+      const execRes = await fetch('/api/flash-arb/simulator/execute', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chain: targetChainKey,
+          tokenSymbol: tradeToken,
+          quoteSymbol: simResult?.quoteToken,
+          loanAmount: simLoanAmount,
+          buyDex: customOpp ? customOpp.dexA : simDexA,
+          sellDex: customOpp ? customOpp.dexB : simDexB,
+          minProfitUsd: customOpp ? minProfitThresholdUsd : simMinProfitUsd,
+        }),
+      });
+      const srvData = await execRes.json();
+      if (!execRes.ok || !srvData.success || !srvData.txHash) {
+        if (srvData.requiresWallet) {
+          setIsSignerModalOpen(true);
+        }
+        setLiveExecutionError(srvData.error || 'Pre-flight eth_call halted broadcast (0 gas spent): no profitable arbitrage on-chain.');
         setIsExecutingLiveTrade(false);
         return;
       }
 
-      // FlashArbOptimized executeDirectFlashArb(address recipient) sweeps native ETH held on the contract to profitWalletAddress.
-      // Note: full Balancer V2 flash-loan ERC-20 arbitrage & profit sweeping runs via executeOptimizedArbitrage(...) in flash-arb/searcher.
-      const cleanRecipient = profitWalletAddress.trim().toLowerCase().replace('0x', '').padStart(64, '0');
-      const txPayload = {
-        to: targetContract,
-        data: `0x7804d9ac${cleanRecipient}`,
-        gas: optimalGasLimit,
-      };
+      const txHash = srvData.txHash;
+      lastAutoSweptTradeTxRef.current = txHash;
 
-      // Check on-chain deployment status before dispatching
-      const isContractLive = contractDeploymentStatus[targetChainKey]?.isDeployed;
-      if (isContractLive === false) {
-        setLiveExecutionError(
-          `On-Chain Broadcast Halted: FlashArb contract ${formatShortAddress(targetContract)} is not yet deployed on ${cfg.name} (bytecode is 0x). Opening Contract Deployment Agent to deploy FlashArbOptimized.sol now.`
-        );
-        setIsDeployModalOpen(true);
-        setIsExecutingLiveTrade(false);
-        return;
-      }
+      // Record strictly verified on-chain profit from decoded ArbitrageSwapsExecuted logs (never theoretical slider estimates)
+      const verifiedProfitUsd = Number(srvData.trade?.netProfitUsd ?? srvData.netOnChainProfitUsd ?? 0);
+      const gasSaved = Number(srvData.gasSavedUsd ?? srvData.trade?.gasSavedUsd ?? 0);
+      const loanSaved = Number(srvData.loanFeeSavedUsd ?? srvData.trade?.loanFeeSavedUsd ?? 0);
 
-      let txHash = '';
-
-      // Path 1: Autonomous Server Signer Key (Gas Funder ..66 authorized in server memory - no browser wallet required)
-      if (isSignerKeyConfigured) {
-        try {
-          const srvRes = await fetch('/api/flash-arb/broadcast', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              chain: targetChainKey,
-              to: targetContract,
-              data: txPayload.data,
-              gasLimit: 300000,
-            }),
-          });
-          const srvData = await srvRes.json();
-          if (srvData.success && srvData.txHash) {
-            txHash = srvData.txHash;
-          } else {
-            throw new Error(srvData.error || 'Server broadcast failed');
-          }
-        } catch (srvErr: any) {
-          // If server broadcast fails, fall back to browser injected wallet if available
-          if (okxConnectedAddress || (typeof window !== 'undefined' && ((window as any).ethereum || (window as any).okxwallet))) {
-            try {
-              txHash = await sendOkxTransaction(txPayload);
-            } catch (wErr: any) {
-              setLiveExecutionError(`Broadcast failed: ${srvErr.message || wErr.message}. Ensure gas wallet (${formatShortAddress(gasWalletAddress)}) has ETH on ${cfg.name}.`);
-              setIsExecutingLiveTrade(false);
-              return;
-            }
-          } else {
-            setLiveExecutionError(`Server broadcast failed: ${srvErr.message}. Ensure gas wallet (${formatShortAddress(gasWalletAddress)}) has ETH.`);
-            setIsExecutingLiveTrade(false);
-            return;
-          }
-        }
-      } else {
-        // Path 2: Injected Browser Web3 Provider (OKX Web3 Wallet ..11)
-        let currentAddr: string | null = okxConnectedAddress ?? null;
-        if (!currentAddr) {
-          if (onOpenOkxWallet) {
-            onOpenOkxWallet();
-            setIsExecutingLiveTrade(false);
-            return;
-          }
-          const conn = await connectOkxWallet();
-          currentAddr = conn.address;
-        }
-
-        // Ensure network is synced
-        const currentCid = await getConnectedChainId();
-        if (currentCid && currentCid.toLowerCase() !== cfg.chainIdHex.toLowerCase()) {
-          await switchOkxChain(cfg.chainIdHex);
-          setWalletChainId(cfg.chainIdHex);
-        }
-
-        try {
-          txHash = await sendOkxTransaction(txPayload);
-        } catch (walletErr: any) {
-          if (walletErr.code === 4001 || walletErr.message?.includes('rejected')) {
-            setLiveExecutionError('Transaction broadcast was rejected in your Web3 wallet.');
-            setIsExecutingLiveTrade(false);
-            return;
-          }
-          setLiveExecutionError(
-            `Transaction broadcast failed on ${cfg.name}: ${walletErr.message || 'Web3 provider rejected transaction'}. Note: No fake transactions are generated.`
-          );
-          setIsExecutingLiveTrade(false);
-          return;
-        }
-      }
-
-      if (txHash) {
-        lastAutoSweptTradeTxRef.current = txHash;
-        try {
-          const receipt = await waitForTxReceipt(txHash, cfg.rpcUrl);
-          if (receipt && receipt.status === 0) {
-            throw new Error(`On-chain execution ${txHash} reverted.`);
-          }
-        } catch (waitErr: any) {
-          if (waitErr?.message?.includes('reverted')) throw waitErr;
-        }
-      }
-
-      // Update Cumulative Session Performance Statistics
       setTotalRealizedAlpha((prev) => {
-        const next = Number((prev + realizedAlpha).toFixed(2));
+        const next = Number((prev + Math.max(0, verifiedProfitUsd)).toFixed(2));
         localStorage.setItem('flash_arb_realized_alpha', next.toString());
         return next;
       });
@@ -2164,58 +2010,63 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
         localStorage.setItem('flash_arb_executions_count', next.toString());
         return next;
       });
-      setCumulativeGasSaved((prev) => {
-        const next = Number((prev + gasSaved).toFixed(2));
-        localStorage.setItem('flash_arb_gas_saved', next.toString());
-        return next;
-      });
-      setCumulativeLoanFeesSaved((prev) => {
-        const next = Number((prev + loanSaved).toFixed(2));
-        localStorage.setItem('flash_arb_loan_fees_saved', next.toString());
-        return next;
-      });
+      if (gasSaved > 0) {
+        setCumulativeGasSaved((prev) => {
+          const next = Number((prev + gasSaved).toFixed(2));
+          localStorage.setItem('flash_arb_gas_saved', next.toString());
+          return next;
+        });
+      }
+      if (loanSaved > 0) {
+        setCumulativeLoanFeesSaved((prev) => {
+          const next = Number((prev + loanSaved).toFixed(2));
+          localStorage.setItem('flash_arb_loan_fees_saved', next.toString());
+          return next;
+        });
+      }
 
-      // Notify parent App component to update portfolio balance, total trades, and logs
       if (onArbitrageExecuted) {
         onArbitrageExecuted({
-          symbol: tradeToken,
-          profitUsd: realizedAlpha,
+          symbol: srvData.sweptToken || tradeToken,
+          profitUsd: verifiedProfitUsd,
           chain: cfg.name,
           txHash,
-          token: tradeToken,
+          token: srvData.sweptToken || tradeToken,
           gasSavedUsd: gasSaved,
           loanFeeSavedUsd: loanSaved,
         });
       }
 
-      // Persist trade execution into Cloud Firestore
-      if (user?.uid) {
-        persistExecutionLog(user.uid, {
+      if (firebaseUser?.uid) {
+        persistExecutionLog(firebaseUser.uid, {
           id: `flash-${Date.now()}-${txHash.slice(2, 8)}`,
           timestamp: Date.now(),
-          symbol: tradeToken,
+          symbol: srvData.sweptToken || tradeToken,
           type: 'FLASH_LOAN_ARBITRAGE',
-          netProfitUsd: realizedAlpha,
+          netProfitUsd: verifiedProfitUsd,
           status: 'CONFIRMED_ON_CHAIN',
-          route: `${cfg.name} (Balancer V2 -> DEX A -> DEX B -> Recipient ${formatShortAddress(profitWalletAddress)})`,
+          route: `${cfg.name} (${srvData.buyDex || simDexA} -> ${srvData.sellDex || simDexB} -> Recipient ${formatShortAddress(profitWalletAddress)})`,
         }).catch((e) => console.warn('Could not persist execution log to Firestore:', e));
       }
 
       setLiveExecutionSuccess({
         txHash,
         chain: cfg.name,
-        token: tradeToken,
-        profitUsd: realizedAlpha,
-        recipient: profitWalletAddress,
+        token: srvData.sweptToken || tradeToken,
+        profitUsd: verifiedProfitUsd,
+        recipient: srvData.recipient || profitWalletAddress,
         timestamp: new Date().toLocaleTimeString(),
-        blockLatency: '7.6ms',
+        blockLatency: srvData.gasSweepTxHash
+          ? `verified (+${srvData.gasSavedEthSwept} ETH gas surplus swept)`
+          : 'verified on-chain',
       });
 
+      await Promise.all([fetchProfitWalletBalances(), fetchContractBalances(), fetchAgentStatus()]);
       if (autoSweepEndOfCycleRef.current) {
-        await runEndOfCycleDustSweep('Direct Execution Cycle', { allowWalletPrompt: true });
+        await runEndOfCycleDustSweep('Direct Execution Cycle');
       }
     } catch (err: any) {
-      setLiveExecutionError(err.message || 'Failed to dispatch live transaction');
+      setLiveExecutionError(err.message || 'Failed to execute live arbitrage transaction');
     } finally {
       setIsExecutingLiveTrade(false);
     }
@@ -2247,6 +2098,25 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
     revmVerified: boolean;
     gasUnits: number;
     gasReductionPercent: number;
+    onChainProbing?: boolean;
+    onChainProfitable?: boolean;
+    onChainGrossProfitUsd?: number;
+    onChainNetProfitUsd?: number;
+    onChainGasUnits?: number;
+    onChainGasCostUsd?: number;
+    onChainRevertReason?: string | null;
+    onChainPair?: string;
+    onChainContract?: string;
+    quoteToken?: string;
+    onChainCheckedCandidates?: Array<{
+      label: string;
+      borrowedToken: string;
+      amountFormatted: string;
+      actualProfitFormatted: string;
+      actualProfitUsd: number;
+      status: 'PROFITABLE' | 'NO_PROFIT' | 'REVERTED';
+      detail: string;
+    }>;
   } | null>(null);
 
   // Live Opportunities Stream
@@ -2336,7 +2206,7 @@ RPC_BASE_WS=wss://base-mainnet.public.blastapi.io
     }
   };
 
-  // Run Real Mathematical Simulation with Gas & Protocol Optimization
+  // Run Theoretical Sizing Model + Real On-Chain eth_call Pre-Flight Fork Probe
   const handleRunSimulation = (overrides?: {
     token?: string;
     loanAmount?: number;
@@ -2344,12 +2214,17 @@ RPC_BASE_WS=wss://base-mainnet.public.blastapi.io
     minProfitUsd?: number;
     flashProviderId?: FlashLoanProviderId;
     gasOptimization?: GasOptimizationLevel;
+    buyDex?: string;
+    sellDex?: string;
+    quoteSymbol?: string;
   }) => {
     setPreflightSimulationsCount((c) => c + 1);
     const activeToken = overrides?.token ?? simToken;
     const activeLoanAmount = overrides?.loanAmount ?? simLoanAmount;
     const activeSpreadBps = overrides?.spreadBps ?? simSpreadBps;
     const activeMinProfitUsd = overrides?.minProfitUsd ?? simMinProfitUsd;
+    const activeBuyDex = overrides?.buyDex ?? simDexA;
+    const activeSellDex = overrides?.sellDex ?? simDexB;
     const activeProvider =
       FLASH_LOAN_PROVIDERS.find((p) => p.id === (overrides?.flashProviderId ?? selectedFlashProvider)) ||
       currentFlashProvider;
@@ -2377,14 +2252,12 @@ RPC_BASE_WS=wss://base-mainnet.public.blastapi.io
 
     // Flash Loan Protocol Fee (0.00% for Balancer & Spark, 0.05% for Aave/Uniswap)
     const loanFeeUsd = loanNotionalUsd * (activeProvider.feePercent / 100);
-    // Loan fee saved compared to standard Aave 0.05%:
     const aaveStandardFeeUsd = loanNotionalUsd * 0.0005;
     const loanFeeSavedUsd = Math.max(0, aaveStandardFeeUsd - loanFeeUsd);
 
-    // Gross spread output:
+    // Theoretical spread calculation from slider inputs
     const grossSpreadGainUsd = loanNotionalUsd * (activeSpreadBps / 10000);
 
-    // Dynamic gas costs based on dynamically resolved live ETH price & L2 sequencer mechanics:
     const ethPrice = liveEthPrice;
     const standardGasUnits = GAS_OPTIMIZATION_PROFILES.STANDARD.gasUnits;
     const currentGasUnits = activeGasProfile.gasUnits;
@@ -2396,8 +2269,6 @@ RPC_BASE_WS=wss://base-mainnet.public.blastapi.io
 
     const grossProfitUsd = grossSpreadGainUsd - loanFeeUsd;
 
-    // Calibrated L2 priority tip: Arbitrum uses FCFS (minimal 0.002 Gwei tip on Hyper-Alpha, 0 on lower tiers);
-    // Base/OP OP-Stack uses ultra-lean 0.001 - 0.005 Gwei priority fee instead of forfeiting 55% of spread.
     const isArb = selectedChain === 'arbitrum';
     const calibratedTipGwei =
       activeGasLevel === 'HYPER_ALPHA' ? (isArb ? 0.002 : 0.005) : isArb ? 0 : 0.001;
@@ -2405,6 +2276,8 @@ RPC_BASE_WS=wss://base-mainnet.public.blastapi.io
 
     const netProfitUsd = grossProfitUsd - gasCostUsd - sequencerTipUsd;
     const passedMinProfit = netProfitUsd >= activeMinProfitUsd;
+
+    const probeSeq = ++simProbeSeqRef.current;
 
     setSimResult({
       grossProfitUsd,
@@ -2416,10 +2289,69 @@ RPC_BASE_WS=wss://base-mainnet.public.blastapi.io
       sequencerTipUsd,
       netProfitUsd,
       passedMinProfit,
-      revmVerified: false, // this is an arithmetic estimate; only eth_estimateGas / Rust searcher verifies trades on-chain
+      revmVerified: false,
       gasUnits: currentGasUnits,
       gasReductionPercent: activeGasProfile.savingsPercent,
+      onChainProbing: true,
+      onChainProfitable: false,
+      onChainRevertReason: null,
     });
+
+    // Execute real read-only eth_call (`minProfit = MaxUint256`) + eth_estimateGas against live DEX pools
+    void fetch('/api/flash-arb/simulator/probe', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chain: selectedChain,
+        tokenSymbol: activeToken,
+        quoteSymbol: overrides?.quoteSymbol,
+        loanAmount: activeLoanAmount,
+        buyDex: activeBuyDex,
+        sellDex: activeSellDex,
+        minProfitUsd: activeMinProfitUsd,
+      }),
+    })
+      .then(async (res) => {
+        const probe = await res.json();
+        if (simProbeSeqRef.current !== probeSeq) return;
+        setSimResult((prev) =>
+          prev
+            ? {
+                ...prev,
+                revmVerified: Boolean(probe?.verifiedOnChain),
+                onChainProbing: false,
+                onChainProfitable: Boolean(probe?.onChainProfitable),
+                onChainGrossProfitUsd: Number(probe?.actualGrossProfitUsd ?? 0),
+                onChainNetProfitUsd: Number(probe?.netOnChainProfitUsd ?? 0),
+                onChainGasUnits: Number(probe?.gasEstimateUnits ?? prev.gasUnits),
+                onChainGasCostUsd: Number(probe?.gasCostUsd ?? prev.gasCostUsd),
+                onChainRevertReason: probe?.revertReason || probe?.error || null,
+                onChainPair: probe?.pair,
+                onChainContract: probe?.contractAddress,
+                quoteToken: probe?.quoteToken,
+                onChainCheckedCandidates: Array.isArray(probe?.checkedCandidates)
+                  ? probe.checkedCandidates
+                  : [],
+              }
+            : prev
+        );
+      })
+      .catch((err: any) => {
+        if (simProbeSeqRef.current !== probeSeq) return;
+        setSimResult((prev) =>
+          prev
+            ? {
+                ...prev,
+                revmVerified: false,
+                onChainProbing: false,
+                onChainProfitable: false,
+                onChainGrossProfitUsd: 0,
+                onChainNetProfitUsd: 0,
+                onChainRevertReason: err?.message || 'On-chain eth_call probe request failed',
+              }
+            : prev
+        );
+      });
   };
 
   const handleOptimizeSimulatorParameters = () => {
@@ -2432,10 +2364,21 @@ RPC_BASE_WS=wss://base-mainnet.public.blastapi.io
       ? bestOpp.loanToken
       : currentTokenConfig.symbol;
     const bestTokCfg = activeChainTokens.find((t) => t.symbol === bestTokenSym) || currentTokenConfig;
-    const optDexA = activeChainDexPools.find((d) => d.name.includes('0.01%'))?.name ||
+    const matchDexOption = (dexLabel: string | undefined, fallback: string) => {
+      if (!dexLabel) return fallback;
+      const hit = activeChainDexPools.find((d) =>
+        d.name.toLowerCase().startsWith(dexLabel.split('(')[0].trim().toLowerCase())
+      );
+      return hit ? hit.name : fallback;
+    };
+    const optDexA =
+      matchDexOption(bestOpp?.buyDex, '') ||
+      activeChainDexPools.find((d) => d.name.includes('0.01%'))?.name ||
       activeChainDexPools.find((d) => d.name.includes('0.05%'))?.name ||
       simDexA;
-    const optDexB = activeChainDexPools.find((d) => d.name === 'PancakeSwap V3' || d.name === 'SushiSwap V3' || d.name === 'Uniswap V3')?.name ||
+    const optDexB =
+      matchDexOption(bestOpp?.sellDex, '') ||
+      activeChainDexPools.find((d) => d.name === 'PancakeSwap V3' || d.name === 'SushiSwap V3' || d.name === 'Uniswap V3')?.name ||
       simDexB;
     const optSpread = bestOpp && bestOpp.grossSpreadBps > 0 ? Math.max(5, Math.round(bestOpp.grossSpreadBps)) : bestTokCfg.typicalSpreadBps;
     const optLoan = bestOpp && bestOpp.optimalLoanAmount > 0 ? bestOpp.optimalLoanAmount : bestTokCfg.defaultLoan;
@@ -2457,6 +2400,8 @@ RPC_BASE_WS=wss://base-mainnet.public.blastapi.io
       minProfitUsd: optMinGuard,
       flashProviderId: 'BALANCER_V2',
       gasOptimization: 'HYPER_ALPHA',
+      buyDex: optDexA,
+      sellDex: optDexB,
     });
   };
 
@@ -2799,50 +2744,25 @@ RPC_BASE_WS=wss://base-mainnet.public.blastapi.io
           </button>
         </div>
 
-        {/* Right: Connected Wallet Chain Verification & 1-Click Auto Switch */}
+        {/* Right: Server Execution Signer Status */}
         <div className="flex flex-wrap items-center gap-2.5">
-          {okxConnectedAddress ? (
-            <div className="flex flex-wrap items-center gap-2">
-              <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-slate-950 border border-slate-800 font-mono text-xs">
-                <span className="text-slate-400">Wallet:</span>
-                <span className="text-white font-bold">{formatShortAddress(okxConnectedAddress)}</span>
-              </div>
-
-              {isWalletOnCorrectChain ? (
-                <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-emerald-500/20 border border-emerald-500/40 font-mono text-xs text-emerald-300 font-bold">
-                  <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" />
-                  <span>Network Synced ({targetChainConfig.name})</span>
-                </div>
-              ) : (
-                <div className="flex items-center gap-2">
-                  <div className="flex items-center gap-1 px-2.5 py-1.5 rounded-xl bg-amber-500/20 border border-amber-500/40 font-mono text-xs text-amber-300">
-                    <AlertTriangle className="h-3.5 w-3.5 text-amber-400 shrink-0" />
-                    <span>Wallet on {currentWalletChainName}</span>
-                  </div>
-                  <button
-                    type="button"
-                    disabled={isSwitchingChain}
-                    onClick={() => handleSwitchChain(selectedChain)}
-                    className="px-3 py-1.5 rounded-xl bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-400 hover:to-orange-400 text-slate-950 text-xs font-mono font-bold transition-all flex items-center gap-1.5 cursor-pointer shadow-md disabled:opacity-50"
-                  >
-                    {isSwitchingChain ? (
-                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                    ) : (
-                      <Zap className="h-3.5 w-3.5 fill-current" />
-                    )}
-                    <span>Switch Wallet to {targetChainConfig.name}</span>
-                  </button>
-                </div>
-              )}
-            </div>
+          {isSignerKeyConfigured ? (
+            <button
+              type="button"
+              onClick={() => setIsSignerModalOpen(true)}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-500/40 font-mono text-xs text-emerald-300 font-bold cursor-pointer transition-all"
+            >
+              <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" />
+              <span>Server Signer Ready ({targetChainConfig.name})</span>
+            </button>
           ) : (
             <button
               type="button"
-              onClick={onOpenOkxWallet}
-              className="px-3.5 py-1.5 rounded-xl bg-indigo-500/20 hover:bg-indigo-500/30 border border-indigo-400/40 text-indigo-200 text-xs font-mono font-bold transition-all flex items-center gap-1.5 cursor-pointer shadow-md"
+              onClick={() => setIsSignerModalOpen(true)}
+              className="px-3.5 py-1.5 rounded-xl bg-amber-500/20 hover:bg-amber-500/30 border border-amber-400/40 text-amber-200 text-xs font-mono font-bold transition-all flex items-center gap-1.5 cursor-pointer shadow-md"
             >
-              <Wallet className="h-3.5 w-3.5" />
-              <span>Connect Web3 / OKX Wallet</span>
+              <Key className="h-3.5 w-3.5" />
+              <span>Configure Server Signer</span>
             </button>
           )}
         </div>
@@ -3486,6 +3406,93 @@ RPC_BASE_WS=wss://base-mainnet.public.blastapi.io
                   <p className="text-[11px] text-slate-400 font-sans leading-relaxed">
                     Detects ERC-20, ERC-2612, ERC-4626, ERC-777, ERC-721, and ERC-1155 on-chain + <code className="text-emerald-300 font-mono">eth_estimateGas</code>. FlashArb contracts sweep fungible ERC-20/2612/4626/777 tokens only; Connected Wallet can also sweep ERC-721/1155 using <code className="text-cyan-300 font-mono">0xAddress:tokenId</code> to <code className="text-emerald-300 font-mono">{formatShortAddress(profitWalletAddress)}</code>.
                   </p>
+
+                  {/* Contract USDT Threshold Auto-Sweep Controls */}
+                  <div
+                    data-testid="usdt-auto-sweep-panel"
+                    className="p-2.5 rounded-lg bg-slate-950/80 border border-emerald-500/25 space-y-2"
+                  >
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <label className="flex items-center gap-1.5 text-[11px] font-semibold text-emerald-300 font-sans cursor-pointer">
+                        <input
+                          type="checkbox"
+                          data-testid="usdt-auto-sweep-toggle"
+                          checked={autoSweepUsdtEnabled}
+                          onChange={(e) => {
+                            const next = e.target.checked;
+                            setAutoSweepUsdtEnabled(next);
+                            persistUsdtAutoSweepPreference(next, usdtSweepThreshold);
+                          }}
+                          className="rounded bg-slate-900 border-slate-700 text-emerald-500 focus:ring-0 cursor-pointer"
+                        />
+                        <span>Auto-sweep contract USDT &rarr; Profit Vault when balance &gt; threshold</span>
+                      </label>
+                      <span
+                        data-testid="usdt-auto-sweep-status"
+                        className={`text-[10px] font-mono px-2 py-0.5 rounded border ${
+                          !autoSweepUsdtEnabled
+                            ? 'bg-slate-900 border-slate-700 text-slate-400'
+                            : usdtAutoSweepEvaluation.exceedsThreshold && !isSignerKeyConfigured
+                              ? 'bg-amber-950/60 border-amber-500/40 text-amber-300'
+                              : usdtAutoSweepEvaluation.exceedsThreshold
+                                ? 'bg-cyan-950/60 border-cyan-500/40 text-cyan-300'
+                                : 'bg-emerald-950/50 border-emerald-500/30 text-emerald-300'
+                        }`}
+                      >
+                        {!autoSweepUsdtEnabled
+                          ? `Paused (${usdtAutoSweepEvaluation.totalContractUsdt.toFixed(2)} USDT held)`
+                          : usdtAutoSweepEvaluation.exceedsThreshold && !isSignerKeyConfigured
+                            ? `${usdtAutoSweepEvaluation.totalContractUsdt.toFixed(2)} > ${usdtSweepThreshold} USDT (configure Signer Key)`
+                            : usdtAutoSweepEvaluation.exceedsThreshold && usdtAutoSweepEvaluation.reason === 'NO_ACCESSIBLE_CONTRACT'
+                              ? `${usdtAutoSweepEvaluation.totalContractUsdt.toFixed(2)} > ${usdtSweepThreshold} USDT (owner mismatch)`
+                              : usdtAutoSweepEvaluation.exceedsThreshold
+                                ? `Threshold exceeded (${usdtAutoSweepEvaluation.sweepableContractUsdt.toFixed(2)} > ${usdtSweepThreshold} USDT)`
+                                : `${usdtAutoSweepEvaluation.totalContractUsdt.toFixed(2)} / ${usdtSweepThreshold} USDT`}
+                      </span>
+                    </div>
+                    <div className="flex flex-wrap items-center justify-between gap-2 text-[11px]">
+                      <div className="flex items-center gap-2 font-mono">
+                        <label htmlFor="usdt-sweep-threshold-input" className="text-slate-400 font-sans">
+                          USDT Threshold:
+                        </label>
+                        <div className="flex items-center rounded-md bg-slate-900 border border-slate-700 focus-within:border-emerald-400 overflow-hidden">
+                          <input
+                            id="usdt-sweep-threshold-input"
+                            data-testid="usdt-sweep-threshold-input"
+                            type="number"
+                            min="0"
+                            step="0.5"
+                            value={usdtSweepThresholdInput}
+                            onChange={(e) => {
+                              const raw = e.target.value;
+                              setUsdtSweepThresholdInput(raw);
+                              if (raw.trim() !== '') {
+                                const nextThreshold = parseUsdtSweepThreshold(raw, DEFAULT_USDT_SWEEP_THRESHOLD);
+                                persistUsdtAutoSweepPreference(autoSweepUsdtEnabled, nextThreshold);
+                              }
+                            }}
+                            onBlur={() => {
+                              const normalized = parseUsdtSweepThreshold(
+                                usdtSweepThresholdInput,
+                                DEFAULT_USDT_SWEEP_THRESHOLD
+                              );
+                              setUsdtSweepThresholdInput(String(normalized));
+                              persistUsdtAutoSweepPreference(autoSweepUsdtEnabled, normalized);
+                            }}
+                            aria-label="USDT auto-sweep threshold"
+                            className="w-24 px-2 py-1 bg-transparent text-white text-[11px] font-mono focus:outline-none"
+                          />
+                          <span className="px-2 py-1 bg-slate-800/90 text-emerald-300 border-l border-slate-700 text-[10px]">
+                            USDT
+                          </span>
+                        </div>
+                      </div>
+                      <span className="text-[10px] text-slate-400 font-mono">
+                        Target: FLASH_ARB_PROFIT_WALLET ({formatShortAddress(profitWalletAddress)})
+                      </span>
+                    </div>
+                  </div>
+
                   <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
                     <div className="flex flex-col gap-1">
                       <label className="flex items-center gap-1.5 text-[11px] text-emerald-300 font-sans cursor-pointer">
@@ -3533,21 +3540,6 @@ RPC_BASE_WS=wss://base-mainnet.public.blastapi.io
                             : ''}
                         </span>
                       </label>
-                      {okxConnectedAddress &&
-                        okxConnectedAddress.toLowerCase() !== profitWalletAddress.toLowerCase() &&
-                        okxConnectedAddress.toLowerCase() !== gasWalletAddress.toLowerCase() && (
-                          <label className="flex items-center gap-1.5 text-[11px] text-cyan-200 font-sans cursor-pointer">
-                            <input
-                              type="checkbox"
-                              checked={includeConnectedWalletTokensInSweep}
-                              onChange={(e) => setIncludeConnectedWalletTokensInSweep(e.target.checked)}
-                              className="rounded bg-slate-900 border-slate-700 text-cyan-500 focus:ring-0 cursor-pointer"
-                            />
-                            <span>
-                              Also sweep compatible ERC-20/4626/721/1155 from Connected Wallet ({formatShortAddress(okxConnectedAddress)})
-                            </span>
-                          </label>
-                        )}
                     </div>
                     <button
                       type="button"
@@ -3561,13 +3553,12 @@ RPC_BASE_WS=wss://base-mainnet.public.blastapi.io
                   </div>
                 </div>
 
-                {/* Quick Presets: MetaMask (..cb9, default) vs OKX Web3 Wallet (..11) */}
+                {/* Quick Presets: MetaMask (..cb9, default) & Custom EVM Address */}
                 <div className="pt-2 border-t border-slate-800/80 flex flex-wrap items-center justify-between gap-2 text-xs">
                   <span className="text-slate-400 font-bold text-[11px] flex items-center gap-1">
                     <span>Target Vault Presets:</span>
                   </span>
                   <div className="flex flex-wrap items-center gap-2">
-                    {/* MetaMask default button + WalletConnect QR Trigger */}
                     <div className="flex items-center gap-1.5">
                       <button
                         type="button"
@@ -3601,42 +3592,15 @@ RPC_BASE_WS=wss://base-mainnet.public.blastapi.io
                       )}
                     </div>
 
-                    {/* OKX Web3 Wallet Button */}
-                    {okxConnectedAddress ? (
-                      <button
-                        type="button"
-                        onClick={() => handleSaveProfitWallet(okxConnectedAddress, `OKX Web3 Wallet (${okxConnectedAddress.toLowerCase().endsWith('11') ? '..11' : okxConnectedAddress.slice(-4)})`)}
-                        className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer border ${
-                          profitWalletAddress.toLowerCase() === okxConnectedAddress.toLowerCase()
-                            ? 'bg-white text-slate-950 border-white shadow-md ring-1 ring-neutral-300'
-                            : 'bg-slate-900 hover:bg-slate-800 text-white border-slate-700'
-                        }`}
-                        title={`Route profits to connected OKX Web3 Wallet (${okxConnectedAddress})`}
-                      >
-                        <span className="text-xs">⬛</span>
-                        <span>OKX Wallet ({formatShortAddress(okxConnectedAddress)})</span>
-                        {profitWalletAddress.toLowerCase() === okxConnectedAddress.toLowerCase() ? (
-                          <Check className="h-3.5 w-3.5 stroke-[3] text-slate-950" />
-                        ) : (
-                          <span className="text-[10px] text-cyan-400 font-mono">
-                            {okxConnectedAddress.toLowerCase().endsWith('11') ? '..11' : 'active'}
-                          </span>
-                        )}
-                      </button>
-                    ) : (
-                      <button
-                        type="button"
-                        onClick={() => {
-                          if (onOpenOkxWallet) onOpenOkxWallet();
-                          else connectOkxWallet().then((conn) => handleSaveProfitWallet(conn.address, `OKX Web3 Wallet (${conn.address.slice(-4)})`)).catch(() => {});
-                        }}
-                        className="px-3 py-1.5 rounded-xl bg-slate-900 hover:bg-slate-800 text-slate-300 hover:text-white border border-slate-700 text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer"
-                        title="Connect your OKX Web3 Wallet (..11) to route profits"
-                      >
-                        <span className="text-xs">⬛</span>
-                        <span>Connect OKX (..11)</span>
-                      </button>
-                    )}
+                    <button
+                      type="button"
+                      onClick={() => setIsEditingWallet(true)}
+                      className="px-3 py-1.5 rounded-xl bg-slate-900 hover:bg-slate-800 text-slate-300 hover:text-white border border-slate-700 text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer"
+                      title="Enter a custom EVM Profit Vault address"
+                    >
+                      <Edit3 className="h-3 w-3" />
+                      <span>Custom EVM Address</span>
+                    </button>
                   </div>
                 </div>
               </div>
@@ -4059,19 +4023,18 @@ RPC_BASE_WS=wss://base-mainnet.public.blastapi.io
                     </div>
                   )}
 
-                  {/* Dual Deployment Actions (Available when not currently deploying) */}
+                  {/* Server Signer Deployment Action */}
                   {!isDeployingAgent && !deployAgentSuccess && (
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1">
-                      {/* Option A: Server Signer Agent */}
+                    <div className="pt-1">
                       <button
                         type="button"
-                        onClick={() => handleDeployContractAgent('SERVER_SIGNER')}
-                        className="p-4 rounded-xl border border-cyan-500/40 bg-gradient-to-br from-cyan-950/40 to-slate-900 hover:border-cyan-400 text-left transition-all cursor-pointer group shadow-lg"
+                        onClick={() => handleDeployContractAgent()}
+                        className="w-full p-4 rounded-xl border border-cyan-500/40 bg-gradient-to-br from-cyan-950/40 to-slate-900 hover:border-cyan-400 text-left transition-all cursor-pointer group shadow-lg"
                       >
                         <div className="flex items-center justify-between mb-2">
                           <span className="text-xs font-bold text-cyan-300 flex items-center gap-1.5">
                             <Zap className="h-4 w-4 fill-current text-cyan-400" />
-                            <span>1. Deploy via Server Agent</span>
+                            <span>Deploy FlashArbOptimized via Server Agent</span>
                           </span>
                           <span className={`text-[10px] px-1.5 py-0.5 rounded font-bold ${isSignerKeyConfigured ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30' : 'bg-slate-800 text-slate-500'}`}>
                             {isSignerKeyConfigured ? 'Key Ready' : 'Key Needed'}
@@ -4079,26 +4042,6 @@ RPC_BASE_WS=wss://base-mainnet.public.blastapi.io
                         </div>
                         <p className="text-[11px] text-slate-300 font-sans leading-relaxed">
                           Autonomous deployment signed by gas funder <code className="text-amber-300 font-mono">{formatShortAddress(gasWalletAddress)}</code> directly through {targetChainConfig.name} RPC.
-                        </p>
-                      </button>
-
-                      {/* Option B: Connected Web3 Wallet */}
-                      <button
-                        type="button"
-                        onClick={() => handleDeployContractAgent('CONNECTED_WALLET')}
-                        className="p-4 rounded-xl border border-indigo-500/40 bg-gradient-to-br from-indigo-950/40 to-slate-900 hover:border-indigo-400 text-left transition-all cursor-pointer group shadow-lg"
-                      >
-                        <div className="flex items-center justify-between mb-2">
-                          <span className="text-xs font-bold text-indigo-300 flex items-center gap-1.5">
-                            <Wallet className="h-4 w-4 text-indigo-400" />
-                            <span>2. Deploy via Web3 Wallet</span>
-                          </span>
-                          <span className="text-[10px] px-1.5 py-0.5 rounded bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 font-bold">
-                            MetaMask / OKX
-                          </span>
-                        </div>
-                        <p className="text-[11px] text-slate-300 font-sans leading-relaxed">
-                          Pops up your browser wallet to sign contract creation bytecode on {targetChainConfig.name}. Auto-monitors receipt and saves address.
                         </p>
                       </button>
                     </div>
@@ -5127,9 +5070,17 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
                                       const parsedAmt = parseFloat(String(opp.loanAmount).split(' ')[0]);
                                       const nextLoan = Number.isFinite(parsedAmt) && parsedAmt > 0 ? parsedAmt : currentTokenConfig.defaultLoan;
                                       const nextSpread = Math.max(1, Math.round(opp.spreadBps));
+                                      const matchDex = (raw: string, fallback: string) =>
+                                        activeChainDexPools.find((d) =>
+                                          d.name.toLowerCase().startsWith(raw.split('(')[0].trim().toLowerCase())
+                                        )?.name || fallback;
+                                      const mappedDexA = matchDex(opp.dexA, simDexA);
+                                      const mappedDexB = matchDex(opp.dexB, simDexB);
                                       setSimToken(opp.token);
                                       setSimLoanAmount(nextLoan);
                                       setSimSpreadBps(nextSpread);
+                                      setSimDexA(mappedDexA);
+                                      setSimDexB(mappedDexB);
                                       setSimMinProfitUsd(minProfitThresholdUsd);
                                       setActiveSubTab('SIMULATOR');
                                       handleRunSimulation({
@@ -5137,6 +5088,8 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
                                         loanAmount: nextLoan,
                                         spreadBps: nextSpread,
                                         minProfitUsd: minProfitThresholdUsd,
+                                        buyDex: mappedDexA,
+                                        sellDex: mappedDexB,
                                       });
                                     }}
                                     className="px-2 py-1 rounded-lg bg-cyan-500/20 hover:bg-cyan-500/30 border border-cyan-400/40 text-cyan-300 text-[10px] font-bold flex items-center gap-1 cursor-pointer transition-all whitespace-nowrap"
@@ -5730,39 +5683,100 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
 
             {simResult ? (
               <div className="space-y-4 animate-in fade-in duration-200">
-                {/* Result Status Banner */}
+                {/* Honest On-Chain eth_call Status Banner vs Theoretical Model */}
                 <div
-                  className={`p-4 rounded-xl border flex items-center justify-between ${
-                    simResult.passedMinProfit
+                  className={`p-4 rounded-xl border flex flex-col sm:flex-row sm:items-center justify-between gap-3 ${
+                    simResult.onChainProbing
+                      ? 'bg-cyan-950/30 border-cyan-500/40 text-cyan-200'
+                      : simResult.revmVerified && simResult.onChainProfitable
                       ? 'bg-emerald-950/30 border-emerald-500/40 text-emerald-200'
                       : 'bg-rose-950/30 border-rose-500/40 text-rose-200'
                   }`}
                 >
-                  <div className="flex items-center gap-3">
-                    {simResult.passedMinProfit ? (
-                      <CheckCircle2 className="h-6 w-6 text-emerald-400 shrink-0" />
+                  <div className="flex items-start gap-3">
+                    {simResult.onChainProbing ? (
+                      <Loader2 className="h-6 w-6 text-cyan-400 animate-spin shrink-0 mt-0.5" />
+                    ) : simResult.revmVerified && simResult.onChainProfitable ? (
+                      <CheckCircle2 className="h-6 w-6 text-emerald-400 shrink-0 mt-0.5" />
                     ) : (
-                      <AlertTriangle className="h-6 w-6 text-rose-400 shrink-0" />
+                      <AlertTriangle className="h-6 w-6 text-rose-400 shrink-0 mt-0.5" />
                     )}
-                    <div>
+                    <div className="space-y-1">
                       <div className="font-bold font-mono text-sm">
-                        {simResult.passedMinProfit ? 'PRE-FLIGHT CONFIRMED · LIVE EXECUTION READY' : 'PRE-FLIGHT REVERTED · INSUFFICIENT SPREAD'}
+                        {simResult.onChainProbing
+                          ? 'PROBING LIVE POOLS VIA ON-CHAIN ETH_CALL...'
+                          : simResult.revmVerified && simResult.onChainProfitable
+                          ? 'ON-CHAIN ETH_CALL CONFIRMED · PROFITABLE ROUTE READY'
+                          : 'ON-CHAIN ETH_CALL: NO EXECUTABLE SPREAD (0 GAS SPENT)'}
                       </div>
                       <div className="text-xs text-slate-300">
-                        {simResult.passedMinProfit
-                          ? `Atomic execution yields positive alpha after ${currentFlashProvider.name} loan, DEX slippage & L2 gas.`
-                          : 'FlashArb contract would atomically revert without capital loss.'}
+                        {simResult.onChainProbing
+                          ? `Calling FlashArbOptimized.executeOptimizedArbitrage() on ${targetChainConfig.name} against real Balancer V2 & DEX pools...`
+                          : simResult.revmVerified && simResult.onChainProfitable
+                          ? `Verified on ${targetChainConfig.name} (${simResult.onChainPair || simToken}): real round-trip yields +$${(simResult.onChainNetProfitUsd ?? 0).toFixed(2)} net profit after gas.`
+                          : simResult.onChainRevertReason ||
+                            `Your ${simSpreadBps} bps slider models $${simResult.netProfitUsd.toFixed(2)}, but real ${targetChainConfig.name} pools currently return $0.00 net profit. FlashArbOptimized blocks unprofitable broadcasts so 0 gas is wasted.`}
                       </div>
                     </div>
                   </div>
 
-                  <div className="text-right font-mono">
-                    <div className="text-xs text-slate-400">Net Realized Alpha</div>
-                    <div className={`text-xl font-black ${simResult.passedMinProfit ? 'text-emerald-400' : 'text-rose-400'}`}>
-                      ${simResult.netProfitUsd.toFixed(2)}
+                  <div className="text-right font-mono shrink-0 space-y-0.5">
+                    <div className="text-[10px] text-slate-400 uppercase">Verified On-Chain Net</div>
+                    <div
+                      className={`text-xl font-black ${
+                        simResult.onChainProbing
+                          ? 'text-cyan-300'
+                          : simResult.revmVerified && simResult.onChainProfitable
+                          ? 'text-emerald-400'
+                          : 'text-rose-400'
+                      }`}
+                    >
+                      {simResult.onChainProbing
+                        ? '...'
+                        : `$${(simResult.onChainNetProfitUsd ?? 0).toFixed(2)}`}
+                    </div>
+                    <div className="text-[10px] text-slate-400">
+                      Slider Model: ${simResult.netProfitUsd.toFixed(2)} ({simSpreadBps} bps)
                     </div>
                   </div>
                 </div>
+
+                {/* Live eth_call Candidate Telemetry */}
+                {!simResult.onChainProbing &&
+                  simResult.onChainCheckedCandidates &&
+                  simResult.onChainCheckedCandidates.length > 0 && (
+                    <div className="p-3 rounded-xl bg-slate-950/90 border border-slate-800 space-y-1.5 font-mono text-[11px]">
+                      <div className="flex items-center justify-between text-slate-400 font-bold">
+                        <span>Live On-Chain eth_call Probe ({simResult.onChainPair || simToken}):</span>
+                        <span className="text-cyan-400">
+                          {simResult.onChainCheckedCandidates.length} directions / clip sizes tested
+                        </span>
+                      </div>
+                      <div className="space-y-1 max-h-32 overflow-y-auto pr-1">
+                        {simResult.onChainCheckedCandidates.slice(0, 4).map((cand, i) => (
+                          <div
+                            key={`${cand.label}-${i}`}
+                            className="flex flex-wrap items-center justify-between gap-2 px-2 py-1 rounded bg-slate-900/90 border border-slate-800/80"
+                          >
+                            <span className="text-slate-300 truncate max-w-[260px]" title={cand.detail}>
+                              {cand.label} · {Number(cand.amountFormatted).toLocaleString(undefined, { maximumFractionDigits: 4 })} {cand.borrowedToken}
+                            </span>
+                            <span
+                              className={
+                                cand.status === 'PROFITABLE'
+                                  ? 'text-emerald-400 font-bold'
+                                  : 'text-rose-400 font-bold'
+                              }
+                            >
+                              {cand.status === 'PROFITABLE'
+                                ? `+$${cand.actualProfitUsd.toFixed(2)} (+${Number(cand.actualProfitFormatted).toFixed(5)} ${cand.borrowedToken})`
+                                : '$0.00 (Negative after fees/impact)'}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
 
                 {/* Gas & Protocol Optimization Alpha Breakdown Card */}
                 <div className="p-4 rounded-xl bg-slate-950 border border-emerald-500/30 space-y-3 font-mono text-xs">
@@ -5812,8 +5826,16 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
 
                 {/* Financial Ledger Breakdown */}
                 <div className="p-4 rounded-xl bg-slate-950/80 border border-slate-800 space-y-2.5 font-mono text-xs">
+                  <div className="text-[10px] text-slate-500 uppercase tracking-wider border-b border-slate-800/80 pb-1.5 flex items-center justify-between">
+                    <span>Theoretical Sizing Model ({simSpreadBps} bps Slider Target)</span>
+                    <span className={simResult.onChainProfitable ? 'text-emerald-400 font-bold' : 'text-rose-400 font-bold'}>
+                      {simResult.onChainProbing
+                        ? 'Probing Live Chain...'
+                        : `On-Chain eth_call: $${(simResult.onChainNetProfitUsd ?? 0).toFixed(2)}`}
+                    </span>
+                  </div>
                   <div className="flex justify-between text-slate-300">
-                    <span className="text-slate-400">Gross Arbitrage Spread Gain:</span>
+                    <span className="text-slate-400">Theoretical Spread Gain ({simSpreadBps} bps input):</span>
                     <span className="text-white font-bold">+${simResult.grossProfitUsd.toFixed(2)}</span>
                   </div>
                   <div className="flex justify-between text-slate-300">
@@ -5833,9 +5855,15 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
                     <span className="text-purple-400 font-bold">-${simResult.sequencerTipUsd.toFixed(2)}</span>
                   </div>
                   <div className="h-px bg-slate-800 my-2" />
+                  <div className="flex justify-between text-xs text-slate-400">
+                    <span>Theoretical Slider Net:</span>
+                    <span className="text-slate-200 font-bold">${simResult.netProfitUsd.toFixed(2)}</span>
+                  </div>
                   <div className="flex justify-between text-sm">
-                    <span className="text-slate-300 font-bold">Net Realized Profit to Owner:</span>
-                    <span className="text-emerald-400 font-black">+${simResult.netProfitUsd.toFixed(2)}</span>
+                    <span className="text-slate-300 font-bold">Verified On-Chain Net Profit:</span>
+                    <span className={`font-black ${simResult.onChainProfitable ? 'text-emerald-400' : 'text-rose-400'}`}>
+                      {simResult.onChainProbing ? '...' : `$${(simResult.onChainNetProfitUsd ?? 0).toFixed(2)}`}
+                    </span>
                   </div>
                 </div>
 
@@ -5874,7 +5902,7 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
                   <div className="flex items-center gap-2 text-slate-300 flex-wrap">
                     <span className="px-1.5 py-0.5 rounded bg-slate-800 text-emerald-400 shrink-0">5</span>
                     <span>
-                      Repay {simLoanAmount} {simToken} (Fee: ${simResult.loanFeeUsd.toFixed(2)}) &rarr; Sweep +${simResult.netProfitUsd.toFixed(2)} ERC-20 net profit (+${simResult.loanFeeSavedUsd.toFixed(2)} fee saved) + excess Gas ETH &gt; 0.002 reserve to profit wallet:
+                      Repay {simLoanAmount} {simToken} (Balancer 0% Fee) &rarr; Sweep ${(simResult.onChainProfitable ? (simResult.onChainNetProfitUsd ?? 0) : 0).toFixed(2)} verified ERC-20 net profit + excess Gas ETH &gt; 0.002 reserve to profit wallet:
                     </span>
                     <span className="text-emerald-400 font-bold bg-emerald-950/40 px-1.5 py-0.5 rounded border border-emerald-500/30 font-mono">
                       {formatShortAddress(profitWalletAddress)} ({profitWalletLabel})
@@ -6028,43 +6056,50 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
                         <Bot className="h-4 w-4" />
                         <span>Deploy FlashArb Contract to {targetChainConfig.name} to Enable Live Trades</span>
                       </button>
-                    ) : !okxConnectedAddress ? (
+                    ) : !isSignerKeyConfigured ? (
                       <button
                         type="button"
-                        onClick={onOpenOkxWallet}
-                        className="w-full py-3 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-mono font-bold text-xs flex items-center justify-center gap-2 cursor-pointer shadow-lg shadow-indigo-500/20 transition-all"
-                      >
-                        <Wallet className="h-4 w-4" />
-                        <span>Connect Web3 Wallet to Broadcast Live Arbitrage</span>
-                      </button>
-                    ) : !isWalletOnCorrectChain ? (
-                      <button
-                        type="button"
-                        disabled={isSwitchingChain}
-                        onClick={() => handleSwitchChain(selectedChain)}
+                        onClick={() => setIsSignerModalOpen(true)}
                         className="w-full py-3 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-mono font-bold text-xs flex items-center justify-center gap-2 cursor-pointer shadow-lg shadow-amber-500/20 transition-all"
                       >
-                        {isSwitchingChain ? <Loader2 className="h-4 w-4 animate-spin" /> : <Zap className="h-4 w-4 fill-current" />}
-                        <span>Switch Wallet to {targetChainConfig.name} to Broadcast Live Trade</span>
+                        <Key className="h-4 w-4" />
+                        <span>Configure Server Signer Key to Broadcast Live Arbitrage</span>
                       </button>
                     ) : (
                       <button
                         type="button"
-                        disabled={isExecutingLiveTrade || !simResult?.passedMinProfit}
+                        disabled={
+                          isExecutingLiveTrade ||
+                          Boolean(simResult?.onChainProbing) ||
+                          !simResult?.revmVerified ||
+                          !simResult?.onChainProfitable
+                        }
                         onClick={() => handleExecuteLiveOnChainTrade()}
-                        className="w-full py-3.5 rounded-xl bg-gradient-to-r from-emerald-500 via-teal-500 to-cyan-500 hover:from-emerald-400 hover:to-cyan-400 text-white font-mono font-black text-xs flex items-center justify-center gap-2 cursor-pointer shadow-xl shadow-emerald-500/25 transition-all disabled:opacity-50"
+                        className="w-full py-3.5 rounded-xl bg-gradient-to-r from-emerald-500 via-teal-500 to-cyan-500 hover:from-emerald-400 hover:to-cyan-400 text-white font-mono font-black text-xs flex items-center justify-center gap-2 cursor-pointer shadow-xl shadow-emerald-500/25 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
                       >
                         {isExecutingLiveTrade ? (
                           <>
                             <Loader2 className="h-4 w-4 animate-spin" />
-                            <span>Broadcasting Live Transaction to {targetChainConfig.name}...</span>
+                            <span>Executing Verified executeOptimizedArbitrage on {targetChainConfig.name}...</span>
+                          </>
+                        ) : simResult?.onChainProbing ? (
+                          <>
+                            <Loader2 className="h-4 w-4 animate-spin" />
+                            <span>Verifying Live Pool Spread via eth_call...</span>
+                          </>
+                        ) : !simResult?.revmVerified || !simResult?.onChainProfitable ? (
+                          <>
+                            <Shield className="h-4 w-4 text-amber-300" />
+                            <span>
+                              Broadcast Halted — Live On-Chain eth_call Found $0.00 Spread (Zero Loss Guard)
+                            </span>
                           </>
                         ) : (
                           <>
                             <Zap className="h-4 w-4 fill-current text-white animate-bounce" />
                             <span>
-                              Broadcast Live Flash Loan Arbitrage on {targetChainConfig.name} (+$
-                              {simResult?.netProfitUsd.toFixed(2)} Alpha)
+                              Broadcast Real Flash Loan Arbitrage on {targetChainConfig.name} (+$
+                              {(simResult.onChainNetProfitUsd ?? 0).toFixed(2)} Verified)
                             </span>
                           </>
                         )}

@@ -109,3 +109,36 @@ test('concentrated V3 virtual depth unlocks higher S* profit while maxTradeUsd c
   })!;
   assert.ok(unclamped.netProfitUsd > clampedToTvl.netProfitUsd * 20);
 });
+
+test('computeAdaptiveDepthFraction unlocks higher dollar profit on wide edges without violating caps', async () => {
+  const { computeAdaptiveDepthFraction } = await import('./arbSizing.ts');
+  assert.equal(computeAdaptiveDepthFraction(5), 0.05);
+  assert.equal(computeAdaptiveDepthFraction(15), 0.065);
+  assert.equal(computeAdaptiveDepthFraction(30), 0.08);
+
+  const conservative = sizeArbitrage({
+    netEdgeBps: 1000,
+    depthBuyUsd: 500_000,
+    depthSellUsd: 200_000,
+    buyPrice: 2000,
+    gasCostUsd: 0.01,
+    autoOptimize: true,
+    minLoanUnits: 0.001,
+    maxLoanUnits: 150,
+    maxDepthFraction: computeAdaptiveDepthFraction(5),
+  })!;
+  const adaptive = sizeArbitrage({
+    netEdgeBps: 1000,
+    depthBuyUsd: 500_000,
+    depthSellUsd: 200_000,
+    buyPrice: 2000,
+    gasCostUsd: 0.01,
+    autoOptimize: true,
+    minLoanUnits: 0.001,
+    maxLoanUnits: 150,
+    maxDepthFraction: computeAdaptiveDepthFraction(1000),
+  })!;
+  assert.equal(adaptive.overDepth, false);
+  assert.ok(adaptive.tradeUsd > conservative.tradeUsd);
+  assert.ok(adaptive.netProfitUsd > conservative.netProfitUsd);
+});

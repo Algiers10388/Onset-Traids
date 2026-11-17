@@ -498,16 +498,6 @@ export interface CredentialsSummary {
   OKX?: ExchangeCredentialStatus;
 }
 
-export interface OkxWalletState {
-  isConnected: boolean;
-  address: string | null;
-  chainId: string | null;
-  networkName: string;
-  balanceEth: number;
-  balanceUsd: number;
-  isExtensionDetected: boolean;
-  lastConnectedAt?: number;
-}
 
 export interface ExchangeWallet {
   exchange: ExchangeId;

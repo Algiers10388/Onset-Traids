@@ -35,11 +35,27 @@ export interface SavedChatSession {
   updatedAt: number;
 }
 
+export interface AppAuthUser {
+  uid: string;
+  email: string | null;
+  displayName: string | null;
+  photoURL: string | null;
+  provider: 'password' | 'google';
+  getIdToken?: () => Promise<string>;
+}
+
 interface AuthContextType {
-  user: User | null;
+  user: AppAuthUser | null;
+  firebaseUser: User | null;
   loading: boolean;
+  signUpWithEmail: (email: string, password: string, displayName?: string) => Promise<void>;
+  signInWithEmail: (email: string, password: string) => Promise<void>;
   signInWithGoogle: () => Promise<void>;
   signOutUser: () => Promise<void>;
+  authModalOpen: boolean;
+  authModalMode: 'login' | 'signup';
+  openAuthModal: (mode?: 'login' | 'signup') => void;
+  closeAuthModal: () => void;
   saveChatToFirestore: (session: SavedChatSession) => Promise<void>;
   savedChats: SavedChatSession[];
   saveStrategyToFirestore: (strategyData: Record<string, unknown>) => Promise<void>;
@@ -49,19 +65,47 @@ interface AuthContextType {
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
 export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
-  const [user, setUser] = useState<User | null>(null);
+  const [firebaseUser, setFirebaseUser] = useState<User | null>(null);
+  const [passwordUser, setPasswordUser] = useState<AppAuthUser | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
   const [savedChats, setSavedChats] = useState<SavedChatSession[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [authModalOpen, setAuthModalOpen] = useState<boolean>(false);
+  const [authModalMode, setAuthModalMode] = useState<'login' | 'signup'>('login');
 
-  // Monitor Auth State
+  // Hydrate email/password server session on mount
+  useEffect(() => {
+    let mounted = true;
+    fetch('/api/auth/me', { credentials: 'include' })
+      .then((res) => res.json())
+      .then((data) => {
+        if (!mounted) return;
+        if (data?.authenticated && data.user) {
+          setPasswordUser({
+            uid: data.user.uid,
+            email: data.user.email,
+            displayName: data.user.displayName || data.user.email,
+            photoURL: null,
+            provider: 'password',
+          });
+        }
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (mounted) setLoading(false);
+      });
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
+  // Monitor Firebase Auth State (Google OAuth optional)
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
-      setUser(currentUser);
+      setFirebaseUser(currentUser);
       setLoading(false);
 
       if (currentUser) {
-        // Sync user profile to Firestore
         try {
           const userRef = doc(db, 'users', currentUser.uid);
           const snap = await getDoc(userRef);
@@ -84,15 +128,26 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
     return () => unsubscribe();
   }, []);
 
-  // Listen to User Saved Chats from Firestore
+  const user: AppAuthUser | null = firebaseUser
+    ? {
+        uid: firebaseUser.uid,
+        email: firebaseUser.email,
+        displayName: firebaseUser.displayName,
+        photoURL: firebaseUser.photoURL,
+        provider: 'google',
+        getIdToken: () => firebaseUser.getIdToken(),
+      }
+    : passwordUser;
+
+  // Listen to User Saved Chats from Firestore (when authenticated with Firebase)
   useEffect(() => {
-    if (!user) {
+    if (!firebaseUser) {
       setSavedChats([]);
       return;
     }
 
     try {
-      const chatsRef = collection(db, 'users', user.uid, 'chats');
+      const chatsRef = collection(db, 'users', firebaseUser.uid, 'chats');
       const q = query(chatsRef, orderBy('updatedAt', 'desc'));
       const unsub = onSnapshot(
         q,
@@ -120,13 +175,62 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
     } catch (err) {
       console.warn('Firestore subscription error:', err);
     }
-  }, [user]);
+  }, [firebaseUser]);
+
+  const signUpWithEmail = async (email: string, password: string, displayName?: string) => {
+    setError(null);
+    const res = await fetch('/api/auth/signup', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ email, password, displayName }),
+    });
+    const data = await res.json();
+    if (!res.ok || !data.success || !data.user) {
+      const msg = data?.error || 'Sign up failed';
+      setError(msg);
+      throw new Error(msg);
+    }
+    setPasswordUser({
+      uid: data.user.uid,
+      email: data.user.email,
+      displayName: data.user.displayName || data.user.email,
+      photoURL: null,
+      provider: 'password',
+    });
+    setAuthModalOpen(false);
+  };
+
+  const signInWithEmail = async (email: string, password: string) => {
+    setError(null);
+    const res = await fetch('/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ email, password }),
+    });
+    const data = await res.json();
+    if (!res.ok || !data.success || !data.user) {
+      const msg = data?.error || 'Invalid email or password';
+      setError(msg);
+      throw new Error(msg);
+    }
+    setPasswordUser({
+      uid: data.user.uid,
+      email: data.user.email,
+      displayName: data.user.displayName || data.user.email,
+      photoURL: null,
+      provider: 'password',
+    });
+    setAuthModalOpen(false);
+  };
 
   // Sign In with Google Popup
   const signInWithGoogle = async () => {
     setError(null);
     try {
       await signInWithPopup(auth, googleProvider);
+      setAuthModalOpen(false);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : 'Sign-in failed';
       console.error('Google Sign-In Error:', err);
@@ -135,20 +239,36 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
     }
   };
 
-  // Sign Out
+  // Sign Out (both password session & Firebase auth)
   const signOutUser = async () => {
+    setError(null);
+    try {
+      await fetch('/api/auth/logout', { method: 'POST', credentials: 'include' });
+    } catch {}
+    setPasswordUser(null);
     try {
       await signOut(auth);
     } catch (err) {
-      console.error('Sign-out error:', err);
+      console.error('Firebase sign-out error:', err);
     }
+  };
+
+  const openAuthModal = (mode: 'login' | 'signup' = 'login') => {
+    setError(null);
+    setAuthModalMode(mode);
+    setAuthModalOpen(true);
+  };
+
+  const closeAuthModal = () => {
+    setError(null);
+    setAuthModalOpen(false);
   };
 
   // Save Chat Session to Firestore
   const saveChatToFirestore = async (session: SavedChatSession) => {
-    if (!user) return;
+    if (!firebaseUser) return;
     try {
-      const chatDocRef = doc(db, 'users', user.uid, 'chats', session.id);
+      const chatDocRef = doc(db, 'users', firebaseUser.uid, 'chats', session.id);
       await setDoc(
         chatDocRef,
         {
@@ -169,10 +289,10 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
 
   // Save Strategy to Firestore
   const saveStrategyToFirestore = async (strategyData: Record<string, unknown>) => {
-    if (!user) return;
+    if (!firebaseUser) return;
     try {
       const strategyId = (strategyData.id as string) || 'default-strategy';
-      const stratDocRef = doc(db, 'users', user.uid, 'strategies', strategyId);
+      const stratDocRef = doc(db, 'users', firebaseUser.uid, 'strategies', strategyId);
       await setDoc(
         stratDocRef,
         {
@@ -190,9 +310,16 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
     <AuthContext.Provider
       value={{
         user,
+        firebaseUser,
         loading,
+        signUpWithEmail,
+        signInWithEmail,
         signInWithGoogle,
         signOutUser,
+        authModalOpen,
+        authModalMode,
+        openAuthModal,
+        closeAuthModal,
         saveChatToFirestore,
         savedChats,
         saveStrategyToFirestore,

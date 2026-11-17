@@ -1,0 +1,11 @@
+[
+  {
+    "uid": "usr_b0b63eb4eadec2bedc81d2af",
+    "email": "verify-1794841889507@example.com",
+    "displayName": "Verifier",
+    "passwordHash": "scrypt$dcc7b2f13995469bf92d0b75683d4ed3$393da42a8f2a9e4298091d68f1b43759ff028ce9c1bb579f724021301e278eb3227c4d209991e7e7e66c32b928d07966d56b7704b6649891478c638a4a7e08a4",
+    "createdAt": "2026-11-16T15:11:29.525Z",
+    "updatedAt": "2026-11-16T15:11:29.715Z",
+    "lastLoginAt": "2026-11-16T15:11:29.715Z"
+  }
+]

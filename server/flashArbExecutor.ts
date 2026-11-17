@@ -245,6 +245,80 @@ export function getEffectiveChainDexRouters(
   return out;
 }
 
+export interface ParsedSimulatorDexSelection {
+  dex: string;
+  feePercent: number;
+  explicitFee: boolean;
+}
+
+/**
+ * Maps Simulator UI DEX dropdown labels (e.g. "Uniswap V3 (0.05% Tick)",
+ * "Uniswap V2 (CPMM)", "PancakeSwap V3") to canonical chain router keys and fee %.
+ */
+export function parseSimulatorDexSelection(label: string): ParsedSimulatorDexSelection {
+  const raw = String(label || '').trim();
+  const lower = raw.toLowerCase();
+  const feeMatch = raw.match(/\((\d+(?:\.\d+)?)%\s*(?:tick)?\)/i);
+  const parsedFee = feeMatch ? Number(feeMatch[1]) : NaN;
+
+  if (lower.startsWith('uniswap v3')) {
+    return {
+      dex: 'Uniswap V3',
+      feePercent: Number.isFinite(parsedFee) && parsedFee > 0 ? parsedFee : 0.05,
+      explicitFee: Number.isFinite(parsedFee) && parsedFee > 0,
+    };
+  }
+  if (lower.startsWith('pancakeswap v3')) {
+    return {
+      dex: 'PancakeSwap V3',
+      feePercent: Number.isFinite(parsedFee) && parsedFee > 0 ? parsedFee : 0.05,
+      explicitFee: Number.isFinite(parsedFee) && parsedFee > 0,
+    };
+  }
+  if (lower.startsWith('sushiswap v3')) {
+    return {
+      dex: 'SushiSwap V3',
+      feePercent: Number.isFinite(parsedFee) && parsedFee > 0 ? parsedFee : 0.05,
+      explicitFee: Number.isFinite(parsedFee) && parsedFee > 0,
+    };
+  }
+  if (lower.startsWith('sushiswap v2')) {
+    return { dex: 'Sushiswap V2', feePercent: 0.30, explicitFee: true };
+  }
+  if (lower.startsWith('uniswap v2')) {
+    return { dex: 'Uniswap V2', feePercent: 0.30, explicitFee: true };
+  }
+  if (lower.startsWith('baseswap v2')) {
+    return { dex: 'BaseSwap V2', feePercent: 0.25, explicitFee: true };
+  }
+  if (lower.startsWith('camelot v3')) {
+    return { dex: 'Camelot V3', feePercent: 0.08, explicitFee: false };
+  }
+  if (lower.startsWith('camelot v2')) {
+    return { dex: 'Camelot V2', feePercent: 0.30, explicitFee: true };
+  }
+  if (lower.startsWith('aerodrome slipstream')) {
+    return { dex: 'Aerodrome Slipstream', feePercent: 0.05, explicitFee: false };
+  }
+  if (lower.startsWith('velodrome slipstream')) {
+    return { dex: 'Velodrome Slipstream', feePercent: 0.05, explicitFee: false };
+  }
+  if (lower.startsWith('curve')) {
+    return { dex: 'Curve Finance', feePercent: 0.04, explicitFee: true };
+  }
+  if (lower.startsWith('balancer')) {
+    return { dex: 'Balancer V2', feePercent: 0.08, explicitFee: true };
+  }
+  if (lower.startsWith('trader joe')) {
+    return { dex: 'Trader Joe V2.1', feePercent: 0.08, explicitFee: true };
+  }
+  return {
+    dex: raw || 'Uniswap V3',
+    feePercent: Number.isFinite(parsedFee) && parsedFee > 0 ? parsedFee : 0.05,
+    explicitFee: Number.isFinite(parsedFee) && parsedFee > 0,
+  };
+}
+
 export const V3_QUOTER_V2_ADDRESSES: Record<SupportedArbChain, Partial<Record<string, string>>> = {
   arbitrum: {
     'Uniswap V3': '0x61fFE014bA17989E743c5F6cB21bF9697530B21e',

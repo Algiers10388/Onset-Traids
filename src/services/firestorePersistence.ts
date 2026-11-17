@@ -199,6 +199,8 @@ export async function persistFlashArbSettings(
     arbitrumContract?: string;
     baseContract?: string;
     optimismContract?: string;
+    autoSweepUsdtEnabled?: boolean;
+    usdtSweepThreshold?: number;
   }
 ): Promise<void> {
   if (!userId) return;
@@ -233,6 +235,8 @@ export async function loadFlashArbSettings(
   arbitrumContract?: string;
   baseContract?: string;
   optimismContract?: string;
+  autoSweepUsdtEnabled?: boolean;
+  usdtSweepThreshold?: number;
 } | null> {
   if (!userId) return null;
   const path = `users/${userId}/bot_security_settings/flash_arb`;

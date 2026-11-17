@@ -40,14 +40,13 @@ import { FlashArbBotDashboard } from './components/FlashArbBotDashboard';
 import { CorrelationMatrixView } from './components/CorrelationMatrixView';
 import { AiTroubleshooterModal } from './components/AiTroubleshooterModal';
 import { OnChainWalletMonitor } from './components/OnChainWalletMonitor';
-import { OkxWalletModal } from './components/OkxWalletModal';
 import { CakeWalletConnectModal } from './components/CakeWalletConnectModal';
+import { AuthModal } from './components/AuthModal';
 import { SentimentAnalysisPanel } from './components/SentimentAnalysisPanel';
 import {
   fetchLiveSentimentReport,
   triggerAiSentimentAnalysis,
 } from './services/sentimentApi';
-import { getCachedOkxAddress } from './services/okxWallet';
 import {
   computeIndicators,
   formatCurrency,
@@ -141,7 +140,7 @@ export default function App() {
 }
 
 function AppInner({ initialAssets, initialCandles }: { initialAssets: CryptoAsset[]; initialCandles: Record<string, Candle[]> }) {
-  const { user } = useAuth();
+  const { user, firebaseUser } = useAuth();
   const [assets, setAssets] = useState<CryptoAsset[]>(initialAssets);
   const [selectedSymbol, setSelectedSymbol] = useState<string>('BTC/USDT');
   const [exchanges, setExchanges] = useState<ExchangeConfig[]>(DEFAULT_EXCHANGES);
@@ -230,28 +229,12 @@ function AppInner({ initialAssets, initialCandles }: { initialAssets: CryptoAsse
   const [fiatModalOpen, setFiatModalOpen] = useState<boolean>(false);
   const [fiatModalInitialTab, setFiatModalInitialTab] = useState<TabType>('FUND_BOT');
 
-  // OKX Web3 Wallet & Exchange Integration State
-  const [okxWalletModalOpen, setOkxWalletModalOpen] = useState<boolean>(false);
   const [cakeWalletModalOpen, setCakeWalletModalOpen] = useState<boolean>(false);
-  const [okxConnectedAddress, setOkxConnectedAddress] = useState<string | null>(getCachedOkxAddress());
   const [targetMonitorWallet, setTargetMonitorWallet] = useState<{ address: string; network: string } | null>(null);
 
   const handleSelectAddressForMonitor = (address: string, network?: string) => {
     setActiveTab('WALLET_MONITOR');
     setTargetMonitorWallet({ address, network: network || 'ethereum' });
-    setOkxConnectedAddress(address);
-  };
-
-  const handleDepositFromOkx = (amount: number, symbol: string) => {
-    setPortfolio((prev) => ({
-      ...prev,
-      cash: prev.cash + amount,
-      startingBalance: prev.startingBalance + amount,
-    }));
-    setBotLogs((prev) => [
-      `[${new Date().toLocaleTimeString()}] OKX WEB3 DEPOSIT: Credited $${amount.toFixed(2)} ${symbol} from OKX self-custody wallet into algorithmic trading desk.`,
-      ...prev,
-    ]);
   };
 
   const handleOpenFiatModal = (tab: TabType = 'FUND_BOT') => {
@@ -321,10 +304,10 @@ function AppInner({ initialAssets, initialCandles }: { initialAssets: CryptoAsse
     ]);
   };
 
-  // Synchronize Live Portfolio Snapshot from Cloud Firestore upon User Authentication
+  // Synchronize Live Portfolio Snapshot from Cloud Firestore upon Firebase Authentication
   useEffect(() => {
-    if (!user?.uid) return;
-    loadPortfolioFromFirestore(user.uid)
+    if (!firebaseUser?.uid) return;
+    loadPortfolioFromFirestore(firebaseUser.uid)
       .then((saved) => {
         if (saved) {
           setPortfolio((prev) => ({
@@ -339,7 +322,7 @@ function AppInner({ initialAssets, initialCandles }: { initialAssets: CryptoAsse
             peakEquity: typeof saved.peakEquity === 'number' ? saved.peakEquity : prev.peakEquity,
           }));
           setBotLogs((prev) => [
-            `[${new Date().toLocaleTimeString()}] ☁️ FIRESTORE REAL-TIME SYNC: Authenticated portfolio loaded from Google Cloud Firestore for ${user.email || user.uid}.`,
+            `[${new Date().toLocaleTimeString()}] ☁️ FIRESTORE REAL-TIME SYNC: Authenticated portfolio loaded from Google Cloud Firestore for ${firebaseUser.email || firebaseUser.uid}.`,
             ...prev,
           ]);
         }
@@ -347,29 +330,29 @@ function AppInner({ initialAssets, initialCandles }: { initialAssets: CryptoAsse
       .catch((err) => {
         console.warn('Could not load portfolio from Firestore:', err);
       });
-  }, [user?.uid]);
+  }, [firebaseUser?.uid]);
 
   // Persist Live Portfolio state to Cloud Firestore whenever balance, trades, or positions update
   useEffect(() => {
-    if (!user?.uid) return;
+    if (!firebaseUser?.uid) return;
     const timeout = setTimeout(() => {
-      persistPortfolioToFirestore(user.uid, portfolio, positions, orders).catch((err) => {
+      persistPortfolioToFirestore(firebaseUser.uid, portfolio, positions, orders).catch((err) => {
         console.warn('Could not persist live portfolio snapshot to Firestore:', err);
       });
     }, 1500);
     return () => clearTimeout(timeout);
-  }, [user?.uid, portfolio.cash, portfolio.realizedPnl, portfolio.totalTrades, positions.length, orders.length]);
+  }, [firebaseUser?.uid, portfolio.cash, portfolio.realizedPnl, portfolio.totalTrades, positions.length, orders.length]);
 
   // Persist Active Strategy parameters to Cloud Firestore when modified
   useEffect(() => {
-    if (!user?.uid) return;
+    if (!firebaseUser?.uid) return;
     const timeout = setTimeout(() => {
-      persistStrategyToFirestore(user.uid, strategy).catch((err) => {
+      persistStrategyToFirestore(firebaseUser.uid, strategy).catch((err) => {
         console.warn('Could not persist strategy to Firestore:', err);
       });
     }, 2000);
     return () => clearTimeout(timeout);
-  }, [user?.uid, strategy]);
+  }, [firebaseUser?.uid, strategy]);
 
   // Fetch Exchange Credentials Status
   const fetchCredentialsStatus = async () => {
@@ -688,8 +671,8 @@ function AppInner({ initialAssets, initialCandles }: { initialAssets: CryptoAsse
     }));
     setPositions((pos) => [...pos, newPos]);
     setOrders((ords) => [order, ...ords]);
-    if (user?.uid) {
-      persistExecutionLog(user.uid, {
+    if (firebaseUser?.uid) {
+      persistExecutionLog(firebaseUser.uid, {
         id: order.id,
         timestamp: order.timestamp,
         symbol: order.symbol,
@@ -1118,8 +1101,8 @@ function AppInner({ initialAssets, initialCandles }: { initialAssets: CryptoAsse
             return;
           }
           setOrders((ords) => [manualSellOrder, ...ords]);
-          if (user?.uid) {
-            persistExecutionLog(user.uid, {
+          if (firebaseUser?.uid) {
+            persistExecutionLog(firebaseUser.uid, {
               id: manualSellOrder.id,
               timestamp: manualSellOrder.timestamp,
               symbol: manualSellOrder.symbol,
@@ -1247,8 +1230,8 @@ function AppInner({ initialAssets, initialCandles }: { initialAssets: CryptoAsse
       });
       setOrders((prev) => [sellLegOrder, buyLegOrder, ...prev]);
 
-      if (user?.uid) {
-        persistExecutionLog(user.uid, {
+      if (firebaseUser?.uid) {
+        persistExecutionLog(firebaseUser.uid, {
           id: buyLegOrder.id,
           timestamp: buyLegOrder.timestamp,
           symbol: buyLegOrder.symbol,
@@ -1257,7 +1240,7 @@ function AppInner({ initialAssets, initialCandles }: { initialAssets: CryptoAsse
           status: 'COMPLETED',
           route: opp.buyExchangeName,
         }).catch(() => {});
-        persistExecutionLog(user.uid, {
+        persistExecutionLog(firebaseUser.uid, {
           id: sellLegOrder.id,
           timestamp: sellLegOrder.timestamp,
           symbol: sellLegOrder.symbol,
@@ -1316,7 +1299,7 @@ function AppInner({ initialAssets, initialCandles }: { initialAssets: CryptoAsse
       const winningTrades = prev.winningTrades + 1;
       const peakEquity = Math.max(prev.peakEquity, newCash);
 
-      if (user?.uid) {
+      if (firebaseUser?.uid) {
         const updatedPortfolio: PortfolioState = {
           ...prev,
           cash: newCash,
@@ -1325,7 +1308,7 @@ function AppInner({ initialAssets, initialCandles }: { initialAssets: CryptoAsse
           winningTrades,
           peakEquity,
         };
-        persistPortfolioToFirestore(user.uid, updatedPortfolio, positions, orders).catch(() => {});
+        persistPortfolioToFirestore(firebaseUser.uid, updatedPortfolio, positions, orders).catch(() => {});
       }
 
       return {
@@ -1451,8 +1434,8 @@ function AppInner({ initialAssets, initialCandles }: { initialAssets: CryptoAsse
         setOrders((prev) => [closeOrder, ...prev]);
         setPositions((cur) => cur.filter((p) => p.id !== positionId));
 
-        if (user?.uid) {
-          persistExecutionLog(user.uid, {
+        if (firebaseUser?.uid) {
+          persistExecutionLog(firebaseUser.uid, {
             id: closeOrder.id,
             timestamp: closeOrder.timestamp,
             symbol: closeOrder.symbol,
@@ -1868,8 +1851,6 @@ function AppInner({ initialAssets, initialCandles }: { initialAssets: CryptoAsse
         onSelectTab={setActiveTab}
         onChainSignalsCount={onChainSignalsCount}
         sentimentScore={sentimentReport?.compositeScore}
-        onOpenOkxWallet={() => setOkxWalletModalOpen(true)}
-        okxConnectedAddress={okxConnectedAddress}
         onOpenCakeWallet={() => setCakeWalletModalOpen(true)}
       />
 
@@ -1913,8 +1894,6 @@ function AppInner({ initialAssets, initialCandles }: { initialAssets: CryptoAsse
               setAiTroubleshooterOpen(true);
             }}
             availableAssets={assets}
-            okxConnectedAddress={okxConnectedAddress}
-            onOpenOkxWallet={() => setOkxWalletModalOpen(true)}
             onOpenCakeWallet={() => setCakeWalletModalOpen(true)}
             onArbitrageExecuted={handleFlashArbExecuted}
           />
@@ -1922,7 +1901,6 @@ function AppInner({ initialAssets, initialCandles }: { initialAssets: CryptoAsse
       ) : activeTab === 'WALLET_MONITOR' ? (
         <main className="flex-1 max-w-7xl w-full mx-auto p-4">
           <OnChainWalletMonitor
-            onOpenOkxWallet={() => setOkxWalletModalOpen(true)}
             targetAddress={targetMonitorWallet}
           />
         </main>
@@ -2084,7 +2062,6 @@ function AppInner({ initialAssets, initialCandles }: { initialAssets: CryptoAsse
         tradingMode={tradingMode}
         credentialsSummary={credentialsSummary}
         onRefreshCredentials={fetchCredentialsStatus}
-        onOpenOkxWallet={() => setOkxWalletModalOpen(true)}
       />
 
 
@@ -2126,13 +2103,8 @@ function AppInner({ initialAssets, initialCandles }: { initialAssets: CryptoAsse
         }}
       />
 
-      {/* OKX Web3 Wallet & Multi-Chain Vault Modal */}
-      <OkxWalletModal
-        isOpen={okxWalletModalOpen}
-        onClose={() => setOkxWalletModalOpen(false)}
-        onSelectAddressForMonitor={handleSelectAddressForMonitor}
-        onDepositToDesk={handleDepositFromOkx}
-      />
+      {/* Email / Password Authentication Modal */}
+      <AuthModal />
 
       {/* Cake Wallet (WalletConnect v2) Modal */}
       <CakeWalletConnectModal

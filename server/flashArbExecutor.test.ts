@@ -13,6 +13,8 @@ import {
   getChainTokens,
   getChainDexRouters,
   getEffectiveChainDexRouters,
+  parseSimulatorDexSelection,
+  decodeArbitrageSwapsExecutedLogs,
   FLASH_ARB_OPTIMIZED_ABI,
   resolveArbitrageCandidates,
   buildScaledArbitrageCandidates,
@@ -33,6 +35,14 @@ import {
   computeTradeGasAndFinancingExtra,
   computeGasSurplusAllocation,
 } from './flashArbExecutor.ts';
+import {
+  DEFAULT_USDT_SWEEP_THRESHOLD,
+  DEFAULT_USDT_AUTO_SWEEP_COOLDOWN_MS,
+  parseUsdtSweepThreshold,
+  normalizeTokenSymbolFilter,
+  filterSweepTokensBySymbols,
+  evaluateContractUsdtSweep,
+} from '../src/utils/usdtAutoSweep.ts';
 
 const RECIPIENT = '0x65602EB9e09B07002872E074004400d37e27CCB9';
 
@@ -715,6 +725,286 @@ test('compiled FlashArbOptimized and CamelotV3SwapAdapter artifacts exist with e
   assert.ok(adapterArtifact.abi.some((entry: { name?: string }) => entry.name === 'exactInputSingle'));
   assert.ok(adapterArtifact.abi.some((entry: { name?: string }) => entry.name === 'camelotRouter'));
 });
+
+test('parseUsdtSweepThreshold validates finite non-negative numbers and falls back safely', () => {
+  assert.equal(parseUsdtSweepThreshold('5'), 5);
+  assert.equal(parseUsdtSweepThreshold('0'), 0);
+  assert.equal(parseUsdtSweepThreshold('12.3456789'), 12.345679);
+  assert.equal(parseUsdtSweepThreshold('-10'), DEFAULT_USDT_SWEEP_THRESHOLD);
+  assert.equal(parseUsdtSweepThreshold('not-a-number', 3), 3);
+  assert.equal(parseUsdtSweepThreshold('', 7), 7);
+});
+
+test('normalizeTokenSymbolFilter & filterSweepTokensBySymbols scope sweep assets cleanly', () => {
+  const tokens = [
+    { symbol: 'USDC', rawBalance: 100n },
+    { symbol: 'USDT', rawBalance: 25n },
+    { symbol: 'WETH', rawBalance: 1n },
+  ];
+
+  assert.equal(normalizeTokenSymbolFilter(undefined), null);
+  assert.equal(normalizeTokenSymbolFilter([]), null);
+  assert.deepEqual(filterSweepTokensBySymbols(tokens, null), tokens);
+
+  const usdtOnly = normalizeTokenSymbolFilter(['usdt']);
+  assert.ok(usdtOnly);
+  assert.deepEqual(filterSweepTokensBySymbols(tokens, usdtOnly), [
+    { symbol: 'USDT', rawBalance: 25n },
+  ]);
+});
+
+test('evaluateContractUsdtSweep enforces threshold, signer access, wallet validity, busy lock, and cooldown', () => {
+  const contractA = '0xeee31ff9e69904b43c124095b6f33aa61505bcc2';
+  const contractB = '0x37440674a814f24d9C6ea0990b272215D40c4512';
+
+  // 1. Equal to threshold (not strictly greater) -> BELOW_THRESHOLD
+  const atThreshold = evaluateContractUsdtSweep({
+    contracts: [
+      {
+        address: contractA,
+        isDeployed: true,
+        ownerMatchesSigner: true,
+        supportsRescueTokens: true,
+        nonZeroTokens: [{ symbol: 'USDT', balance: '5.0', sweepCompatible: true }],
+      },
+    ],
+    thresholdUsdt: 5,
+    enabled: true,
+    isSignerKeyConfigured: true,
+    profitWalletAddress: RECIPIENT,
+    isBusy: false,
+  });
+  assert.equal(atThreshold.shouldTrigger, false);
+  assert.equal(atThreshold.exceedsThreshold, false);
+  assert.equal(atThreshold.reason, 'BELOW_THRESHOLD');
+
+  // 2. Strictly above threshold -> READY and scopes triggerContracts to contracts holding USDT
+  const ready = evaluateContractUsdtSweep({
+    contracts: [
+      {
+        address: contractA,
+        isDeployed: true,
+        ownerMatchesSigner: true,
+        supportsRescueTokens: true,
+        nonZeroTokens: [{ symbol: 'USDC', balance: '100', sweepCompatible: true }],
+      },
+      {
+        address: contractB,
+        isDeployed: true,
+        ownerMatchesSigner: true,
+        supportsRescueTokensTo: true,
+        nonZeroTokens: [{ symbol: 'USDT', balance: '5.25', sweepCompatible: true }],
+      },
+    ],
+    thresholdUsdt: 5,
+    enabled: true,
+    isSignerKeyConfigured: true,
+    profitWalletAddress: RECIPIENT,
+    isBusy: false,
+  });
+  assert.equal(ready.shouldTrigger, true);
+  assert.equal(ready.exceedsThreshold, true);
+  assert.equal(ready.reason, 'READY');
+  assert.equal(ready.sweepableContractUsdt, 5.25);
+  assert.deepEqual(ready.triggerContracts, [contractB]);
+
+  // 3. Disabled toggle blocks trigger while reporting exceedsThreshold
+  const disabled = evaluateContractUsdtSweep({
+    contracts: [
+      {
+        address: contractB,
+        isDeployed: true,
+        ownerMatchesSigner: true,
+        supportsRescueTokensTo: true,
+        nonZeroTokens: [{ symbol: 'USDT', balance: '15', sweepCompatible: true }],
+      },
+    ],
+    thresholdUsdt: 5,
+    enabled: false,
+    isSignerKeyConfigured: true,
+    profitWalletAddress: RECIPIENT,
+    isBusy: false,
+  });
+  assert.equal(disabled.shouldTrigger, false);
+  assert.equal(disabled.exceedsThreshold, true);
+  assert.equal(disabled.reason, 'DISABLED');
+
+  // 4. Missing server signer key blocks automatic sweep
+  const noSigner = evaluateContractUsdtSweep({
+    contracts: [
+      {
+        address: contractB,
+        isDeployed: true,
+        ownerMatchesSigner: true,
+        supportsRescueTokensTo: true,
+        nonZeroTokens: [{ symbol: 'USDT', balance: '15', sweepCompatible: true }],
+      },
+    ],
+    thresholdUsdt: 5,
+    enabled: true,
+    isSignerKeyConfigured: false,
+    profitWalletAddress: RECIPIENT,
+    isBusy: false,
+  });
+  assert.equal(noSigner.shouldTrigger, false);
+  assert.equal(noSigner.exceedsThreshold, true);
+  assert.equal(noSigner.reason, 'SIGNER_NOT_CONFIGURED');
+
+  // 5. Non-signer owner contract blocks automatic sweep cleanly
+  const ownerMismatch = evaluateContractUsdtSweep({
+    contracts: [
+      {
+        address: contractA,
+        isDeployed: true,
+        ownerMatchesSigner: false,
+        supportsRescueTokens: true,
+        nonZeroTokens: [{ symbol: 'USDT', balance: '15', sweepCompatible: true }],
+      },
+    ],
+    thresholdUsdt: 5,
+    enabled: true,
+    isSignerKeyConfigured: true,
+    profitWalletAddress: RECIPIENT,
+    isBusy: false,
+  });
+  assert.equal(ownerMismatch.shouldTrigger, false);
+  assert.equal(ownerMismatch.reason, 'NO_ACCESSIBLE_CONTRACT');
+  assert.deepEqual(ownerMismatch.blockedContracts, [contractA]);
+
+  // 6. Cooldown blocks rapid re-trigger until cooldown window elapses
+  const now = 1_700_000_000_000;
+  const coolingDown = evaluateContractUsdtSweep({
+    contracts: [
+      {
+        address: contractB,
+        isDeployed: true,
+        ownerMatchesSigner: true,
+        supportsRescueTokensTo: true,
+        nonZeroTokens: [{ symbol: 'USDT', balance: '10', sweepCompatible: true }],
+      },
+    ],
+    thresholdUsdt: 5,
+    enabled: true,
+    isSignerKeyConfigured: true,
+    profitWalletAddress: RECIPIENT,
+    isBusy: false,
+    lastAttemptAtMs: now - 5_000,
+    nowMs: now,
+  });
+  assert.equal(coolingDown.shouldTrigger, false);
+  assert.equal(coolingDown.reason, 'COOLDOWN_ACTIVE');
+
+  const afterCooldown = evaluateContractUsdtSweep({
+    contracts: [
+      {
+        address: contractB,
+        isDeployed: true,
+        ownerMatchesSigner: true,
+        supportsRescueTokensTo: true,
+        nonZeroTokens: [{ symbol: 'USDT', balance: '10', sweepCompatible: true }],
+      },
+    ],
+    thresholdUsdt: 5,
+    enabled: true,
+    isSignerKeyConfigured: true,
+    profitWalletAddress: RECIPIENT,
+    isBusy: false,
+    lastAttemptAtMs: now - DEFAULT_USDT_AUTO_SWEEP_COOLDOWN_MS - 1,
+    nowMs: now,
+  });
+  assert.equal(afterCooldown.shouldTrigger, true);
+  assert.equal(afterCooldown.reason, 'READY');
+});
+
+test('parseSimulatorDexSelection maps Simulator UI DEX labels to canonical router keys and fee tiers', () => {
+  assert.deepEqual(parseSimulatorDexSelection('Uniswap V3 (0.01% Tick)'), {
+    dex: 'Uniswap V3',
+    feePercent: 0.01,
+    explicitFee: true,
+  });
+  assert.deepEqual(parseSimulatorDexSelection('Uniswap V3 (0.05% Tick)'), {
+    dex: 'Uniswap V3',
+    feePercent: 0.05,
+    explicitFee: true,
+  });
+  assert.deepEqual(parseSimulatorDexSelection('Uniswap V3 (0.30% Tick)'), {
+    dex: 'Uniswap V3',
+    feePercent: 0.3,
+    explicitFee: true,
+  });
+  assert.deepEqual(parseSimulatorDexSelection('PancakeSwap V3'), {
+    dex: 'PancakeSwap V3',
+    feePercent: 0.05,
+    explicitFee: false,
+  });
+  assert.deepEqual(parseSimulatorDexSelection('Uniswap V2 (CPMM)'), {
+    dex: 'Uniswap V2',
+    feePercent: 0.3,
+    explicitFee: true,
+  });
+  assert.deepEqual(parseSimulatorDexSelection('Camelot V3 (Algebra Engine)'), {
+    dex: 'Camelot V3',
+    feePercent: 0.08,
+    explicitFee: false,
+  });
+  assert.deepEqual(parseSimulatorDexSelection('Aerodrome Slipstream (CL)'), {
+    dex: 'Aerodrome Slipstream',
+    feePercent: 0.05,
+    explicitFee: false,
+  });
+});
+
+test('Simulator route encoding builds real executeOptimizedArbitrage + MaxUint256 probe calldata (never 0x7804d9ac)', () => {
+  const buy = parseSimulatorDexSelection('Uniswap V3 (0.05% Tick)');
+  const sell = parseSimulatorDexSelection('PancakeSwap V3');
+  const candidates = buildScaledArbitrageCandidates(
+    {
+      chain: 'arbitrum',
+      baseToken: ARBITRUM_TOKENS.WETH,
+      quoteToken: ARBITRUM_TOKENS.USDC,
+      buyDex: buy.dex,
+      buyFeePercent: buy.feePercent,
+      sellDex: sell.dex,
+      sellFeePercent: sell.feePercent,
+      optimalLoanBaseUnits: 25,
+      buyPriceQuotePerBase: 2500,
+      buyPriceUsd: 2500,
+      estNetProfitUsd: 0.1,
+    },
+    RECIPIENT,
+    undefined,
+    [1, 0.5]
+  );
+
+  assert.equal(candidates.length, 4);
+  for (const cand of candidates) {
+    assert.ok(cand.calldata.startsWith('0x23b3aa6b')); // executeOptimizedArbitrage
+    assert.ok(!cand.calldata.startsWith('0x7804d9ac')); // never ETH sweep stub
+    const probeCalldata = buildMaxProfitProbeCalldata(cand);
+    assert.ok(probeCalldata.startsWith('0x23b3aa6b'));
+  }
+
+  // decodeArbitrageSwapsExecutedLogs returns null when only ArbitrageBroadcast (ETH sweep) is emitted
+  const iface = new ethers.Interface(FLASH_ARB_OPTIMIZED_ABI);
+  const sweepOnlyEvent = iface.encodeEventLog('ArbitrageBroadcast', [
+    '0xF1d765d693f9e6fAb0c4a2FCa942d9D54233C966',
+    RECIPIENT,
+    0n,
+  ]);
+  const decoded = decodeArbitrageSwapsExecutedLogs(
+    [
+      {
+        address: '0xeee31ff9e69904b43c124095b6f33aa61505bcc2',
+        topics: sweepOnlyEvent.topics as string[],
+        data: sweepOnlyEvent.data,
+      },
+    ],
+    '0xeee31ff9e69904b43c124095b6f33aa61505bcc2'
+  );
+  assert.equal(decoded, null);
+});
+
+
 
 
 

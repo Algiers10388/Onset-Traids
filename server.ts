@@ -12,6 +12,7 @@ import { aiRouter } from "./server/aiRoutes.ts";
 import { walletRouter } from "./server/walletRoutes.ts";
 import { flashArbRouter } from "./server/flashArbRoutes.ts";
 import { sentimentRouter } from "./server/sentimentRoutes.ts";
+import { createAuthRouter } from "./server/authRoutes.ts";
 import { requireAuth, type AuthRequest } from "./src/middleware/auth.ts";
 import { getOrCreateUser } from "./src/db/users.ts";
 import {
@@ -92,6 +93,9 @@ async function startServer() {
 
   // AI Sentiment Analysis & Social Media News Gateway
   app.use('/api/sentiment', sentimentRouter);
+
+  // User Authentication (Email + Hashed Password Signup, Login, Logout & Session Check)
+  app.use('/api/auth', createAuthRouter());
 
   // Health check
   app.get("/api/health", (_req, res) => {
