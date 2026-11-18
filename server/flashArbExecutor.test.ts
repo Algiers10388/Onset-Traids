@@ -31,9 +31,16 @@ import {
   encodeErc721SafeTransferFrom,
   encodeErc1155SafeTransferFrom,
   classifyDetectedErcStandard,
+  ALL_SUPPORTED_ARB_CHAINS,
+  CHAIN_LAYER_META,
+  isSupportedArbChain,
+  verifyChainRouteTypesReadiness,
   DEFAULT_MIN_GAS_RESERVE_WEI,
   computeTradeGasAndFinancingExtra,
   computeGasSurplusAllocation,
+  KNOWN_FLASH_ARB_CONTRACTS,
+  normalizeValidContractAddress,
+  resolveAndValidateSweepContracts,
 } from './flashArbExecutor.ts';
 import {
   DEFAULT_USDT_SWEEP_THRESHOLD,
@@ -286,8 +293,9 @@ test('classifyDetectedErcStandard distinguishes ERC-1155, ERC-721, ERC-4626, ERC
   assert.equal(cUnknown.walletSweepCompatible, false);
 });
 
-test('CHAIN_DEX_ROUTERS and getChainDexRouters expose verified routers on Arbitrum, Base, and Optimism', () => {
-  assert.equal(Object.keys(CHAIN_DEX_ROUTERS).length, 3);
+test('CHAIN_DEX_ROUTERS and getChainDexRouters expose verified routers across all 10 L1/L2/L3 chains', () => {
+  assert.equal(Object.keys(CHAIN_DEX_ROUTERS).length, 10);
+  assert.equal(ALL_SUPPORTED_ARB_CHAINS.length, 10);
 
   const baseRouters = getChainDexRouters('base');
   assert.equal(baseRouters['Uniswap V3'].router?.toLowerCase(), '0x2626664c2603336e57b271c5c0b26f421741e481');
@@ -1003,6 +1011,162 @@ test('Simulator route encoding builds real executeOptimizedArbitrage + MaxUint25
   );
   assert.equal(decoded, null);
 });
+
+test('CHAIN_LAYER_META, BSC 18-decimal tokens, and L1/L2/L3 DEX routers resolve accurately', () => {
+  for (const chain of ALL_SUPPORTED_ARB_CHAINS) {
+    assert.equal(isSupportedArbChain(chain), true);
+    assert.ok(['L1', 'L2', 'L3'].includes(CHAIN_LAYER_META[chain].layer));
+    assert.ok(CHAIN_LAYER_META[chain].chainId > 0);
+    const tokens = getChainTokens(chain);
+    assert.ok(tokens.length >= 3, `${chain} should have verified tokens`);
+    for (const tok of tokens) {
+      assert.equal(ethers.isAddress(tok.addr), true);
+    }
+  }
+
+  // BSC bridged USDT & USDC are 18 decimals (not 6)
+  assert.equal(CHAIN_TOKENS.bsc.USDT.dec, 18);
+  assert.equal(CHAIN_TOKENS.bsc.USDC.dec, 18);
+  assert.equal(CHAIN_TOKENS.ethereum.USDC.dec, 6);
+  assert.equal(CHAIN_TOKENS.polygon.USDT.dec, 6);
+
+  // Verify V2 + V3 calldata generation on Ethereum L1 (Type 1: UniV3 -> UniV2)
+  const ethCands = resolveArbitrageCandidates(
+    {
+      chain: 'ethereum',
+      baseToken: CHAIN_TOKENS.ethereum.WETH,
+      quoteToken: CHAIN_TOKENS.ethereum.USDC,
+      buyDex: 'Uniswap V3',
+      buyFeePercent: 0.05,
+      sellDex: 'Uniswap V2',
+      sellFeePercent: 0.30,
+      optimalLoanBaseUnits: 5,
+      buyPriceQuotePerBase: 2800,
+      buyPriceUsd: 2800,
+      estNetProfitUsd: 25,
+    },
+    RECIPIENT
+  );
+  assert.equal(ethCands.length, 2);
+  assert.equal(ethCands[0].routeType, 2); // borrow WETH: sell on V2, buy on V3
+  assert.equal(ethCands[1].routeType, 1); // borrow USDC: buy on V3, sell on V2
+
+  // Verify V2 <-> V2 Type 4 on Avalanche (Trader Joe V1 <-> Pangolin V2)
+  const avaxCands = resolveArbitrageCandidates(
+    {
+      chain: 'avalanche',
+      baseToken: CHAIN_TOKENS.avalanche.WAVAX,
+      quoteToken: CHAIN_TOKENS.avalanche.USDC,
+      buyDex: 'Trader Joe V1',
+      buyFeePercent: 0.30,
+      sellDex: 'Pangolin V2',
+      sellFeePercent: 0.30,
+      optimalLoanBaseUnits: 100,
+      buyPriceQuotePerBase: 25,
+      buyPriceUsd: 25,
+      estNetProfitUsd: 10,
+    },
+    RECIPIENT
+  );
+  assert.equal(avaxCands.length, 2);
+  assert.equal(avaxCands[0].routeType, 4); // V2 -> V2
+  assert.ok(avaxCands[0].calldata.startsWith('0x23b3aa6b'));
+
+  // Verify Scroll Nuri V3 <-> SushiSwap V3 Type 3
+  const scrollCands = resolveArbitrageCandidates(
+    {
+      chain: 'scroll',
+      baseToken: CHAIN_TOKENS.scroll.WETH,
+      quoteToken: CHAIN_TOKENS.scroll.USDC,
+      buyDex: 'SushiSwap V3',
+      buyFeePercent: 0.05,
+      sellDex: 'Nuri V3',
+      sellFeePercent: 0.05,
+      optimalLoanBaseUnits: 2,
+      buyPriceQuotePerBase: 2800,
+      buyPriceUsd: 2800,
+      estNetProfitUsd: 10,
+    },
+    RECIPIENT
+  );
+  assert.equal(scrollCands.length, 2);
+  assert.equal(scrollCands[0].routeType, 3); // V3 -> V3
+});
+
+test('verifyChainRouteTypesReadiness generates routeTypes 1..4 readiness & ABI prefixes across L1/L2/L3', () => {
+  const ethReady = verifyChainRouteTypesReadiness('ethereum', undefined, RECIPIENT);
+  assert.equal(ethReady.layer, 'L1');
+  assert.equal(ethReady.routeTypes.length, 4);
+  for (const rt of ethReady.routeTypes) {
+    assert.equal(rt.available, true, `Ethereum routeType ${rt.routeType} (${rt.codeName}) should be available`);
+    assert.equal(rt.sampleSelector, '0x23b3aa6b');
+    assert.ok(rt.sampleCalldataPrefix?.startsWith('0x23b3aa6b'));
+  }
+
+  const arbReady = verifyChainRouteTypesReadiness('arbitrum', undefined, RECIPIENT);
+  assert.equal(arbReady.layer, 'L2');
+  assert.equal(arbReady.routeTypes.filter((r) => r.available).length, 4);
+
+  const apeReady = verifyChainRouteTypesReadiness('apechain', undefined, RECIPIENT);
+  assert.equal(apeReady.layer, 'L3');
+  assert.equal(apeReady.routeTypes.length, 4);
+});
+
+test('normalizeValidContractAddress and resolveAndValidateSweepContracts validate and fall back to known contracts or wallet sweep', () => {
+  const expectedArbChecksum = ethers.getAddress('0xeee31ff9e69904b43c124095b6f33aa61505bcc2');
+  assert.equal(
+    normalizeValidContractAddress('0xeee31ff9e69904b43c124095b6f33aa61505bcc2'),
+    expectedArbChecksum
+  );
+  assert.equal(normalizeValidContractAddress('0x0000000000000000000000000000000000000000'), null);
+  assert.equal(normalizeValidContractAddress('0x1234'), null);
+
+  // Empty contractAddress on Arbitrum automatically falls back to known Arbitrum contracts
+  const arbResolved = resolveAndValidateSweepContracts({
+    chain: 'arbitrum',
+    requestedContract: '',
+    deployedContract: '',
+    extraContracts: [],
+    hasWalletSweepTarget: false,
+  });
+  assert.equal(arbResolved.ok, true);
+  assert.equal(arbResolved.usedFallbackKnownContracts, true);
+  assert.equal(arbResolved.contracts.length, KNOWN_FLASH_ARB_CONTRACTS.arbitrum.length);
+  assert.equal(arbResolved.primaryContract, expectedArbChecksum);
+
+  // Empty/placeholder contractAddress on Polygon/BSC succeeds when wallet sweep (e.g. Gas Wallet surplus) is enabled
+  const polyWithWallet = resolveAndValidateSweepContracts({
+    chain: 'polygon',
+    requestedContract: '',
+    deployedContract: '',
+    hasWalletSweepTarget: true,
+  });
+  assert.equal(polyWithWallet.ok, true);
+  assert.deepEqual(polyWithWallet.contracts, []);
+  assert.equal(polyWithWallet.primaryContract, null);
+
+  // Empty contractAddress with no known contracts and no wallet sweep gives actionable guidance
+  const polyNoTarget = resolveAndValidateSweepContracts({
+    chain: 'polygon',
+    requestedContract: 'undeployed',
+    deployedContract: '',
+    hasWalletSweepTarget: false,
+  });
+  assert.equal(polyNoTarget.ok, false);
+  assert.match(polyNoTarget.error || '', /No deployed FlashArb contract registered on POLYGON/i);
+
+  // Explicit malformed contractAddress fails cleanly with validation message
+  const badExplicit = resolveAndValidateSweepContracts({
+    chain: 'arbitrum',
+    requestedContract: '0xinvalidhex',
+    deployedContract: '0xeee31ff9e69904b43c124095b6f33aa61505bcc2',
+    hasWalletSweepTarget: true,
+  });
+  assert.equal(badExplicit.ok, false);
+  assert.match(badExplicit.error || '', /Invalid contractAddress/i);
+});
+
+
 
 
 

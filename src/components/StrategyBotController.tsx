@@ -35,7 +35,7 @@ import {
 } from 'lucide-react';
 import { StrategyParameters, TechnicalIndicators, TriggerType, CryptoAsset } from '../types';
 import { STRATEGY_PRESETS } from '../data/marketData';
-import { formatPercent, formatCurrency, calculateDynamicPositionSize } from '../utils/cryptoMath';
+import { formatPercent, formatCurrency, calculateDynamicPositionSize, calculateSmartTrailingPercent } from '../utils/cryptoMath';
 
 interface StrategyBotControllerProps {
   strategy: StrategyParameters;
@@ -122,6 +122,18 @@ export const StrategyBotController: React.FC<StrategyBotControllerProps> = ({
   const projectedTakeProfitPrice = currentPrice * (1 + (effectiveTakeProfitPct / 100) / strategy.leverage);
   const projectedRiskUsd = dynamicSizing.riskAmountUsd;
   const projectedRewardUsd = projectedRiskUsd * (strategy.riskRewardRatio ?? 2.5);
+
+  // Smart Trailing (real-time ATR volatility trailing stop distance)
+  const smartTrailingMultiplier = strategy.smartTrailingAtrMultiplier ?? 1.5;
+  const smartTrailing = calculateSmartTrailingPercent({
+    atr: currentAtr,
+    currentPrice,
+    atrMultiplier: smartTrailingMultiplier,
+    leverage: strategy.leverage,
+  });
+  const effectiveTrailingStopPercent = strategy.smartTrailingEnabled
+    ? smartTrailing.trailingPercent
+    : strategy.trailingStopPercent;
 
   return (
     <div className="rounded-2xl bg-slate-900/70 border border-slate-800/80 p-4 shadow-xl backdrop-blur-sm flex flex-col gap-4">
@@ -939,25 +951,145 @@ export const StrategyBotController: React.FC<StrategyBotControllerProps> = ({
               />
             </div>
 
-            <div className="flex items-center justify-between pt-1">
-              <label className="flex items-center gap-1.5 text-slate-300 text-xs font-medium cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={strategy.trailingStopEnabled}
-                  onChange={(e) =>
-                    onUpdateStrategy({ ...strategy, trailingStopEnabled: e.target.checked })
-                  }
-                  className="rounded border-slate-700 bg-slate-950 text-cyan-500 focus:ring-0 cursor-pointer"
-                />
-                <span>Trailing Stop-Loss</span>
-              </label>
-              <span className="font-mono text-cyan-400 text-xs font-bold">
-                {strategy.trailingStopPercent}% from peak
+            <div className="space-y-2 pt-1 border-t border-slate-800/80">
+              <div className="flex items-center justify-between gap-2">
+                <label className="flex items-center gap-1.5 text-slate-300 text-xs font-medium cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={strategy.trailingStopEnabled}
+                    onChange={(e) =>
+                      onUpdateStrategy({
+                        ...strategy,
+                        trailingStopEnabled: e.target.checked,
+                        smartTrailingEnabled: e.target.checked ? strategy.smartTrailingEnabled : false,
+                      })
+                    }
+                    className="rounded border-slate-700 bg-slate-950 text-cyan-500 focus:ring-0 cursor-pointer"
+                  />
+                  <span>Trailing Stop-Loss</span>
+                </label>
+                <div className="flex items-center gap-1.5">
+                  {strategy.smartTrailingEnabled && (
+                    <span className="text-[9px] px-1.5 py-0.5 rounded bg-purple-500/20 text-purple-300 border border-purple-500/40 font-mono font-bold">
+                      ATR LIVE
+                    </span>
+                  )}
+                  <span className="font-mono text-cyan-400 text-xs font-bold">
+                    {effectiveTrailingStopPercent.toFixed(2)}% from peak
+                  </span>
+                </div>
+              </div>
+
+              {/* Smart Trailing (ATR-Dynamic) Toggle */}
+              <div className="p-2 rounded bg-slate-950/90 border border-slate-800/90 space-y-2">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-1.5">
+                    <Sparkles className={`h-3.5 w-3.5 ${strategy.smartTrailingEnabled ? 'text-purple-400' : 'text-slate-500'}`} />
+                    <span className="text-[11px] font-bold text-slate-200">Smart Trailing</span>
+                    <span className="text-[10px] text-slate-400 font-mono">(ATR Volatility)</span>
+                  </div>
+                  <button
+                    type="button"
+                    role="switch"
+                    aria-checked={Boolean(strategy.smartTrailingEnabled)}
+                    aria-label="Toggle Smart Trailing"
+                    onClick={() => {
+                      const nextEnabled = !strategy.smartTrailingEnabled;
+                      onUpdateStrategy({
+                        ...strategy,
+                        smartTrailingEnabled: nextEnabled,
+                        trailingStopEnabled: nextEnabled ? true : strategy.trailingStopEnabled,
+                        smartTrailingAtrMultiplier: smartTrailingMultiplier,
+                        trailingStopPercent: nextEnabled
+                          ? smartTrailing.trailingPercent
+                          : strategy.trailingStopPercent,
+                      });
+                    }}
+                    className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full border transition-colors cursor-pointer ${
+                      strategy.smartTrailingEnabled
+                        ? 'bg-purple-500/80 border-purple-400'
+                        : 'bg-slate-800 border-slate-700'
+                    }`}
+                  >
+                    <span
+                      className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${
+                        strategy.smartTrailingEnabled ? 'translate-x-4' : 'translate-x-0.5'
+                      }`}
+                    />
+                  </button>
+                </div>
+
+                {strategy.smartTrailingEnabled ? (
+                  <div className="space-y-1.5">
+                    <div className="flex items-center justify-between text-[10px] font-mono text-slate-400">
+                      <span>
+                        ATR {smartTrailing.atrPercent.toFixed(2)}% &times; {smartTrailingMultiplier.toFixed(1)}x ({smartTrailing.volatilityRegime})
+                      </span>
+                      <span className="text-purple-300 font-bold">
+                        {smartTrailing.spotTrailPercent.toFixed(2)}% spot
+                      </span>
+                    </div>
+                    <div className="flex gap-1">
+                      {[1.0, 1.5, 2.0, 2.5].map((mult) => {
+                        const preview = calculateSmartTrailingPercent({
+                          atr: currentAtr,
+                          currentPrice,
+                          atrMultiplier: mult,
+                          leverage: strategy.leverage,
+                        });
+                        return (
+                          <button
+                            key={mult}
+                            type="button"
+                            onClick={() =>
+                              onUpdateStrategy({
+                                ...strategy,
+                                smartTrailingEnabled: true,
+                                trailingStopEnabled: true,
+                                smartTrailingAtrMultiplier: mult,
+                                trailingStopPercent: preview.trailingPercent,
+                              })
+                            }
+                            className={`flex-1 py-1 rounded text-[10px] font-mono cursor-pointer border transition-all ${
+                              smartTrailingMultiplier === mult
+                                ? 'bg-purple-500/25 border-purple-400/60 text-purple-200 font-bold'
+                                : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-slate-200'
+                            }`}
+                          >
+                            {mult.toFixed(1)}x
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                ) : (
+                  <div>
+                    <div className="flex justify-between items-center text-[10px] text-slate-400 mb-1">
+                      <span>Static Trail Distance</span>
+                      <span className="font-bold text-cyan-400">{Number(strategy.trailingStopPercent).toFixed(2)}%</span>
+                    </div>
+                    <input
+                      type="range"
+                      min="0.4"
+                      max="5.0"
+                      step="0.1"
+                      value={Number.isFinite(strategy.trailingStopPercent) ? strategy.trailingStopPercent : 1.2}
+                      onChange={(e) => {
+                        const val = Number(e.target.value);
+                        if (Number.isFinite(val)) onUpdateStrategy({ ...strategy, trailingStopPercent: val });
+                      }}
+                      className="w-full accent-cyan-400 cursor-pointer h-1.5 bg-slate-800 rounded-lg"
+                    />
+                  </div>
+                )}
+              </div>
+
+              <span className="text-[10px] text-slate-500 block">
+                {strategy.smartTrailingEnabled
+                  ? `Smart Trailing active: dynamically adjusts stop to ${effectiveTrailingStopPercent.toFixed(2)}% (${smartTrailing.spotTrailPercent.toFixed(2)}% spot) from peak using live ${smartTrailing.volatilityRegime} ATR.`
+                  : `Auto-exits when loss breaches tolerance or price drops ${strategy.trailingStopPercent}% from highest peak.`}
               </span>
             </div>
-            <span className="text-[10px] text-slate-500 mt-1 block">
-              Auto-exits when loss breaches tolerance or price drops {strategy.trailingStopPercent}% from highest peak.
-            </span>
           </div>
         </div>
 

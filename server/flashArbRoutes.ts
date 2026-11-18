@@ -2,7 +2,12 @@ import { Router, type Request, type Response } from 'express';
 import { ethers } from 'ethers';
 import { sizeArbitrage, computeAdaptiveDepthFraction } from './arbSizing.ts';
 import { fetchLiveTickers } from './liveMarketData.ts';
+import { loadOrCompileContractArtifact } from './contractArtifactLoader.ts';
 import {
+  ALL_SUPPORTED_ARB_CHAINS,
+  CHAIN_LAYER_META,
+  isSupportedArbChain,
+  verifyChainRouteTypesReadiness,
   ARBITRUM_TOKENS,
   CHAIN_TOKENS,
   getChainTokens,
@@ -32,7 +37,12 @@ import {
   DEFAULT_MIN_GAS_RESERVE_WEI,
   computeTradeGasAndFinancingExtra,
   computeGasSurplusAllocation,
+  KNOWN_FLASH_ARB_CONTRACTS,
+  normalizeValidContractAddress,
+  resolveAndValidateSweepContracts,
+  type AllLayerFilter,
   type ArbitrumTokenInfo,
+  type BlockchainLayer,
   type EncodedArbitrageCandidate,
   type ErcStandard,
   type ExtraTokenSpec,
@@ -40,6 +50,15 @@ import {
   type RouterCapabilityOptions,
   type SupportedArbChain,
 } from './flashArbExecutor.ts';
+import {
+  ETH_POOL_SPECS,
+  POLYGON_POOL_SPECS,
+  BSC_POOL_SPECS,
+  AVALANCHE_POOL_SPECS,
+  LINEA_POOL_SPECS,
+  SCROLL_POOL_SPECS,
+  APECHAIN_POOL_SPECS,
+} from './multiChainPools.ts';
 import {
   normalizeTokenSymbolFilter,
   filterSweepTokensBySymbols,
@@ -51,12 +70,40 @@ export const flashArbRouter = Router();
 const gasWalletEnv = () => (process.env.FLASH_ARB_GAS_WALLET || '').trim();
 const profitWalletEnv = () => (process.env.FLASH_ARB_PROFIT_WALLET || '').trim();
 
+export const ETHEREUM_RPC_POOL = [
+  process.env.ETHEREUM_RPC_URL,
+  'https://ethereum-rpc.publicnode.com',
+  'https://eth.meowrpc.com',
+  'https://1rpc.io/eth',
+].filter(Boolean) as string[];
+
+export const POLYGON_RPC_POOL = [
+  process.env.POLYGON_RPC_URL,
+  'https://polygon-bor-rpc.publicnode.com',
+  'https://polygon-rpc.com',
+  'https://1rpc.io/matic',
+].filter(Boolean) as string[];
+
+export const BSC_RPC_POOL = [
+  process.env.BSC_RPC_URL,
+  'https://bsc-rpc.publicnode.com',
+  'https://bsc-dataseed.bnbchain.org',
+  'https://1rpc.io/bnb',
+].filter(Boolean) as string[];
+
+export const AVALANCHE_RPC_POOL = [
+  process.env.AVALANCHE_RPC_URL,
+  'https://avalanche-c-chain-rpc.publicnode.com',
+  'https://api.avax.network/ext/bc/C/rpc',
+  'https://1rpc.io/avax/c',
+].filter(Boolean) as string[];
+
 export const ARBITRUM_RPC_POOL = [
   process.env.ARBITRUM_RPC_URL,
-  'https://arbitrum-one-rpc.publicnode.com',
-  'https://1rpc.io/arb',
   'https://arb1.arbitrum.io/rpc',
+  'https://arbitrum-one-rpc.publicnode.com',
   'https://arbitrum.meowrpc.com',
+  'https://1rpc.io/arb',
 ].filter(Boolean) as string[];
 
 // PublicNode rejects eth_getTransactionReceipt with -32602 ("Archive requests require a personal token"),
@@ -64,8 +111,8 @@ export const ARBITRUM_RPC_POOL = [
 export const ARBITRUM_TX_RPC_POOL = [
   process.env.ARBITRUM_RPC_URL,
   'https://arb1.arbitrum.io/rpc',
-  'https://1rpc.io/arb',
   'https://arbitrum.meowrpc.com',
+  'https://1rpc.io/arb',
 ].filter(Boolean) as string[];
 
 export const BASE_RPC_POOL = [
@@ -78,41 +125,98 @@ export const BASE_RPC_POOL = [
 export const OPTIMISM_RPC_POOL = [
   process.env.OPTIMISM_RPC_URL,
   'https://optimism-rpc.publicnode.com',
-  'https://1rpc.io/op',
   'https://mainnet.optimism.io',
+  'https://1rpc.io/op',
 ].filter(Boolean) as string[];
+
+export const LINEA_RPC_POOL = [
+  process.env.LINEA_RPC_URL,
+  'https://rpc.linea.build',
+  'https://linea-rpc.publicnode.com',
+  'https://1rpc.io/linea',
+].filter(Boolean) as string[];
+
+export const SCROLL_RPC_POOL = [
+  process.env.SCROLL_RPC_URL,
+  'https://scroll-rpc.publicnode.com',
+  'https://rpc.scroll.io',
+  'https://1rpc.io/scroll',
+].filter(Boolean) as string[];
+
+export const APECHAIN_RPC_POOL = [
+  process.env.APECHAIN_RPC_URL,
+  'https://rpc.apechain.com/http',
+  'https://apechain.calderachain.xyz/http',
+].filter(Boolean) as string[];
+
+const CHAIN_RPC_POOLS: Record<SupportedArbChain, string[]> = {
+  ethereum: ETHEREUM_RPC_POOL,
+  polygon: POLYGON_RPC_POOL,
+  bsc: BSC_RPC_POOL,
+  avalanche: AVALANCHE_RPC_POOL,
+  arbitrum: ARBITRUM_RPC_POOL,
+  base: BASE_RPC_POOL,
+  optimism: OPTIMISM_RPC_POOL,
+  linea: LINEA_RPC_POOL,
+  scroll: SCROLL_RPC_POOL,
+  apechain: APECHAIN_RPC_POOL,
+};
+
+function parseSupportedChain(raw: unknown, fallback: SupportedArbChain = 'arbitrum'): SupportedArbChain {
+  const s = String(raw || '').toLowerCase();
+  return isSupportedArbChain(s) ? s : fallback;
+}
 
 const RPC_ENDPOINTS: Record<string, {
   name: string;
+  layer: BlockchainLayer;
+  nativeSymbol: string;
   rpc: string;
   explorer: string;
   chainId: number;
   balancerVault: string;
   aavePool: string;
 }> = {
+  ethereum: {
+    ...CHAIN_LAYER_META.ethereum,
+    rpc: ETHEREUM_RPC_POOL[0],
+  },
+  polygon: {
+    ...CHAIN_LAYER_META.polygon,
+    rpc: POLYGON_RPC_POOL[0],
+  },
+  bsc: {
+    ...CHAIN_LAYER_META.bsc,
+    rpc: BSC_RPC_POOL[0],
+  },
+  avalanche: {
+    ...CHAIN_LAYER_META.avalanche,
+    rpc: AVALANCHE_RPC_POOL[0],
+  },
   arbitrum: {
-    name: 'Arbitrum One',
+    ...CHAIN_LAYER_META.arbitrum,
     rpc: ARBITRUM_TX_RPC_POOL[0],
-    explorer: 'https://arbiscan.io',
-    chainId: 42161,
-    balancerVault: '0xBA12222222228d8Ba445958a75a0704d566BF2C8',
-    aavePool: '0x794a61358D6845594F94dc1DB02A252b5b4814aD',
   },
   base: {
+    ...CHAIN_LAYER_META.base,
     name: 'Base L2',
     rpc: BASE_RPC_POOL[0],
-    explorer: 'https://basescan.org',
-    chainId: 8453,
-    balancerVault: '0xBA12222222228d8Ba445958a75a0704d566BF2C8',
-    aavePool: '0xA238Dd80C259a72e81d7e4664a9801593F98d1c5',
   },
   optimism: {
-    name: 'Optimism Mainnet',
+    ...CHAIN_LAYER_META.optimism,
     rpc: OPTIMISM_RPC_POOL[0],
-    explorer: 'https://optimistic.etherscan.io',
-    chainId: 10,
-    balancerVault: '0xBA12222222228d8Ba445958a75a0704d566BF2C8',
-    aavePool: '0x794a61358D6845594F94dc1DB02A252b5b4814aD',
+  },
+  linea: {
+    ...CHAIN_LAYER_META.linea,
+    rpc: LINEA_RPC_POOL[0],
+  },
+  scroll: {
+    ...CHAIN_LAYER_META.scroll,
+    rpc: SCROLL_RPC_POOL[0],
+  },
+  apechain: {
+    ...CHAIN_LAYER_META.apechain,
+    rpc: APECHAIN_RPC_POOL[0],
   },
 };
 
@@ -123,9 +227,8 @@ const rpcCooldowns = new Map<string, number>();
  * Resilient multi-endpoint RPC caller that fails over instantly across public RPC providers
  * and enforces backoff if any provider returns 429 Too Many Requests.
  */
-async function fetchRpcBatchWithFailover(chain: 'arbitrum' | 'base' | 'optimism', calls: any[]): Promise<{ results: any[]; rpcUrl: string }> {
-  const pool = chain === 'arbitrum' ? ARBITRUM_RPC_POOL : chain === 'base' ? BASE_RPC_POOL : OPTIMISM_RPC_POOL;
-  const now = Date.now();
+async function fetchRpcBatchWithFailover(chain: SupportedArbChain, calls: any[]): Promise<{ results: any[]; rpcUrl: string }> {
+  const pool = CHAIN_RPC_POOLS[chain] || ARBITRUM_RPC_POOL;
   // Sort endpoints: non-cooled down first, then by earliest cooldown expiry
   const candidates = [...pool].sort((a, b) => (rpcCooldowns.get(a) || 0) - (rpcCooldowns.get(b) || 0));
 
@@ -133,7 +236,7 @@ async function fetchRpcBatchWithFailover(chain: 'arbitrum' | 'base' | 'optimism'
   for (const url of candidates) {
     try {
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 6500);
+      const timeout = setTimeout(() => controller.abort(), 9000);
       const resp = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -174,10 +277,9 @@ async function fetchRpcBatchWithFailover(chain: 'arbitrum' | 'base' | 'optimism'
 }
 
 function getRpcPool(chain: string, txCapable = false): string[] {
-  const c = chain.toLowerCase();
-  if (c === 'base') return BASE_RPC_POOL;
-  if (c === 'optimism') return OPTIMISM_RPC_POOL;
-  return txCapable ? ARBITRUM_TX_RPC_POOL : ARBITRUM_RPC_POOL;
+  const c = parseSupportedChain(chain);
+  if (c === 'arbitrum' && txCapable) return ARBITRUM_TX_RPC_POOL;
+  return CHAIN_RPC_POOLS[c] || ARBITRUM_RPC_POOL;
 }
 
 async function fetchRpcSingleWithFailover(
@@ -290,7 +392,7 @@ async function waitForReceiptWithFailover(
  * and skips dust amounts smaller than 2x the estimated L2 transfer fee.
  */
 async function sweepGasWalletEthSurplus(params: {
-  chain: 'arbitrum' | 'base' | 'optimism';
+  chain: SupportedArbChain;
   cleanKey: string;
   signerAddress: string;
   recipient: string;
@@ -410,8 +512,9 @@ async function sweepGasWalletEthSurplus(params: {
 /**
  * Fetch raw on-chain balance and gas price via JSON-RPC with multi-endpoint failover
  */
-async function queryChainGas(chain: 'arbitrum' | 'base' | 'optimism', address: string) {
-  const pool = chain === 'arbitrum' ? ARBITRUM_RPC_POOL : chain === 'base' ? BASE_RPC_POOL : OPTIMISM_RPC_POOL;
+async function queryChainGas(chain: SupportedArbChain, address: string) {
+  const pool = CHAIN_RPC_POOLS[chain] || ARBITRUM_RPC_POOL;
+  const nativeSymbol = CHAIN_LAYER_META[chain]?.nativeSymbol || 'ETH';
   let lastErr = 'RPC Query Timeout';
 
   for (const rpcUrl of pool) {
@@ -471,25 +574,23 @@ async function queryChainGas(chain: 'arbitrum' | 'base' | 'optimism', address: s
       const balanceWei = BigInt(balHex);
       const gasPriceWei = BigInt(gasHex);
 
-      // Convert balance from Wei to ETH with 6 decimal precision
-      const weiPerEth = 10n ** 18n;
-      const wholeEth = balanceWei / weiPerEth;
-      const remainderWei = balanceWei % weiPerEth;
-      const fractionalPart = (remainderWei * 1000000n) / weiPerEth;
-      const ethStr = `${wholeEth}.${fractionalPart.toString().padStart(6, '0')}`;
-      const ethNum = parseFloat(ethStr);
+      const weiPerNative = 10n ** 18n;
+      const wholeUnits = balanceWei / weiPerNative;
+      const remainderWei = balanceWei % weiPerNative;
+      const fractionalPart = (remainderWei * 1000000n) / weiPerNative;
+      const nativeStr = `${wholeUnits}.${fractionalPart.toString().padStart(6, '0')}`;
+      const nativeNum = parseFloat(nativeStr);
 
       const gasPriceGwei = Number(gasPriceWei) / 1e9;
-
-      // FlashArbOptimized consumes ~148,000 gas per trade
       const avgGasPerTx = 148000n;
       const costPerTxWei = avgGasPerTx * gasPriceWei;
       const estimatedTxs = costPerTxWei > 0n ? Number(balanceWei / costPerTxWei) : null;
 
       return {
         success: true,
-        balanceEth: ethNum,
-        balanceEthFormatted: `${ethNum.toFixed(4)} ETH`,
+        nativeSymbol,
+        balanceEth: nativeNum,
+        balanceEthFormatted: `${nativeNum.toFixed(4)} ${nativeSymbol}`,
         gasPriceGwei: Number(gasPriceGwei.toFixed(3)),
         estimatedTxsRemaining: estimatedTxs === null ? null : Math.max(0, estimatedTxs),
         rawHex: balHex,
@@ -501,6 +602,7 @@ async function queryChainGas(chain: 'arbitrum' | 'base' | 'optimism', address: s
 
   return {
     success: false,
+    nativeSymbol,
     balanceEth: null as number | null,
     balanceEthFormatted: null as string | null,
     gasPriceGwei: null as number | null,
@@ -511,7 +613,7 @@ async function queryChainGas(chain: 'arbitrum' | 'base' | 'optimism', address: s
 
 /**
  * GET /api/flash-arb/gas-status
- * Queries real-time on-chain ETH gas balance of the Gas Holder Wallet across Arbitrum, Base, and Optimism
+ * Queries real-time on-chain native gas balance of the Gas Holder Wallet across all L1/L2/L3 chains
  */
 flashArbRouter.get('/gas-status', async (req: Request, res: Response) => {
   try {
@@ -520,16 +622,36 @@ flashArbRouter.get('/gas-status', async (req: Request, res: Response) => {
       return res.status(400).json({ success: false, error: 'No valid address: pass ?address= or set FLASH_ARB_GAS_WALLET.' });
     }
 
-    const [liveFeed, arbStatus, baseStatus, opStatus] = await Promise.all([
+    const [liveFeed, ...gasStatuses] = await Promise.all([
       getLiveTokenPriceFeed().catch(() => null),
-      queryChainGas('arbitrum', address),
-      queryChainGas('base', address),
-      queryChainGas('optimism', address),
+      ...ALL_SUPPORTED_ARB_CHAINS.map((c) => queryChainGas(c, address)),
     ]);
+
     const ethUsdPrice =
       liveFeed?.ethUsd ||
       getLiveTokenUsdPrice('WETH', 'arbitrum') ||
       0;
+
+    const chainsOut: Record<string, any> = {};
+    ALL_SUPPORTED_ARB_CHAINS.forEach((c, idx) => {
+      const status = gasStatuses[idx];
+      const meta = CHAIN_LAYER_META[c];
+      const nativeUsd =
+        meta.nativeSymbol === 'ETH'
+          ? ethUsdPrice
+          : getLiveTokenUsdPrice(meta.wrappedNativeSymbol, c) ||
+            getLiveTokenUsdPrice(meta.nativeSymbol, c) ||
+            0;
+      const minReserve = meta.nativeSymbol === 'ETH' ? 0.002 : 0.05;
+      chainsOut[c] = {
+        ...RPC_ENDPOINTS[c],
+        layer: meta.layer,
+        nativeUsdPrice: nativeUsd > 0 ? nativeUsd : null,
+        ...status,
+        balanceUsd: nativeUsd > 0 ? Number(((status.balanceEth ?? 0) * nativeUsd).toFixed(2)) : 0,
+        fundedForTrading: (status.balanceEth ?? 0) >= minReserve,
+      };
+    });
 
     const isSignerConfigured = Boolean(process.env.FLASH_ARB_SIGNER_KEY);
 
@@ -539,26 +661,7 @@ flashArbRouter.get('/gas-status', async (req: Request, res: Response) => {
       profitWallet: profitWalletEnv(),
       isSignerConfigured,
       ethUsdPrice: ethUsdPrice > 0 ? ethUsdPrice : null,
-      chains: {
-        arbitrum: {
-          ...RPC_ENDPOINTS.arbitrum,
-          ...arbStatus,
-          balanceUsd: ethUsdPrice > 0 ? Number(((arbStatus.balanceEth ?? 0) * ethUsdPrice).toFixed(2)) : 0,
-          fundedForTrading: (arbStatus.balanceEth ?? 0) >= 0.002,
-        },
-        base: {
-          ...RPC_ENDPOINTS.base,
-          ...baseStatus,
-          balanceUsd: ethUsdPrice > 0 ? Number(((baseStatus.balanceEth ?? 0) * ethUsdPrice).toFixed(2)) : 0,
-          fundedForTrading: (baseStatus.balanceEth ?? 0) >= 0.002,
-        },
-        optimism: {
-          ...RPC_ENDPOINTS.optimism,
-          ...opStatus,
-          balanceUsd: ethUsdPrice > 0 ? Number(((opStatus.balanceEth ?? 0) * ethUsdPrice).toFixed(2)) : 0,
-          fundedForTrading: (opStatus.balanceEth ?? 0) >= 0.002,
-        },
-      },
+      chains: chainsOut,
       timestamp: Date.now(),
     });
   } catch (err: any) {
@@ -937,13 +1040,7 @@ flashArbRouter.get('/deploy-payload', async (req: Request, res: Response) => {
     const chain = String(req.query.chain || 'arbitrum').toLowerCase();
     const rpcInfo = RPC_ENDPOINTS[chain] || RPC_ENDPOINTS.arbitrum;
 
-    const fs = await import('fs');
-    const path = await import('path');
-    const artifactPath = path.join(process.cwd(), 'flash-arb/contracts/out/FlashArbOptimized.json');
-    if (!fs.existsSync(artifactPath)) {
-      return res.status(500).json({ success: false, error: 'FlashArbOptimized artifact not found' });
-    }
-    const artifact = JSON.parse(fs.readFileSync(artifactPath, 'utf8'));
+    const artifact = await loadOrCompileContractArtifact('FlashArbOptimized');
 
     const { ethers } = await import('ethers');
     const abiCoder = ethers.AbiCoder.defaultAbiCoder();
@@ -970,11 +1067,18 @@ flashArbRouter.get('/deploy-payload', async (req: Request, res: Response) => {
   }
 });
 
-// In-memory registry of active FlashArb contract addresses per chain
+// In-memory registry of active FlashArb contract addresses per chain (empty until actually deployed on-chain)
 const DEPLOYED_CONTRACTS: Record<string, string> = {
+  ethereum: (process.env.FLASH_ARB_CONTRACT_ETHEREUM || '').trim(),
+  polygon: (process.env.FLASH_ARB_CONTRACT_POLYGON || '').trim(),
+  bsc: (process.env.FLASH_ARB_CONTRACT_BSC || '').trim(),
+  avalanche: (process.env.FLASH_ARB_CONTRACT_AVALANCHE || '').trim(),
   arbitrum: '0xeee31ff9e69904b43c124095b6f33aa61505bcc2',
   base: '0x37440674a814f24d9C6ea0990b272215D40c4512',
   optimism: '0x738C8Eb31316B23d9b8A68B0c2658B456c932598',
+  linea: (process.env.FLASH_ARB_CONTRACT_LINEA || '').trim(),
+  scroll: (process.env.FLASH_ARB_CONTRACT_SCROLL || '').trim(),
+  apechain: (process.env.FLASH_ARB_CONTRACT_APECHAIN || '').trim(),
 };
 
 /**
@@ -995,10 +1099,11 @@ flashArbRouter.get('/deployed-contracts', (_req: Request, res: Response) => {
 flashArbRouter.post('/deployed-contracts', (req: Request, res: Response) => {
   const { chain, address } = req.body;
   const targetChain = String(chain || 'arbitrum').toLowerCase();
-  if (!address || !/^0x[a-fA-F0-9]{40}$/i.test(String(address).trim())) {
-    return res.status(400).json({ success: false, error: 'Invalid EVM contract address format (must be 0x followed by 40 hex chars)' });
+  const normalizedAddr = normalizeValidContractAddress(address);
+  if (!normalizedAddr) {
+    return res.status(400).json({ success: false, error: 'Invalid non-zero EVM contract address format (must be 0x followed by 40 hex chars)' });
   }
-  DEPLOYED_CONTRACTS[targetChain] = address.trim();
+  DEPLOYED_CONTRACTS[targetChain] = normalizedAddr;
   liveAgent.invalidateChainInfraCache(targetChain as SupportedArbChain);
   return res.json({
     success: true,
@@ -1018,13 +1123,7 @@ flashArbRouter.post('/deploy-contract', async (req: Request, res: Response) => {
     const targetChain = String(chain || 'arbitrum').toLowerCase();
     const rpcInfo = RPC_ENDPOINTS[targetChain] || RPC_ENDPOINTS.arbitrum;
 
-    const fs = await import('fs');
-    const path = await import('path');
-    const artifactPath = path.join(process.cwd(), 'flash-arb/contracts/out/FlashArbOptimized.json');
-    if (!fs.existsSync(artifactPath)) {
-      return res.status(500).json({ success: false, error: 'FlashArbOptimized artifact not found on disk' });
-    }
-    const artifact = JSON.parse(fs.readFileSync(artifactPath, 'utf8'));
+    const artifact = await loadOrCompileContractArtifact('FlashArbOptimized');
 
     const { ethers } = await import('ethers');
 
@@ -1171,13 +1270,7 @@ flashArbRouter.get('/camelot-adapter-payload', async (req: Request, res: Respons
   try {
     const chain = String(req.query.chain || 'arbitrum').toLowerCase();
     const rpcInfo = RPC_ENDPOINTS[chain] || RPC_ENDPOINTS.arbitrum;
-    const fs = await import('fs');
-    const path = await import('path');
-    const artifactPath = path.join(process.cwd(), 'flash-arb/contracts/out/CamelotV3SwapAdapter.json');
-    if (!fs.existsSync(artifactPath)) {
-      return res.status(500).json({ success: false, error: 'CamelotV3SwapAdapter artifact not found on disk' });
-    }
-    const artifact = JSON.parse(fs.readFileSync(artifactPath, 'utf8'));
+    const artifact = await loadOrCompileContractArtifact('CamelotV3SwapAdapter');
     const { ethers } = await import('ethers');
     const abiCoder = ethers.AbiCoder.defaultAbiCoder();
     const encodedArgs = abiCoder.encode(['address'], [CAMELOT_V3_ROUTER_ADDRESS]);
@@ -1205,13 +1298,7 @@ flashArbRouter.post('/deploy-camelot-adapter', async (req: Request, res: Respons
       return res.status(400).json({ success: false, error: 'CamelotV3SwapAdapter is only needed on Arbitrum One.' });
     }
     const rpcInfo = RPC_ENDPOINTS.arbitrum;
-    const fs = await import('fs');
-    const path = await import('path');
-    const artifactPath = path.join(process.cwd(), 'flash-arb/contracts/out/CamelotV3SwapAdapter.json');
-    if (!fs.existsSync(artifactPath)) {
-      return res.status(500).json({ success: false, error: 'CamelotV3SwapAdapter artifact not found on disk' });
-    }
-    const artifact = JSON.parse(fs.readFileSync(artifactPath, 'utf8'));
+    const artifact = await loadOrCompileContractArtifact('CamelotV3SwapAdapter');
     const { ethers } = await import('ethers');
 
     const signerKey = reqPrivateKey || process.env.FLASH_ARB_SIGNER_KEY;
@@ -1726,12 +1813,23 @@ const OP_POOL_SPECS: PoolSpec[] = [
 ];
 
 const POOL_SPECS_BY_CHAIN: Record<SupportedArbChain, PoolSpec[]> = {
+  ethereum: ETH_POOL_SPECS,
+  polygon: POLYGON_POOL_SPECS,
+  bsc: BSC_POOL_SPECS,
+  avalanche: AVALANCHE_POOL_SPECS,
   arbitrum: POOL_SPECS,
   base: BASE_POOL_SPECS,
   optimism: OP_POOL_SPECS,
+  linea: LINEA_POOL_SPECS,
+  scroll: SCROLL_POOL_SPECS,
+  apechain: APECHAIN_POOL_SPECS,
 };
 
-const SUPPORTED_SCAN_CHAINS: SupportedArbChain[] = ['arbitrum', 'base', 'optimism'];
+const SUPPORTED_SCAN_CHAINS: SupportedArbChain[] = ALL_SUPPORTED_ARB_CHAINS;
+
+function initChainRecord<T>(factory: () => T): Record<SupportedArbChain, T> {
+  return Object.fromEntries(ALL_SUPPORTED_ARB_CHAINS.map((c) => [c, factory()])) as Record<SupportedArbChain, T>;
+}
 
 const MULTICALL3_ADDRESS = '0xcA11bde05977b3631167028862bE2a173976CA11';
 const multicallIface = new ethers.Interface([
@@ -1746,31 +1844,11 @@ class LiveMevAgent {
   public pools: MonitoredPoolState[] = [];
   public opportunities: LiveArbitrageOpportunity[] = [];
   public executedTrades: ExecutedAgentTrade[] = [];
-  public poolsByChain: Record<SupportedArbChain, MonitoredPoolState[]> = {
-    arbitrum: [],
-    base: [],
-    optimism: [],
-  };
-  public opportunitiesByChain: Record<SupportedArbChain, LiveArbitrageOpportunity[]> = {
-    arbitrum: [],
-    base: [],
-    optimism: [],
-  };
-  public latestBlockByChain: Record<SupportedArbChain, number> = {
-    arbitrum: 0,
-    base: 0,
-    optimism: 0,
-  };
-  public lastErrorByChain: Record<SupportedArbChain, string | null> = {
-    arbitrum: null,
-    base: null,
-    optimism: null,
-  };
-  public lastSuccessfulScanByChain: Record<SupportedArbChain, number> = {
-    arbitrum: Date.now(),
-    base: Date.now(),
-    optimism: Date.now(),
-  };
+  public poolsByChain: Record<SupportedArbChain, MonitoredPoolState[]> = initChainRecord<MonitoredPoolState[]>(() => []);
+  public opportunitiesByChain: Record<SupportedArbChain, LiveArbitrageOpportunity[]> = initChainRecord<LiveArbitrageOpportunity[]>(() => []);
+  public latestBlockByChain: Record<SupportedArbChain, number> = initChainRecord<number>(() => 0);
+  public lastErrorByChain: Record<SupportedArbChain, string | null> = initChainRecord<string | null>(() => null);
+  public lastSuccessfulScanByChain: Record<SupportedArbChain, number> = initChainRecord<number>(() => Date.now());
   private loopTimer: NodeJS.Timeout | null = null;
   public isScanning: boolean = false;
   private consecutiveFailures: number = 0;
@@ -1799,6 +1877,7 @@ class LiveMevAgent {
     contractSupportsAlgebra: boolean;
     contractSupportsCamelotV2: boolean;
     camelotV3Adapter: string | null;
+    hasBalancerVault: boolean;
     vaultBalances: Record<string, bigint>;
     fetchedAt: number;
   }>();
@@ -1815,6 +1894,7 @@ class LiveMevAgent {
     contractSupportsAlgebra: boolean;
     contractSupportsCamelotV2: boolean;
     camelotV3Adapter: string | null;
+    hasBalancerVault: boolean;
     vaultBalances: Record<string, bigint>;
     fetchedAt: number;
   }> {
@@ -1833,7 +1913,12 @@ class LiveMevAgent {
 
     const rpcInfo = RPC_ENDPOINTS[chain] || RPC_ENDPOINTS.arbitrum;
     const tokens = Object.values(CHAIN_TOKENS[chain] || {});
-    const paddedVault = rpcInfo.balancerVault.toLowerCase().replace('0x', '').padStart(64, '0');
+    const hasVaultConfigured =
+      Boolean(rpcInfo.balancerVault) &&
+      rpcInfo.balancerVault.toLowerCase() !== ethers.ZeroAddress.toLowerCase();
+    const paddedVault = hasVaultConfigured
+      ? rpcInfo.balancerVault.toLowerCase().replace('0x', '').padStart(64, '0')
+      : '';
     const hasContract = Boolean(contractAddr && /^0x[a-fA-F0-9]{40}$/.test(contractAddr));
     const hasAdapter = Boolean(configuredAdapter && /^0x[a-fA-F0-9]{40}$/.test(configuredAdapter));
     const mcCalls: Array<{ target: string; allowFailure: boolean; callData: string }> = [
@@ -1843,11 +1928,13 @@ class LiveMevAgent {
             { target: contractAddr, allowFailure: true, callData: '0x459a01ae' }, // routerCapabilities()
           ]
         : []),
-      ...tokens.map((t) => ({
-        target: t.addr,
-        allowFailure: true,
-        callData: `0x70a08231${paddedVault}`,
-      })),
+      ...(hasVaultConfigured
+        ? tokens.map((t) => ({
+            target: t.addr,
+            allowFailure: true,
+            callData: `0x70a08231${paddedVault}`,
+          }))
+        : []),
     ];
 
     const [codeResp, adapterCodeResp, mcResp] = await Promise.all([
@@ -1893,16 +1980,20 @@ class LiveMevAgent {
             contractSupportsCamelotV2 = (capMask & 4n) !== 0n;
           }
         }
-        tokens.forEach((t, idx) => {
-          const entry = decoded[offset + idx];
-          if (entry?.success && typeof entry.returnData === 'string' && entry.returnData.length >= 66) {
-            vaultBalances[t.addr.toLowerCase()] = BigInt(entry.returnData.slice(0, 66));
-          }
-        });
+        if (hasVaultConfigured) {
+          tokens.forEach((t, idx) => {
+            const entry = decoded[offset + idx];
+            if (entry?.success && typeof entry.returnData === 'string' && entry.returnData.length >= 66) {
+              vaultBalances[t.addr.toLowerCase()] = BigInt(entry.returnData.slice(0, 66));
+            }
+          });
+        }
       } catch {
         // ignore malformed multicall response
       }
     }
+
+    const hasBalancerVault = hasVaultConfigured && Object.values(vaultBalances).some((b) => b > 0n);
 
     const fresh = {
       contractAddr,
@@ -1911,6 +2002,7 @@ class LiveMevAgent {
       contractSupportsAlgebra,
       contractSupportsCamelotV2,
       camelotV3Adapter,
+      hasBalancerVault,
       vaultBalances,
       fetchedAt: Date.now(),
     };
@@ -1997,6 +2089,7 @@ class LiveMevAgent {
     routeType: number;
     loanToken: string;
     ethUsd: number; // real WETH/USDC price from chain
+    nativeUsd?: number; // live USD price of chain native gas token (POL, BNB, AVAX, APE, or ETH)
     gasPriceGwei: number; // real eth_gasPrice from the chain RPC
     lighterRoute: boolean; // both legs concentrated-liquidity pools
     maxTradeUsd?: number; // real physical pool reserve / Balancer Vault liquidity cap
@@ -2006,25 +2099,28 @@ class LiveMevAgent {
     const dexFeeBps = Math.round((params.feeTierA + params.feeTierB) * 100);
     const netEdgeBps = grossSpreadBps - dexFeeBps;
 
-    // Calibrate lowest safe gas limit based on route architecture and L2 sequencer fee mechanics
-    const baseGasLimit = params.lighterRoute ? 135000 : 148500; // per-route gas budget (EIP-1153 + pre-approved)
-    const isFcfsChain = params.chain === 'arbitrum';
+    // Calibrate lowest safe gas limit based on route architecture and L2/L1 fee mechanics
+    const baseGasLimit = params.lighterRoute ? 135000 : 148500;
+    const isFcfsChain = params.chain === 'arbitrum' || params.chain === 'apechain';
+    const isL1Priority = params.chain === 'ethereum';
 
     let gasMultiplier = 0.96;
-    let tipGwei = isFcfsChain ? 0.002 : 0.005;
+    let tipGwei = isFcfsChain ? 0.002 : isL1Priority ? 0.25 : 0.005;
     if (this.gasOptimizationMode === 'ECO') {
       gasMultiplier = 0.90;
-      tipGwei = isFcfsChain ? 0 : 0.001;
+      tipGwei = isFcfsChain ? 0 : isL1Priority ? 0.05 : 0.001;
     } else if (this.gasOptimizationMode === 'AGGRESSIVE') {
       gasMultiplier = 1.10;
-      tipGwei = isFcfsChain ? 0.01 : 0.05;
+      tipGwei = isFcfsChain ? 0.01 : isL1Priority ? 1.0 : 0.05;
     }
 
     const optimalGasLimit = Math.round(baseGasLimit * gasMultiplier);
     const gasSavingsPercent = Number((((300000 - optimalGasLimit) / 300000) * 100).toFixed(1));
-    const effectiveGwei = params.gasPriceGwei + tipGwei; // real chain gas price + calibrated L2 tip
-    const gasEth = (optimalGasLimit * effectiveGwei) / 1e9;
-    const gasCostUsd = Number((gasEth * params.ethUsd).toFixed(4));
+    const effectiveGwei = params.gasPriceGwei + tipGwei;
+    const gasNative = (optimalGasLimit * effectiveGwei) / 1e9;
+    const gasUnitUsd =
+      typeof params.nativeUsd === 'number' && params.nativeUsd > 0 ? params.nativeUsd : params.ethUsd;
+    const gasCostUsd = Number((gasNative * gasUnitUsd).toFixed(4));
 
     // ---- Sizing from MEASURED depth (model + rationale in server/arbSizing.ts) ----------------------------
     // Calibrated for L2s: min notional floor scales safely from $1 (not $900) so S* never clamps into slippage loss,
@@ -2111,7 +2207,7 @@ class LiveMevAgent {
    */
   public async verifyAndExecuteOpportunity(
     opp: LiveArbitrageOpportunity,
-    options?: { forceTestExecution?: boolean; chain?: 'arbitrum' | 'base' | 'optimism' }
+    options?: { forceTestExecution?: boolean; chain?: SupportedArbChain }
   ): Promise<{
     ok: boolean;
     statusCode: number;
@@ -2623,8 +2719,7 @@ class LiveMevAgent {
       detail: string;
     }>;
   }> {
-    const chain: SupportedArbChain =
-      params.chain === 'base' || params.chain === 'optimism' ? params.chain : 'arbitrum';
+    const chain: SupportedArbChain = parseSupportedChain(params.chain);
     const rpcInfo = RPC_ENDPOINTS[chain] || RPC_ENDPOINTS.arbitrum;
     const contractAddr = DEPLOYED_CONTRACTS[chain] || '';
     const profitWallet = profitWalletEnv();
@@ -2665,7 +2760,7 @@ class LiveMevAgent {
       }
     }
     if (!quoteToken && matchingSpecs.length > 0) {
-      const preferredOrder = ['USDC', 'WETH', 'USDT', 'USDC.E', 'USDBC', 'DAI'];
+      const preferredOrder = ['USDC', 'USDT', 'WETH', 'WMATIC', 'WBNB', 'WAVAX', 'ApeUSD', 'WAPE', 'USDC.E', 'USDBC', 'DAI'];
       for (const pref of preferredOrder) {
         if (pref === baseToken.sym.toUpperCase()) continue;
         const foundSpec = matchingSpecs.find(
@@ -2791,7 +2886,14 @@ class LiveMevAgent {
       await getLiveTokenPriceFeed(false).catch(() => null);
     }
     const chainPools = this.poolsByChain[chain] || [];
+    const chainMeta = CHAIN_LAYER_META[chain];
     const ethUsd = getLiveTokenUsdPrice('WETH', chain) || chainPools.find((p) => p.pair === 'WETH/USDC')?.priceUsd || 2500;
+    const nativeUsd =
+      chainMeta.nativeSymbol === 'ETH'
+        ? ethUsd
+        : getLiveTokenUsdPrice(chainMeta.wrappedNativeSymbol, chain) ||
+          getLiveTokenUsdPrice(chainMeta.nativeSymbol, chain) ||
+          ethUsd;
     const baseUsd = getLiveTokenUsdPrice(baseToken.sym, chain) || (baseToken.sym === 'WETH' ? ethUsd : 1);
     const quoteUsd = getLiveTokenUsdPrice(quoteToken.sym, chain) || (quoteToken.sym === 'WETH' ? ethUsd : 1);
     const buyPriceQuotePerBase = quoteUsd > 0 ? baseUsd / quoteUsd : 1;
@@ -2850,8 +2952,9 @@ class LiveMevAgent {
       const u = sym.toUpperCase();
       if (u === baseToken.sym.toUpperCase()) return baseUsd;
       if (u === quoteToken!.sym.toUpperCase()) return quoteUsd;
-      if (['USDC', 'USDC.E', 'USDBC', 'USDT', 'DAI', 'FRAX', 'USDE'].includes(u)) return 1;
-      if (u === 'WETH' || u === 'ETH') return ethUsd;
+      if (['USDC', 'USDC.E', 'USDBC', 'USDT', 'DAI', 'FRAX', 'USDE', 'APEUSD'].includes(u)) return 1;
+      if (u === 'WETH' || u === 'ETH' || u === 'APEETH') return ethUsd;
+      if (u === chainMeta.wrappedNativeSymbol.toUpperCase() || u === chainMeta.nativeSymbol.toUpperCase()) return nativeUsd;
       return getLiveTokenUsdPrice(sym, chain) || 1;
     };
 
@@ -2872,7 +2975,7 @@ class LiveMevAgent {
     const { results: probeResults } = await fetchRpcBatchWithFailover(chain, probeBatch);
 
     const defaultGasUnits = 185000;
-    const defaultGasCostUsd = Number((((defaultGasUnits * Number(gasPriceWei)) / 1e18) * ethUsd).toFixed(4));
+    const defaultGasCostUsd = Number((((defaultGasUnits * Number(gasPriceWei)) / 1e18) * nativeUsd).toFixed(4));
 
     const checkedCandidates: Array<{
       label: string;
@@ -2958,7 +3061,7 @@ class LiveMevAgent {
         );
         if (typeof gasHex === 'string' && gasHex.startsWith('0x')) {
           estimatedGas = BigInt(gasHex);
-          gasCostUsd = Number((((Number(estimatedGas) * Number(gasPriceWei)) / 1e18) * ethUsd).toFixed(4));
+          gasCostUsd = Number((((Number(estimatedGas) * Number(gasPriceWei)) / 1e18) * nativeUsd).toFixed(4));
           if (bestPositive.actualUsd >= minProfitUsd + gasCostUsd) {
             verifiedCandidate = tightenedCand;
           } else {
@@ -3304,13 +3407,13 @@ class LiveMevAgent {
         scanError: this.lastErrorByChain.arbitrum,
       };
     }
-    const c: SupportedArbChain = key === 'base' || key === 'optimism' ? key : 'arbitrum';
+    const c: SupportedArbChain = parseSupportedChain(key);
     return {
       chain: c,
       latestBlock: this.latestBlockByChain[c] || 0,
       pools: this.poolsByChain[c] || [],
       opportunities: this.opportunitiesByChain[c] || [],
-      activeContract: DEPLOYED_CONTRACTS[c],
+      activeContract: DEPLOYED_CONTRACTS[c] || '',
       scanError: this.lastErrorByChain[c],
     };
   }
@@ -3501,12 +3604,74 @@ class LiveMevAgent {
       reads.push({ spec: p, basePerQuote: quotePerBase, depthQuote, actualBaseHuman, actualQuoteHuman, liveFeePercent });
     });
 
-    // ETH/USD reference = the real Uniswap V3 WETH/USDC 0.05% pool on this chain
+    // Reference token USD prices on this chain (WETH, native gas token, WBTC/BTCB, stables)
+    const chainMeta = CHAIN_LAYER_META[chain];
+    const isStableSym = (s: string) =>
+      ['USDC', 'USDC.E', 'USDBC', 'USDT', 'DAI', 'FRAX', 'USDE', 'APEUSD'].includes(s.toUpperCase());
+    const findDirectPairRate = (baseSym: string): number | null => {
+      const m = reads.find(
+        (r) =>
+          r.spec.base.sym.toUpperCase() === baseSym.toUpperCase() &&
+          isStableSym(r.spec.quote.sym) &&
+          r.basePerQuote > 0
+      );
+      if (m) return m.basePerQuote;
+      const rev = reads.find(
+        (r) =>
+          r.spec.quote.sym.toUpperCase() === baseSym.toUpperCase() &&
+          isStableSym(r.spec.base.sym) &&
+          r.basePerQuote > 0
+      );
+      if (rev) return 1 / rev.basePerQuote;
+      return null;
+    };
+
     const ethRef =
       reads.find((r) => r.spec.pair === 'WETH/USDC' && r.spec.dex === 'Uniswap V3' && Math.abs(r.spec.fee - 0.05) < 0.001) ||
-      reads.find((r) => r.spec.pair === 'WETH/USDC' && r.spec.base.sym === 'WETH');
-    const ethUsd = ethRef ? ethRef.basePerQuote : null;
-    const quoteUsd = (q: Tok): number | null => (q.sym === 'WETH' ? ethUsd : 1);
+      reads.find((r) => (r.spec.pair === 'WETH/USDC' || r.spec.pair === 'WETH/USDT') && r.spec.base.sym === 'WETH');
+    const ethUsd =
+      (ethRef ? ethRef.basePerQuote : null) ||
+      findDirectPairRate('WETH') ||
+      findDirectPairRate('ApeETH') ||
+      getLiveTokenUsdPrice('WETH', chain) ||
+      cachedPriceFeed?.ethUsd ||
+      null;
+
+    const nativeWrapped = chainMeta.wrappedNativeSymbol;
+    let nativeUsd: number | null = chainMeta.nativeSymbol === 'ETH' ? ethUsd : findDirectPairRate(nativeWrapped);
+    if (!nativeUsd && chainMeta.nativeSymbol !== 'ETH' && ethUsd) {
+      const vsWeth = reads.find(
+        (r) =>
+          (r.spec.base.sym.toUpperCase() === nativeWrapped.toUpperCase() && r.spec.quote.sym.toUpperCase() === 'WETH') ||
+          (r.spec.quote.sym.toUpperCase() === nativeWrapped.toUpperCase() && r.spec.base.sym.toUpperCase() === 'WETH')
+      );
+      if (vsWeth) {
+        nativeUsd = vsWeth.spec.base.sym.toUpperCase() === nativeWrapped.toUpperCase()
+          ? vsWeth.basePerQuote * ethUsd
+          : ethUsd / vsWeth.basePerQuote;
+      } else {
+        const vsApeEth = reads.find(
+          (r) => r.spec.base.sym === 'ApeETH' && r.spec.quote.sym === 'WAPE' && r.basePerQuote > 0
+        );
+        if (vsApeEth) nativeUsd = ethUsd / vsApeEth.basePerQuote;
+      }
+    }
+    if (!nativeUsd) {
+      nativeUsd =
+        getLiveTokenUsdPrice(nativeWrapped, chain) ||
+        getLiveTokenUsdPrice(chainMeta.nativeSymbol, chain) ||
+        (chainMeta.nativeSymbol === 'ETH' ? ethUsd : null);
+    }
+
+    const wbtcRefUsd = findDirectPairRate('WBTC') || findDirectPairRate('BTCB') || getLiveTokenUsdPrice('WBTC', chain);
+    const quoteUsd = (q: Tok): number | null => {
+      const u = q.sym.toUpperCase();
+      if (isStableSym(u)) return 1;
+      if (u === 'WETH' || u === 'ETH' || u === 'APEETH') return ethUsd;
+      if (u === nativeWrapped.toUpperCase() || u === chainMeta.nativeSymbol.toUpperCase()) return nativeUsd;
+      if (u === 'WBTC' || u === 'BTCB' || u === 'CBBTC') return wbtcRefUsd;
+      return getLiveTokenUsdPrice(q.sym, chain);
+    };
 
     const now = Date.now();
     const chainTokenList = Object.values(CHAIN_TOKENS[chain] || {});
@@ -3611,6 +3776,7 @@ class LiveMevAgent {
               routeType,
               loanToken: buy.spec.base.sym,
               ethUsd,
+              nativeUsd: nativeUsd ?? ethUsd,
               gasPriceGwei,
               lighterRoute: buy.spec.kind !== 'v2' && sell.spec.kind !== 'v2',
               maxTradeUsd,
@@ -3618,14 +3784,15 @@ class LiveMevAgent {
             if (opp) {
               const buyRouterOk = Boolean(chainRouters[buy.spec.dex]?.supported);
               const sellRouterOk = Boolean(chainRouters[sell.spec.dex]?.supported);
-              const contractDeployedOk = infra ? infra.contractHasExec : true;
+              const contractDeployedOk = Boolean(infra?.contractHasExec);
+              const balancerVaultPresent = Boolean(infra?.hasBalancerVault);
               const tokensCompatibleOk =
                 isTokenArbCompatible(buy.spec.base.addr) && isTokenArbCompatible(buy.spec.quote.addr);
               const balancerFundedOk = hasVaultInfo
                 ? (baseVaultBal ?? 0n) > 0n || (quoteVaultBal ?? 0n) > 0n
-                : true;
+                : false;
               opp.contractExecutable =
-                buyRouterOk && sellRouterOk && contractDeployedOk && tokensCompatibleOk && balancerFundedOk;
+                buyRouterOk && sellRouterOk && contractDeployedOk && balancerVaultPresent && tokensCompatibleOk && balancerFundedOk;
               opps.push(opp);
               chainRouteInputs.set(opp.id, {
                 chain,
@@ -3770,13 +3937,11 @@ flashArbRouter.get('/agent/status', (req: Request, res: Response) => {
     executedTrades: liveAgent.executedTrades.slice(-20),
     activeContract: statusView.activeContract,
     arbitrumCapabilities: liveAgent.getCachedChainCapabilities('arbitrum'),
-    countsByChain: {
-      arbitrum: liveAgent.poolsByChain.arbitrum.length,
-      base: liveAgent.poolsByChain.base.length,
-      optimism: liveAgent.poolsByChain.optimism.length,
-    },
+    countsByChain: Object.fromEntries(SUPPORTED_SCAN_CHAINS.map((c) => [c, (liveAgent.poolsByChain[c] || []).length])),
+    oppsCountByChain: Object.fromEntries(SUPPORTED_SCAN_CHAINS.map((c) => [c, (liveAgent.opportunitiesByChain[c] || []).length])),
     blocksByChain: liveAgent.latestBlockByChain,
     errorsByChain: liveAgent.lastErrorByChain,
+    chainMeta: CHAIN_LAYER_META,
     gasWallet: gasWalletEnv(),
     profitWallet: profitWalletEnv(),
     agentState: liveAgent.agentState,
@@ -3957,9 +4122,7 @@ flashArbRouter.post('/agent/verify-v3', async (req: Request, res: Response) => {
   try {
     const rawChain = String(req.body?.chain || req.query?.chain || 'all').toLowerCase();
     const chainsToCheck: SupportedArbChain[] =
-      rawChain === 'arbitrum' || rawChain === 'base' || rawChain === 'optimism'
-        ? [rawChain]
-        : ['arbitrum', 'base', 'optimism'];
+      isSupportedArbChain(rawChain) ? [rawChain] : SUPPORTED_SCAN_CHAINS;
 
     await Promise.allSettled(chainsToCheck.map((c) => liveAgent.scan(c)));
 
@@ -4177,9 +4340,7 @@ flashArbRouter.post('/agent/stop', (_req: Request, res: Response) => {
  */
 flashArbRouter.post('/agent/trigger', async (req: Request, res: Response) => {
   try {
-    const rawChain = String(req.body?.chain || 'arbitrum').toLowerCase();
-    const targetChain: SupportedArbChain =
-      rawChain === 'base' || rawChain === 'optimism' ? rawChain : 'arbitrum';
+    const targetChain: SupportedArbChain = parseSupportedChain(req.body?.chain);
 
     // 1. Run fresh scan on target chain
     await liveAgent.scan(targetChain);
@@ -4245,9 +4406,7 @@ flashArbRouter.post('/agent/trigger', async (req: Request, res: Response) => {
  */
 flashArbRouter.post('/simulator/probe', async (req: Request, res: Response) => {
   try {
-    const rawChain = String(req.body?.chain || 'arbitrum').toLowerCase();
-    const chain: SupportedArbChain =
-      rawChain === 'base' || rawChain === 'optimism' ? rawChain : 'arbitrum';
+    const chain: SupportedArbChain = parseSupportedChain(req.body?.chain);
     const result = await liveAgent.probeOrExecuteSimulatorRoute({
       chain,
       tokenSymbol: String(req.body?.tokenSymbol || 'WETH'),
@@ -4273,9 +4432,7 @@ flashArbRouter.post('/simulator/probe', async (req: Request, res: Response) => {
  */
 flashArbRouter.post('/simulator/execute', async (req: Request, res: Response) => {
   try {
-    const rawChain = String(req.body?.chain || 'arbitrum').toLowerCase();
-    const chain: SupportedArbChain =
-      rawChain === 'base' || rawChain === 'optimism' ? rawChain : 'arbitrum';
+    const chain: SupportedArbChain = parseSupportedChain(req.body?.chain);
     const result = await liveAgent.probeOrExecuteSimulatorRoute({
       chain,
       tokenSymbol: String(req.body?.tokenSymbol || 'WETH'),
@@ -4378,11 +4535,9 @@ flashArbRouter.post('/agent/verify-receipt', async (req: Request, res: Response)
   }
 });
 
-const CHAIN_ID_HEX_MAP: Record<'arbitrum' | 'base' | 'optimism', string> = {
-  arbitrum: '0xa4b1',
-  base: '0x2105',
-  optimism: '0xa',
-};
+const CHAIN_ID_HEX_MAP: Record<SupportedArbChain, string> = Object.fromEntries(
+  ALL_SUPPORTED_ARB_CHAINS.map((c) => [c, CHAIN_LAYER_META[c].chainIdHex])
+) as Record<SupportedArbChain, string>;
 
 const ercProbeIface = new ethers.Interface([
   'function symbol() view returns (string)',
@@ -4489,6 +4644,13 @@ export const EXTRA_LLAMA_TOKEN_KEYS: Record<string, { key: string; symbol: strin
   AERO: { key: 'base:0x940181a94A35A4569E4529A3CDfB74e38FD98631', symbol: 'AERO' },
   OP: { key: 'optimism:0x4200000000000000000000000000000000000042', symbol: 'OP' },
   SUSDE: { key: 'coingecko:ethena-staked-usde', symbol: 'sUSDe' },
+  POL: { key: 'coingecko:matic-network', symbol: 'POL' },
+  BNB: { key: 'coingecko:binancecoin', symbol: 'BNB' },
+  AVAX: { key: 'coingecko:avalanche-2', symbol: 'AVAX' },
+  APE: { key: 'coingecko:apecoin', symbol: 'APE' },
+  SCR: { key: 'coingecko:scroll', symbol: 'SCR' },
+  JOE: { key: 'coingecko:joe', symbol: 'JOE' },
+  CAKE: { key: 'coingecko:pancakeswap-token', symbol: 'CAKE' },
 };
 
 export function buildLlamaPriceQueryKeys(): {
@@ -4534,11 +4696,7 @@ export async function getLiveTokenPriceFeed(forceRefresh = false): Promise<LiveT
   inFlightPriceFeedPromise = (async () => {
     const updatedAt = Date.now();
     const prices: Record<string, LiveTokenPriceEntry> = {};
-    const byChain: Record<SupportedArbChain, Record<string, LiveTokenPriceEntry>> = {
-      arbitrum: {},
-      base: {},
-      optimism: {},
-    };
+    const byChain: Record<SupportedArbChain, Record<string, LiveTokenPriceEntry>> = initChainRecord<Record<string, LiveTokenPriceEntry>>(() => ({}));
     const sourcesUsed = new Set<string>();
 
     const upsertGlobal = (sym: string, entry: LiveTokenPriceEntry, prefer = false) => {
@@ -4689,22 +4847,27 @@ function getLiveTokenUsdPrice(symbol: string, chain: SupportedArbChain = 'arbitr
     ...preferredPools,
     ...SUPPORTED_SCAN_CHAINS.flatMap((c) => (c === chain ? [] : liveAgent.poolsByChain[c] || [])),
   ];
-  const ethPool = allPools.find((p) => p.pair === 'WETH/USDC');
+  const ethPool = allPools.find((p) => p.pair === 'WETH/USDC' || p.pair === 'WETH/USDT');
   const cachedChainPrice = cachedPriceFeed?.byChain?.[chain]?.[sym]?.priceUsd;
   if (typeof cachedChainPrice === 'number' && cachedChainPrice > 0) return cachedChainPrice;
   const cachedGlobalPrice = cachedPriceFeed?.prices?.[sym]?.priceUsd;
   if (typeof cachedGlobalPrice === 'number' && cachedGlobalPrice > 0) return cachedGlobalPrice;
 
-  if (['USDC', 'USDC.E', 'USDBC', 'USDT', 'DAI', 'FRAX', 'USDE'].includes(sym)) return 1.0;
+  if (['USDC', 'USDC.E', 'USDBC', 'USDT', 'DAI', 'FRAX', 'USDE', 'APEUSD'].includes(sym)) return 1.0;
   const ethUsd = ethPool?.priceUsd || cachedPriceFeed?.ethUsd || null;
-  if (sym === 'ETH' || sym === 'WETH') return ethUsd;
+  if (sym === 'ETH' || sym === 'WETH' || sym === 'APEETH') return ethUsd;
+  if (sym === 'WMATIC') return cachedPriceFeed?.prices?.POL?.priceUsd ?? cachedPriceFeed?.prices?.WMATIC?.priceUsd ?? null;
+  if (sym === 'WBNB') return cachedPriceFeed?.prices?.BNB?.priceUsd ?? cachedPriceFeed?.prices?.WBNB?.priceUsd ?? null;
+  if (sym === 'WAVAX') return cachedPriceFeed?.prices?.AVAX?.priceUsd ?? cachedPriceFeed?.prices?.WAVAX?.priceUsd ?? null;
+  if (sym === 'WAPE') return cachedPriceFeed?.prices?.APE?.priceUsd ?? cachedPriceFeed?.prices?.WAPE?.priceUsd ?? null;
+  if (sym === 'BTCB' || sym === 'BTC.B') return cachedPriceFeed?.prices?.WBTC?.priceUsd ?? cachedPriceFeed?.prices?.BTC?.priceUsd ?? null;
   const directPool = allPools.find((p) => p.pair.toUpperCase().startsWith(`${sym}/`));
   if (directPool && directPool.priceUsd > 0) return directPool.priceUsd;
   return null;
 }
 
 async function resolveVerifiedTokenList(
-  chain: 'arbitrum' | 'base' | 'optimism',
+  chain: SupportedArbChain,
   extraSpecsInput: Array<string | ExtraTokenSpec> = []
 ): Promise<ArbitrumTokenInfo[]> {
   const baseList = [...getChainTokens(chain)];
@@ -4827,7 +4990,7 @@ async function resolveVerifiedTokenList(
  * Helper: Query ETH + all verified chain ERC-20 & probed multi-ERC token balances for an address in one RPC batch.
  */
 async function queryAllChainBalances(
-  chain: 'arbitrum' | 'base' | 'optimism',
+  chain: SupportedArbChain,
   targetAddress: string,
   extraSpecs: Array<string | ExtraTokenSpec> = []
 ) {
@@ -4993,11 +5156,13 @@ async function queryAllChainBalances(
     });
   });
 
+  const chainMeta = CHAIN_LAYER_META[chain];
   const ethFormatted = ethers.formatEther(ethWei);
-  const ethPrice = getLiveTokenUsdPrice('ETH', chain);
-  const ethUsd = ethPrice !== null ? Number((Number(ethFormatted) * ethPrice).toFixed(2)) : null;
+  const nativePrice = getLiveTokenUsdPrice(chainMeta.nativeSymbol, chain) ?? getLiveTokenUsdPrice(chainMeta.wrappedNativeSymbol, chain);
+  const ethUsd = nativePrice !== null ? Number((Number(ethFormatted) * nativePrice).toFixed(2)) : null;
 
   return {
+    nativeSymbol: chainMeta.nativeSymbol,
     ethWei,
     ethFormatted,
     ethUsd,
@@ -5011,9 +5176,7 @@ async function queryAllChainBalances(
  */
 flashArbRouter.get('/wallet-balances', async (req: Request, res: Response) => {
   try {
-    const chainRaw = String(req.query.chain || 'arbitrum').toLowerCase();
-    const chain: 'arbitrum' | 'base' | 'optimism' =
-      chainRaw === 'base' || chainRaw === 'optimism' ? chainRaw : 'arbitrum';
+    const chain: SupportedArbChain = parseSupportedChain(req.query.chain);
     const rpcInfo = RPC_ENDPOINTS[chain] || RPC_ENDPOINTS.arbitrum;
     const address = String(req.query.address || profitWalletEnv()).trim();
     if (!address || !/^0x[a-fA-F0-9]{40}$/i.test(address)) {
@@ -5094,13 +5257,39 @@ flashArbRouter.get('/wallet-balances', async (req: Request, res: Response) => {
  */
 flashArbRouter.get('/contract-balances', async (req: Request, res: Response) => {
   try {
-    const chainRaw = String(req.query.chain || 'arbitrum').toLowerCase();
-    const chain: 'arbitrum' | 'base' | 'optimism' =
-      chainRaw === 'base' || chainRaw === 'optimism' ? chainRaw : 'arbitrum';
+    const chain: SupportedArbChain = parseSupportedChain(req.query.chain);
     const rpcInfo = RPC_ENDPOINTS[chain] || RPC_ENDPOINTS.arbitrum;
-    const contractAddr = String(req.query.address || DEPLOYED_CONTRACTS[chain] || '').trim();
-    if (!/^0x[a-fA-F0-9]{40}$/.test(contractAddr)) {
-      return res.status(400).json({ success: false, error: 'Invalid contract address' });
+    const rawQueryAddr = typeof req.query.address === 'string' ? req.query.address.trim() : '';
+    const resolved = resolveAndValidateSweepContracts({
+      chain,
+      requestedContract: rawQueryAddr,
+      deployedContract: DEPLOYED_CONTRACTS[chain],
+      hasWalletSweepTarget: true,
+    });
+    if (!resolved.ok) {
+      return res.status(400).json({ success: false, error: resolved.error || 'Invalid contract address' });
+    }
+    const contractAddr = resolved.primaryContract;
+    if (!contractAddr) {
+      return res.json({
+        success: true,
+        chain,
+        chainName: rpcInfo.name,
+        contractAddress: null,
+        isDeployed: false,
+        owner: null,
+        supportsOptimizedArbitrage: false,
+        supportsRescueTokensTo: false,
+        supportsRescueTokens: false,
+        supportsDirectSweep: false,
+        eth: '0',
+        ethWei: '0',
+        ethUsd: 0,
+        tokens: [],
+        nonZeroCount: 0,
+        explorerUrl: rpcInfo.explorer,
+        timestamp: Date.now(),
+      });
     }
     const extraTokens = normalizeExtraTokenSpecs(
       typeof req.query.extraTokens === 'string' ? req.query.extraTokens.split(',') : []
@@ -5162,18 +5351,11 @@ flashArbRouter.get('/contract-balances', async (req: Request, res: Response) => 
  */
 flashArbRouter.get('/holdings-overview', async (req: Request, res: Response) => {
   try {
-    const chainRaw = String(req.query.chain || 'arbitrum').toLowerCase();
-    const chain: 'arbitrum' | 'base' | 'optimism' =
-      chainRaw === 'base' || chainRaw === 'optimism' ? chainRaw : 'arbitrum';
+    const chain: SupportedArbChain = parseSupportedChain(req.query.chain);
     const rpcInfo = RPC_ENDPOINTS[chain] || RPC_ENDPOINTS.arbitrum;
 
     const rawContracts = typeof req.query.contracts === 'string' ? req.query.contracts.split(',') : [];
-    const defaultExtras =
-      chain === 'arbitrum'
-        ? ['0xeee31ff9e69904b43c124095b6f33aa61505bcc2', '0x19359c6C418669FCfC46196970814353b8766BE0']
-        : chain === 'base'
-          ? ['0x37440674a814f24d9C6ea0990b272215D40c4512', '0xBBA273E057cDa31bB359d8AA8749256246B6d0cC']
-          : [];
+    const defaultExtras = KNOWN_FLASH_ARB_CONTRACTS[chain] || [];
     const contractAddrs = normalizeExtraAddresses([
       DEPLOYED_CONTRACTS[chain],
       ...rawContracts,
@@ -5192,62 +5374,61 @@ flashArbRouter.get('/holdings-overview', async (req: Request, res: Response) => 
       ? new ethers.Wallet(signerKey.startsWith('0x') ? signerKey : `0x${signerKey}`).address
       : null;
 
-    const contracts = await Promise.all(
-      contractAddrs.map(async (addr) => {
-        const [balInfo, codeResp, ownerResp] = await Promise.all([
-          queryAllChainBalances(chain, addr, extraTokens),
-          fetchRpcSingleWithFailover(chain, 'eth_getCode', [addr, 'latest'], true),
-          fetchRpcSingleWithFailover(chain, 'eth_call', [{ to: addr, data: '0x8da5cb5b' }, 'latest'], true).catch(() => ({ result: null })),
-        ]);
-        const code = String(codeResp.result || '0x').toLowerCase();
-        const isDeployed = code !== '0x' && code.length > 2;
-        const contractOwner =
-          typeof ownerResp.result === 'string' && ownerResp.result.length >= 66
-            ? ethers.getAddress(`0x${ownerResp.result.slice(-40)}`)
-            : null;
-        const ownerMatchesSigner = Boolean(
-          signerAddress && contractOwner && contractOwner.toLowerCase() === signerAddress.toLowerCase()
-        );
-        const ownerMatchesConnectedWallet = Boolean(
-          /^0x[a-fA-F0-9]{40}$/.test(connectedWallet) &&
-            contractOwner &&
-            contractOwner.toLowerCase() === connectedWallet.toLowerCase()
-        );
-        const nonZeroTokens = balInfo.tokens.filter((t) => t.hasBalance);
-        const compatibleNonZeroTokens = nonZeroTokens.filter((t) => t.sweepCompatible);
+    const contracts: any[] = [];
+    for (const addr of contractAddrs) {
+      const [balInfo, codeResp, ownerResp] = await Promise.all([
+        queryAllChainBalances(chain, addr, extraTokens),
+        fetchRpcSingleWithFailover(chain, 'eth_getCode', [addr, 'latest'], true),
+        fetchRpcSingleWithFailover(chain, 'eth_call', [{ to: addr, data: '0x8da5cb5b' }, 'latest'], true).catch(() => ({ result: null })),
+      ]);
+      const code = String(codeResp.result || '0x').toLowerCase();
+      const isDeployed = code !== '0x' && code.length > 2;
+      const contractOwner =
+        typeof ownerResp.result === 'string' && ownerResp.result.length >= 66
+          ? ethers.getAddress(`0x${ownerResp.result.slice(-40)}`)
+          : null;
+      const ownerMatchesSigner = Boolean(
+        signerAddress && contractOwner && contractOwner.toLowerCase() === signerAddress.toLowerCase()
+      );
+      const ownerMatchesConnectedWallet = Boolean(
+        /^0x[a-fA-F0-9]{40}$/.test(connectedWallet) &&
+          contractOwner &&
+          contractOwner.toLowerCase() === connectedWallet.toLowerCase()
+      );
+      const nonZeroTokens = balInfo.tokens.filter((t) => t.hasBalance);
+      const compatibleNonZeroTokens = nonZeroTokens.filter((t) => t.sweepCompatible);
 
-        return {
-          address: addr,
-          isPrimary: addr.toLowerCase() === (DEPLOYED_CONTRACTS[chain] || '').toLowerCase(),
-          isDeployed,
-          owner: contractOwner,
-          ownerMatchesSigner,
-          ownerMatchesConnectedWallet,
-          accessibleForSweep: isDeployed && (ownerMatchesSigner || ownerMatchesConnectedWallet),
-          supportsOptimizedArbitrage: code.includes('23b3aa6b'),
-          supportsRescueTokensTo: code.includes('a7070692'),
-          supportsRescueTokens: code.includes('ae3bf8'),
-          supportsDirectSweep: code.includes('7804d9ac'),
-          eth: balInfo.ethFormatted,
-          ethWei: balInfo.ethWei.toString(),
-          ethUsd: balInfo.ethUsd,
-          nonZeroTokens: nonZeroTokens.map((t) => ({
-            symbol: t.symbol,
-            address: t.address,
-            decimals: t.decimals,
-            ercStandard: t.ercStandard,
-            tokenId: t.tokenId,
-            balance: t.formatted,
-            arbCompatible: t.arbCompatible,
-            sweepCompatible: t.sweepCompatible,
-            compatibilityNote: t.compatibilityNote,
-            usdValue: t.usdValue,
-          })),
-          compatibleNonZeroCount: (balInfo.ethWei > 0n ? 1 : 0) + compatibleNonZeroTokens.length,
-          explorerUrl: `${rpcInfo.explorer}/address/${addr}`,
-        };
-      })
-    );
+      contracts.push({
+        address: addr,
+        isPrimary: addr.toLowerCase() === (DEPLOYED_CONTRACTS[chain] || '').toLowerCase(),
+        isDeployed,
+        owner: contractOwner,
+        ownerMatchesSigner,
+        ownerMatchesConnectedWallet,
+        accessibleForSweep: isDeployed && (ownerMatchesSigner || ownerMatchesConnectedWallet),
+        supportsOptimizedArbitrage: code.includes('23b3aa6b'),
+        supportsRescueTokensTo: code.includes('a7070692'),
+        supportsRescueTokens: code.includes('ae3bf8'),
+        supportsDirectSweep: code.includes('7804d9ac'),
+        eth: balInfo.ethFormatted,
+        ethWei: balInfo.ethWei.toString(),
+        ethUsd: balInfo.ethUsd,
+        nonZeroTokens: nonZeroTokens.map((t) => ({
+          symbol: t.symbol,
+          address: t.address,
+          decimals: t.decimals,
+          ercStandard: t.ercStandard,
+          tokenId: t.tokenId,
+          balance: t.formatted,
+          arbCompatible: t.arbCompatible,
+          sweepCompatible: t.sweepCompatible,
+          compatibilityNote: t.compatibilityNote,
+          usdValue: t.usdValue,
+        })),
+        compatibleNonZeroCount: (balInfo.ethWei > 0n ? 1 : 0) + compatibleNonZeroTokens.length,
+        explorerUrl: `${rpcInfo.explorer}/address/${addr}`,
+      });
+    }
 
     const walletInspect = async (addr: string) => {
       if (!/^0x[a-fA-F0-9]{40}$/.test(addr)) return null;
@@ -5395,12 +5576,9 @@ flashArbRouter.get('/holdings-overview', async (req: Request, res: Response) => 
  */
 flashArbRouter.post('/sweep-all', async (req: Request, res: Response) => {
   try {
-    const chainRaw = String(req.body?.chain || 'arbitrum').toLowerCase();
-    const chain: 'arbitrum' | 'base' | 'optimism' =
-      chainRaw === 'base' || chainRaw === 'optimism' ? chainRaw : 'arbitrum';
+    const chain: SupportedArbChain = parseSupportedChain(req.body?.chain);
     const rpcInfo = RPC_ENDPOINTS[chain] || RPC_ENDPOINTS.arbitrum;
-    const primaryContract = String(req.body?.contractAddress || DEPLOYED_CONTRACTS[chain] || '').trim();
-    const recipient = String(req.body?.recipient || profitWalletEnv() || '').trim();
+    const recipient = normalizeValidContractAddress(req.body?.recipient || profitWalletEnv() || '');
     const extraContracts = Array.isArray(req.body?.extraContracts) ? req.body.extraContracts : [];
     const extraTokenSpecs = normalizeExtraTokenSpecs(req.body?.extraTokenAddresses);
     const includeGasWalletTokens = Boolean(req.body?.includeGasWalletTokens);
@@ -5418,25 +5596,39 @@ flashArbRouter.post('/sweep-all', async (req: Request, res: Response) => {
       Boolean(req.body?.skipContractEth) ||
       (tokenSymbolFilter !== null && !tokenSymbolFilter.has('ETH'));
 
-    if (!/^0x[a-fA-F0-9]{40}$/.test(primaryContract)) {
-      return res.status(400).json({ success: false, error: 'Valid contractAddress is required.' });
-    }
-    if (!/^0x[a-fA-F0-9]{40}$/.test(recipient) || recipient === '0x0000000000000000000000000000000000000000') {
+    if (!recipient) {
       return res.status(400).json({ success: false, error: 'Valid non-zero Profit Vault recipient address (0x...) is required.' });
     }
 
     const signerKey = (process.env.FLASH_ARB_SIGNER_KEY || '').trim();
     const cleanKey = signerKey ? (signerKey.startsWith('0x') ? signerKey : `0x${signerKey}`) : '';
     const signerAddress = cleanKey ? new ethers.Wallet(cleanKey).address : null;
-    const validConnectedAddr = /^0x[a-fA-F0-9]{40}$/.test(connectedWalletAddress)
-      ? ethers.getAddress(connectedWalletAddress)
-      : null;
+    const validConnectedAddr = normalizeValidContractAddress(connectedWalletAddress);
 
     if (!signerAddress && !validConnectedAddr) {
       return res.status(409).json({
         success: false,
         requiresWallet: true,
         error: 'No server signer key configured. Configure FLASH_ARB_SIGNER_KEY in Signer Key Config.',
+      });
+    }
+
+    const hasWalletSweepTarget =
+      (includeGasWalletTokens && Boolean(signerAddress)) ||
+      (includeGasWalletEthSurplus && Boolean(signerAddress && cleanKey)) ||
+      (includeConnectedWalletTokens && Boolean(validConnectedAddr));
+
+    const contractResolution = resolveAndValidateSweepContracts({
+      chain,
+      requestedContract: req.body?.contractAddress,
+      deployedContract: DEPLOYED_CONTRACTS[chain],
+      extraContracts,
+      hasWalletSweepTarget,
+    });
+    if (!contractResolution.ok) {
+      return res.status(400).json({
+        success: false,
+        error: contractResolution.error || 'Valid contractAddress is required.',
       });
     }
 
@@ -5486,13 +5678,10 @@ flashArbRouter.post('/sweep-all', async (req: Request, res: Response) => {
       return { txHash: sentHash, gasUsed: receipt.gasUsed.toString() };
     };
 
-    // Deduplicate contract addresses to inspect
+    // Deduplicate validated contract addresses to inspect
     const contractSet = new Map<string, string>();
-    for (const addr of [primaryContract, ...extraContracts]) {
-      const trimmed = String(addr || '').trim();
-      if (/^0x[a-fA-F0-9]{40}$/.test(trimmed)) {
-        contractSet.set(trimmed.toLowerCase(), ethers.getAddress(trimmed));
-      }
+    for (const addr of contractResolution.contracts) {
+      contractSet.set(addr.toLowerCase(), addr);
     }
 
     const sweptAssets: Array<{
@@ -5505,7 +5694,7 @@ flashArbRouter.post('/sweep-all', async (req: Request, res: Response) => {
       recipient: string;
     }> = [];
     const pendingWalletTxs: Array<{
-      chain: 'arbitrum' | 'base' | 'optimism';
+      chain: SupportedArbChain;
       chainIdHex: string;
       to: string;
       data: string;
@@ -5998,3 +6187,486 @@ flashArbRouter.post('/sweep-all', async (req: Request, res: Response) => {
     return res.status(500).json({ success: false, error: err.message });
   }
 });
+
+// ============================================================
+// L4 CROSS-LAYER SPATIAL ARBITRAGE & LIVE L1-L4 VERIFIER
+// ============================================================
+
+const CANONICAL_L4_ASSET_MAP: Record<string, string> = {
+  WETH: 'ETH',
+  ETH: 'ETH',
+  APEETH: 'ETH',
+  WBTC: 'BTC',
+  BTCB: 'BTC',
+  'BTC.B': 'BTC',
+  CBBTC: 'BTC',
+  USDC: 'USDC',
+  'USDC.E': 'USDC',
+  USDBC: 'USDC',
+  USDT: 'USDT',
+  DAI: 'DAI',
+  LINK: 'LINK',
+  UNI: 'UNI',
+  AAVE: 'AAVE',
+  EZETH: 'ezETH',
+  WSTETH: 'wstETH',
+  ARB: 'ARB',
+  OP: 'OP',
+  WMATIC: 'POL',
+  POL: 'POL',
+  WBNB: 'BNB',
+  BNB: 'BNB',
+  WAVAX: 'AVAX',
+  AVAX: 'AVAX',
+  WAPE: 'APE',
+  APE: 'APE',
+};
+
+function computeL4CrossLayerOpportunities(staleThresholdMs = 90000) {
+  const now = Date.now();
+  const byCanonicalAsset = new Map<
+    string,
+    Array<{
+      chain: SupportedArbChain;
+      layer: BlockchainLayer;
+      chainName: string;
+      dex: string;
+      pair: string;
+      poolAddress: string;
+      priceUsd: number;
+      feeTierPercent: number;
+      depthUsdApprox: number;
+      blockNumber: number;
+      ageMs: number;
+    }>
+  >();
+
+  for (const chain of SUPPORTED_SCAN_CHAINS) {
+    const meta = CHAIN_LAYER_META[chain];
+    const pools = liveAgent.poolsByChain[chain] || [];
+    for (const pool of pools) {
+      const ageMs = now - (pool.lastUpdated || 0);
+      if (ageMs > staleThresholdMs) continue;
+      const baseSym = (pool.pair.split('/')[0] || '').toUpperCase();
+      const canonical = CANONICAL_L4_ASSET_MAP[baseSym];
+      if (!canonical) continue;
+      if (!['ETH', 'BTC', 'USDC', 'USDT', 'DAI', 'LINK', 'UNI', 'AAVE', 'ezETH', 'wstETH'].includes(canonical)) {
+        continue;
+      }
+      if (!(pool.priceUsd > 0)) continue;
+      // Parse rough measured depthUsd from depthSummary ('$12.4M' / '$250K')
+      let depthUsdApprox = 0;
+      const m = pool.depthSummary.match(/\$([\d.]+)([MK])?/i);
+      if (m) {
+        const val = parseFloat(m[1]);
+        const mult = m[2]?.toUpperCase() === 'M' ? 1e6 : m[2]?.toUpperCase() === 'K' ? 1e3 : 1;
+        depthUsdApprox = val * mult;
+      }
+      if (depthUsdApprox < 10000) continue;
+
+      const list = byCanonicalAsset.get(canonical) || [];
+      list.push({
+        chain,
+        layer: meta.layer,
+        chainName: meta.shortName,
+        dex: pool.dex,
+        pair: pool.pair,
+        poolAddress: pool.poolAddress,
+        priceUsd: pool.priceUsd,
+        feeTierPercent: pool.feeTierPercent,
+        depthUsdApprox,
+        blockNumber: pool.blockNumber,
+        ageMs,
+      });
+      byCanonicalAsset.set(canonical, list);
+    }
+  }
+
+  const opportunities: Array<{
+    id: string;
+    asset: string;
+    buyChain: SupportedArbChain;
+    buyLayer: BlockchainLayer;
+    buyChainName: string;
+    buyDex: string;
+    buyPair: string;
+    buyPool: string;
+    buyPriceUsd: number;
+    sellChain: SupportedArbChain;
+    sellLayer: BlockchainLayer;
+    sellChainName: string;
+    sellDex: string;
+    sellPair: string;
+    sellPool: string;
+    sellPriceUsd: number;
+    layerCorridor: string;
+    grossSpreadBps: number;
+    dexAndBridgeCostBps: number;
+    netSpreadBps: number;
+    recommendedClipUsd: number;
+    estNetProfitUsd: number;
+    isProfitable: boolean;
+    executionMode: 'CROSS_LAYER_SOLVER_OR_PREFUNDED_INVENTORY';
+    note: string;
+  }> = [];
+
+  for (const [asset, venues] of byCanonicalAsset.entries()) {
+    if (venues.length < 2) continue;
+    // Best single venue per chain to avoid noisy intra-chain duplicates in L4 cross-chain view
+    const sortedAsc = [...venues].sort((a, b) => a.priceUsd - b.priceUsd);
+    const low = sortedAsc[0];
+    const highCandidates = sortedAsc.filter((v) => v.chain !== low.chain);
+    if (highCandidates.length === 0) continue;
+    const high = highCandidates[highCandidates.length - 1];
+    if (high.priceUsd <= low.priceUsd) continue;
+
+    const grossSpreadBps = Number((((high.priceUsd - low.priceUsd) / low.priceUsd) * 10000).toFixed(2));
+    // Exclude extreme >1500 bps mis-pegged bridged assets unless explicitly flagged
+    if (grossSpreadBps > 2000) continue;
+
+    const dexFeeBps = (low.feeTierPercent + high.feeTierPercent) * 100;
+    const estBridgeFeeBps = low.layer === 'L1' || high.layer === 'L1' ? 8 : 4;
+    const dexAndBridgeCostBps = Number((dexFeeBps + estBridgeFeeBps).toFixed(2));
+    const netSpreadBps = Number((grossSpreadBps - dexAndBridgeCostBps).toFixed(2));
+    const depthBound = Math.min(low.depthUsdApprox, high.depthUsdApprox) * 0.02;
+    const recommendedClipUsd = Number(Math.max(1000, Math.min(50000, depthBound)).toFixed(0));
+    const l1GasUsd = low.chain === 'ethereum' || high.chain === 'ethereum' ? 6.5 : 0.25;
+    const estNetProfitUsd = Number(((recommendedClipUsd * (netSpreadBps / 10000)) - l1GasUsd).toFixed(2));
+
+    opportunities.push({
+      id: `l4-${asset.toLowerCase()}-${low.chain}-${high.chain}`,
+      asset,
+      buyChain: low.chain,
+      buyLayer: low.layer,
+      buyChainName: low.chainName,
+      buyDex: low.dex,
+      buyPair: low.pair,
+      buyPool: low.poolAddress,
+      buyPriceUsd: low.priceUsd,
+      sellChain: high.chain,
+      sellLayer: high.layer,
+      sellChainName: high.chainName,
+      sellDex: high.dex,
+      sellPair: high.pair,
+      sellPool: high.poolAddress,
+      sellPriceUsd: high.priceUsd,
+      layerCorridor: `${low.layer} (${low.chainName}) -> ${high.layer} (${high.chainName})`,
+      grossSpreadBps,
+      dexAndBridgeCostBps,
+      netSpreadBps,
+      recommendedClipUsd,
+      estNetProfitUsd,
+      isProfitable: estNetProfitUsd > 0 && netSpreadBps > 0,
+      executionMode: 'CROSS_LAYER_SOLVER_OR_PREFUNDED_INVENTORY',
+      note: 'Requires asynchronous cross-domain bridge / solver settlement or pre-funded L4 inventory (non-atomic).',
+    });
+  }
+
+  opportunities.sort((a, b) => b.estNetProfitUsd - a.estNetProfitUsd);
+  return opportunities;
+}
+
+/**
+ * GET /api/flash-arb/cross-layer-opportunities
+ * L4 Cross-Layer Spatial Arbitrage & Intent Solver Corridor Scanner across all live L1/L2/L3 pools
+ */
+flashArbRouter.get('/cross-layer-opportunities', (_req: Request, res: Response) => {
+  const opportunities = computeL4CrossLayerOpportunities();
+  const activeChains = SUPPORTED_SCAN_CHAINS.filter((c) => (liveAgent.poolsByChain[c] || []).length > 0);
+  return res.json({
+    success: true,
+    layer: 'L4',
+    name: 'Cross-Layer Meta-Execution & Spatial Arbitrage',
+    activeChainsCount: activeChains.length,
+    activeChains,
+    totalCorridorsEvaluated: opportunities.length,
+    profitableCorridorsCount: opportunities.filter((o) => o.isProfitable).length,
+    opportunities,
+    timestamp: Date.now(),
+  });
+});
+
+// Cancun EIP-1153 runtime probe initcode: PUSH1 0x01 PUSH0 TSTORE PUSH0 TLOAD PUSH0 MSTORE PUSH1 0x20 PUSH0 RETURN
+// Returns 0x...01 (32-byte value 1) via eth_call ONLY when EVM supports PUSH0 + TSTORE + TLOAD.
+const CANCUN_TSTORE_PROBE_INITCODE = '0x60015f5d5f5c5f5260205ff3';
+const CANCUN_EXPECTED_RET = '0x0000000000000000000000000000000000000000000000000000000000000001';
+
+/**
+ * POST /api/flash-arb/verify-layers
+ * Live RPC verification of L1, L2, L3 blockchains, Cancun EIP-1153 execution, Vault/Aave/Router deployments,
+ * FlashArbOptimized functions & routeTypes 1..4 (UniV3->V2, V2->UniV3, UniV3->UniV3, V2->V2), plus L4 spatial corridors.
+ */
+flashArbRouter.post('/verify-layers', async (req: Request, res: Response) => {
+  try {
+    const requestedLayer = String(req.body?.layer || req.query?.layer || 'ALL').toUpperCase() as AllLayerFilter;
+    const requestedChainRaw = String(req.body?.chain || '').toLowerCase();
+
+    let chainsToVerify: SupportedArbChain[] = SUPPORTED_SCAN_CHAINS;
+    if (isSupportedArbChain(requestedChainRaw)) {
+      chainsToVerify = [requestedChainRaw];
+    } else if (requestedLayer === 'L1' || requestedLayer === 'L2' || requestedLayer === 'L3') {
+      chainsToVerify = SUPPORTED_SCAN_CHAINS.filter((c) => CHAIN_LAYER_META[c].layer === requestedLayer);
+    }
+
+    const verifySingleChain = async (chain: SupportedArbChain) => {
+      const meta = CHAIN_LAYER_META[chain];
+      const rpcInfo = RPC_ENDPOINTS[chain];
+      const routers = getEffectiveChainDexRouters(chain);
+      const contractAddr = DEPLOYED_CONTRACTS[chain] || '';
+      const hasContract = Boolean(contractAddr && /^0x[a-fA-F0-9]{40}$/.test(contractAddr));
+      const hasVaultAddr = meta.balancerVault.toLowerCase() !== ethers.ZeroAddress.toLowerCase();
+      const hasAaveAddr = meta.aavePool.toLowerCase() !== ethers.ZeroAddress.toLowerCase();
+
+      const routerEntries = Object.entries(routers);
+      const batchCalls: any[] = [
+        { jsonrpc: '2.0', method: 'eth_blockNumber', params: [], id: 1 },
+        { jsonrpc: '2.0', method: 'eth_gasPrice', params: [], id: 2 },
+        { jsonrpc: '2.0', method: 'eth_chainId', params: [], id: 3 },
+        { jsonrpc: '2.0', method: 'eth_call', params: [{ data: CANCUN_TSTORE_PROBE_INITCODE }, 'latest'], id: 4 },
+        { jsonrpc: '2.0', method: 'eth_getCode', params: [MULTICALL3_ADDRESS, 'latest'], id: 5 },
+        ...(hasVaultAddr
+          ? [{ jsonrpc: '2.0', method: 'eth_getCode', params: [meta.balancerVault, 'latest'], id: 6 }]
+          : []),
+        ...(hasAaveAddr
+          ? [{ jsonrpc: '2.0', method: 'eth_getCode', params: [meta.aavePool, 'latest'], id: 7 }]
+          : []),
+        ...(hasContract
+          ? [
+              { jsonrpc: '2.0', method: 'eth_getCode', params: [contractAddr, 'latest'], id: 8 },
+              { jsonrpc: '2.0', method: 'eth_call', params: [{ to: contractAddr, data: '0x8da5cb5b' }, 'latest'], id: 9 },
+              { jsonrpc: '2.0', method: 'eth_call', params: [{ to: contractAddr, data: '0x459a01ae' }, 'latest'], id: 10 },
+            ]
+          : []),
+      ];
+
+      routerEntries.forEach(([_, spec], idx) => {
+        if (spec.router) {
+          batchCalls.push({
+            jsonrpc: '2.0',
+            method: 'eth_getCode',
+            params: [spec.router, 'latest'],
+            id: 100 + idx,
+          });
+        }
+      });
+
+      const started = Date.now();
+      let blockNumber = 0;
+      let chainIdOnRpc = 0;
+      let gasPriceGwei = 0;
+      let cancunVerified = false;
+      let multicall3Verified = false;
+      let balancerVaultDeployed = false;
+      let aavePoolDeployed = false;
+      let contractDeployed = false;
+      let contractOwner: string | null = null;
+      let routerCaps: RouterCapabilityOptions = {};
+      let contractFunctions = {
+        executeOptimizedArbitrage: false,
+        executeDirectFlashArb: false,
+        rescueTokens: false,
+        rescueTokensTo: false,
+        owner: false,
+      };
+      let rpcUsed = rpcInfo.rpc;
+      let rpcError: string | null = null;
+      const routerBytecodeOk = new Map<number, boolean>();
+
+      try {
+        const [{ results, rpcUrl }, infra] = await Promise.all([
+          fetchRpcBatchWithFailover(chain, batchCalls),
+          liveAgent.getChainInfra(chain).catch(() => null),
+        ]);
+        rpcUsed = rpcUrl;
+        const byId = new Map<number, any>();
+        for (const r of results) {
+          if (r && r.id !== undefined) byId.set(Number(r.id), r);
+        }
+        const blkRes = byId.get(1)?.result;
+        const gpRes = byId.get(2)?.result;
+        const cidRes = byId.get(3)?.result;
+        const cancunRes = byId.get(4)?.result;
+        const mcRes = byId.get(5)?.result;
+        const balRes = byId.get(6)?.result;
+        const aaveRes = byId.get(7)?.result;
+        const ctrCodeRes = byId.get(8)?.result;
+        const ownerRes = byId.get(9)?.result;
+        const capsRes = byId.get(10)?.result;
+
+        blockNumber = typeof blkRes === 'string' ? parseInt(blkRes, 16) : 0;
+        chainIdOnRpc = typeof cidRes === 'string' ? parseInt(cidRes, 16) : 0;
+        gasPriceGwei = typeof gpRes === 'string' ? Number((Number(BigInt(gpRes)) / 1e9).toFixed(4)) : 0;
+        cancunVerified = typeof cancunRes === 'string' && cancunRes.toLowerCase() === CANCUN_EXPECTED_RET;
+        multicall3Verified = typeof mcRes === 'string' && mcRes.length > 2;
+        balancerVaultDeployed = hasVaultAddr && typeof balRes === 'string' && balRes.length > 2;
+        aavePoolDeployed = hasAaveAddr && typeof aaveRes === 'string' && aaveRes.length > 2;
+
+        if (typeof ctrCodeRes === 'string' && ctrCodeRes.length > 2) {
+          const lower = ctrCodeRes.toLowerCase();
+          contractDeployed = true;
+          contractFunctions = {
+            executeOptimizedArbitrage: lower.includes('23b3aa6b'),
+            executeDirectFlashArb: lower.includes('7804d9ac'),
+            rescueTokens: lower.includes('00ae3bf8') || lower.includes('ae3bf8'),
+            rescueTokensTo: lower.includes('a7070692'),
+            owner: lower.includes('8da5cb5b'),
+          };
+        }
+        if (typeof ownerRes === 'string' && ownerRes.length >= 66) {
+          contractOwner = ethers.getAddress(`0x${ownerRes.slice(-40)}`);
+        }
+        if (typeof capsRes === 'string' && capsRes.length >= 66) {
+          const mask = BigInt(capsRes.slice(0, 66));
+          routerCaps = {
+            supportsAlgebra: (mask & 2n) !== 0n,
+            supportsCamelotV2: (mask & 4n) !== 0n,
+          };
+        }
+        if (infra?.camelotV3Adapter) {
+          routerCaps.camelotV3Adapter = infra.camelotV3Adapter;
+        }
+        routerEntries.forEach((_, idx) => {
+          const rCode = byId.get(100 + idx)?.result;
+          routerBytecodeOk.set(idx, typeof rCode === 'string' && rCode.length > 2);
+        });
+
+        const vaultDepthTokens = infra
+          ? Object.values(CHAIN_TOKENS[chain]).filter((t) => (infra.vaultBalances[t.addr.toLowerCase()] || 0n) > 0n).length
+          : 0;
+        const routeReadiness = verifyChainRouteTypesReadiness(
+          chain,
+          chain === 'arbitrum' ? routerCaps : undefined,
+          profitWalletEnv() || contractOwner || '0x000000000000000000000000000000000000dEaD'
+        );
+
+        const verifiedRouters = routerEntries.map(([name, spec], idx) => ({
+          dex: name,
+          routerAddress: spec.router,
+          isV3: spec.isV3,
+          supportedByContract: spec.supported,
+          bytecodeVerifiedOnChain: spec.router ? Boolean(routerBytecodeOk.get(idx)) : false,
+        }));
+
+        const poolsLive = (liveAgent.poolsByChain[chain] || []).length;
+        const oppsLive = (liveAgent.opportunitiesByChain[chain] || []).length;
+
+        return {
+          chain,
+          name: meta.name,
+          layer: meta.layer,
+          chainId: meta.chainId,
+          chainIdVerified: chainIdOnRpc === meta.chainId,
+          nativeSymbol: meta.nativeSymbol,
+          settlementModel: meta.settlementModel,
+          rpcReachable: blockNumber > 0,
+          rpcUsed,
+          latencyMs: Date.now() - started,
+          blockNumber,
+          gasPriceGwei,
+          cancunEip1153Verified: cancunVerified,
+          multicall3Verified,
+          balancerVaultDeployed,
+          balancerVaultFundedTokens: vaultDepthTokens,
+          aavePoolDeployed,
+          contractAddress: hasContract ? contractAddr : null,
+          contractDeployed,
+          contractOwner,
+          contractFunctions,
+          routeReadiness,
+          verifiedRouters,
+          monitoredPoolsCount: poolsLive,
+          evaluatedOpportunitiesCount: oppsLive,
+          rpcError,
+        };
+      } catch (err: any) {
+        rpcError = err?.message || 'RPC verification failed';
+        const routeReadiness = verifyChainRouteTypesReadiness(chain);
+        return {
+          chain,
+          name: meta.name,
+          layer: meta.layer,
+          chainId: meta.chainId,
+          chainIdVerified: false,
+          nativeSymbol: meta.nativeSymbol,
+          settlementModel: meta.settlementModel,
+          rpcReachable: false,
+          rpcUsed,
+          latencyMs: Date.now() - started,
+          blockNumber: 0,
+          gasPriceGwei: 0,
+          cancunEip1153Verified: false,
+          multicall3Verified: false,
+          balancerVaultDeployed: false,
+          balancerVaultFundedTokens: 0,
+          aavePoolDeployed: false,
+          contractAddress: hasContract ? contractAddr : null,
+          contractDeployed: false,
+          contractOwner: null,
+          contractFunctions,
+          routeReadiness,
+          verifiedRouters: [],
+          monitoredPoolsCount: (liveAgent.poolsByChain[chain] || []).length,
+          evaluatedOpportunitiesCount: (liveAgent.opportunitiesByChain[chain] || []).length,
+          rpcError,
+        };
+      }
+    };
+
+    const chainReports = await Promise.all(chainsToVerify.map((c) => verifySingleChain(c)));
+    const l4Opportunities = computeL4CrossLayerOpportunities();
+
+    const layerSummary = {
+      L1: {
+        chains: chainReports.filter((c) => c.layer === 'L1').length,
+        rpcOnline: chainReports.filter((c) => c.layer === 'L1' && c.rpcReachable).length,
+        cancunVerified: chainReports.filter((c) => c.layer === 'L1' && c.cancunEip1153Verified).length,
+      },
+      L2: {
+        chains: chainReports.filter((c) => c.layer === 'L2').length,
+        rpcOnline: chainReports.filter((c) => c.layer === 'L2' && c.rpcReachable).length,
+        cancunVerified: chainReports.filter((c) => c.layer === 'L2' && c.cancunEip1153Verified).length,
+      },
+      L3: {
+        chains: chainReports.filter((c) => c.layer === 'L3').length,
+        rpcOnline: chainReports.filter((c) => c.layer === 'L3' && c.rpcReachable).length,
+        cancunVerified: chainReports.filter((c) => c.layer === 'L3' && c.cancunEip1153Verified).length,
+      },
+      L4: {
+        activeCorridors: l4Opportunities.length,
+        profitableCorridors: l4Opportunities.filter((o) => o.isProfitable).length,
+        topSpreadBps: l4Opportunities[0]?.grossSpreadBps ?? 0,
+      },
+    };
+
+    const routeTypeAggregate = ([1, 2, 3, 4] as const).map((rt) => {
+      const supportingChains = chainReports
+        .filter((c) => c.routeReadiness.routeTypes.find((r) => r.routeType === rt)?.available)
+        .map((c) => c.chain);
+      const sample = chainReports
+        .map((c) => c.routeReadiness.routeTypes.find((r) => r.routeType === rt))
+        .find((r) => r?.available);
+      return {
+        routeType: rt,
+        codeName: sample?.codeName || `TYPE_${rt}`,
+        description: sample?.description || '',
+        supportingChainsCount: supportingChains.length,
+        supportingChains,
+      };
+    });
+
+    return res.json({
+      success: true,
+      requestedLayer,
+      verifiedChainsCount: chainReports.filter((c) => c.rpcReachable).length,
+      totalChainsChecked: chainReports.length,
+      layerSummary,
+      routeTypeAggregate,
+      chains: chainReports,
+      l4SampleOpportunities: l4Opportunities.slice(0, 10),
+      timestamp: Date.now(),
+    });
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err?.message || 'Layer verification failed' });
+  }
+});
+

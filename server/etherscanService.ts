@@ -46,11 +46,39 @@ function isEtherscanRateLimitMessage(msg: string): boolean {
   return /rate limit|max calls per sec|429|too many requests/i.test(msg);
 }
 
-async function etherscanApiOnce(params: Record<string, string | number>, chainId = 1): Promise<any> {
+export function isTransientEtherscanError(err: unknown): boolean {
+  const name = err && typeof err === 'object' && 'name' in err ? String((err as any).name) : '';
+  const msg = err instanceof Error ? err.message : String(err ?? '');
+  if (isEtherscanRateLimitMessage(msg)) return true;
+  if (name === 'AbortError' || name === 'TimeoutError') return true;
+  return /aborted|timed out|timeout|ETIMEDOUT|ECONNRESET|EAI_AGAIN|ECONNREFUSED|UND_ERR_|fetch failed|network|socket hang up|Etherscan HTTP (?:408|429|5\d\d)/i.test(msg);
+}
+
+function normalizeEtherscanError(err: unknown, timeoutMs: number): Error {
+  const name = err && typeof err === 'object' && 'name' in err ? String((err as any).name) : '';
+  const msg = err instanceof Error ? err.message : String(err ?? 'Unknown Etherscan error');
+  if (name === 'AbortError' || name === 'TimeoutError' || /This operation was aborted|The operation was aborted/i.test(msg)) {
+    return new Error(`Etherscan request timed out after ${timeoutMs}ms`);
+  }
+  return err instanceof Error ? err : new Error(msg);
+}
+
+export interface EtherscanApiOptions {
+  timeoutMs?: number;
+  retryDelaysMs?: number[];
+}
+
+async function etherscanApiOnce(
+  params: Record<string, string | number>,
+  chainId = 1,
+  timeoutMsOverride?: number
+): Promise<any> {
   const apikey = getEtherscanKey();
   if (!apikey) throw new Error('ETHERSCAN_API_KEY is not set');
+  const isFullBlock = params.action === 'eth_getBlockByNumber' && String(params.boolean) === 'true';
+  const timeoutMs = timeoutMsOverride ?? (isFullBlock ? 20_000 : 12_000);
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 8000);
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const qs = new URLSearchParams({
       chainid: String(chainId),
@@ -66,21 +94,29 @@ async function etherscanApiOnce(params: Record<string, string | number>, chainId
     if (json?.status === '1' || (json?.jsonrpc && json.result !== undefined && !json.error)) return json.result;
     const errDetail = typeof json?.result === 'string' ? json.result : json?.message || json?.error?.message || 'unknown';
     throw new Error(`Etherscan error: ${errDetail}`);
+  } catch (err) {
+    if (controller.signal.aborted) {
+      throw new Error(`Etherscan request timed out after ${timeoutMs}ms`);
+    }
+    throw normalizeEtherscanError(err, timeoutMs);
   } finally {
     clearTimeout(timeout);
   }
 }
 
-export async function etherscanApi(params: Record<string, string | number>, chainId = 1): Promise<any> {
-  const backoffMs = [1200, 2400, 4000];
+export async function etherscanApi(
+  params: Record<string, string | number>,
+  chainId = 1,
+  options?: EtherscanApiOptions
+): Promise<any> {
+  const backoffMs = options?.retryDelaysMs ?? [1000, 2200, 4000];
   let lastErr: unknown;
   for (let attempt = 0; attempt <= backoffMs.length; attempt++) {
     try {
-      return await enqueueEtherscan(() => etherscanApiOnce(params, chainId));
+      return await enqueueEtherscan(() => etherscanApiOnce(params, chainId, options?.timeoutMs));
     } catch (err) {
       lastErr = err;
-      const msg = err instanceof Error ? err.message : String(err);
-      if (isEtherscanRateLimitMessage(msg) && attempt < backoffMs.length) {
+      if (isTransientEtherscanError(err) && attempt < backoffMs.length) {
         await sleep(backoffMs[attempt]);
         continue;
       }
@@ -106,6 +142,10 @@ export const NOTABLE_WALLETS: Record<string, { label: string; category: string }
   '0x1111111254EEB25477B68fb85Ed929f73A960582': { label: '1inch V5: Aggregator', category: 'DEX' },
 };
 
+const NOTABLE_WALLETS_LOWER: Record<string, { label: string; category: string }> = Object.fromEntries(
+  Object.entries(NOTABLE_WALLETS).map(([k, v]) => [k.toLowerCase(), v])
+);
+
 // Known ERC20 token contracts on Ethereum Mainnet
 export const KNOWN_TOKENS: Record<string, { symbol: string; name: string; decimals: number }> = {
   '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2': { symbol: 'WETH', name: 'Wrapped Ether', decimals: 18 },
@@ -129,6 +169,10 @@ export const KNOWN_BUILDERS: Record<string, string> = {
   '0xDAFEA492D9c6733ae3d56b7Ed1ADB60692c98Bc5': 'Flashbots Builder',
   '0x1f9090aaE28b8a3dCeaDf281B0F12828e676c326': 'rsync-builder',
 };
+
+const KNOWN_BUILDERS_LOWER: Record<string, string> = Object.fromEntries(
+  Object.entries(KNOWN_BUILDERS).map(([k, v]) => [k.toLowerCase(), v])
+);
 
 export interface LiveOnChainTx {
   hash: string;
@@ -225,7 +269,7 @@ class EtherscanIntelligenceService {
   private isPolling = false;
   private activeSync: Promise<void> | null = null;
   private pollTimer: NodeJS.Timeout | null = null;
-  private consecutiveRateLimits = 0;
+  private consecutiveBackoffSteps = 0;
   private autoExecutionEnabled = false;
   private minProfitThresholdPercent = 0.01;
 
@@ -239,8 +283,8 @@ class EtherscanIntelligenceService {
       await this.syncLiveBlockAndTxs();
       const baseDelay = 12_000;
       const nextDelay =
-        this.consecutiveRateLimits > 0
-          ? Math.min(60_000, baseDelay * Math.pow(2, this.consecutiveRateLimits))
+        this.consecutiveBackoffSteps > 0
+          ? Math.min(60_000, baseDelay * Math.pow(2, this.consecutiveBackoffSteps))
           : baseDelay;
       this.scheduleNextPoll(nextDelay);
     }, delayMs);
@@ -252,14 +296,8 @@ class EtherscanIntelligenceService {
   private startLivePolling(): void {
     if (this.isPolling) return;
     this.isPolling = true;
-    void this.syncLiveBlockAndTxs().finally(() => {
-      const baseDelay = 12_000;
-      const nextDelay =
-        this.consecutiveRateLimits > 0
-          ? Math.min(60_000, baseDelay * Math.pow(2, this.consecutiveRateLimits))
-          : baseDelay;
-      this.scheduleNextPoll(nextDelay);
-    });
+    // Brief staggered startup delay so module import during tests or server boot does not contend with startup I/O
+    this.scheduleNextPoll(1500);
   }
 
   public syncLiveBlockAndTxs(): Promise<void> {
@@ -288,7 +326,7 @@ class EtherscanIntelligenceService {
       const blockNumber = parseInt(blockRaw.number, 16);
       if (this.blockSnapshot?.blockNumber === blockNumber) {
         this.lastError = null;
-        this.consecutiveRateLimits = 0;
+        this.consecutiveBackoffSteps = 0;
         return;
       }
 
@@ -302,7 +340,7 @@ class EtherscanIntelligenceService {
         blockNumber,
         baseFeeGwei: Number(baseFeeGwei.toFixed(4)),
         priorityFeeGwei: Number(Math.max(0, mk.gasPropose - baseFeeGwei).toFixed(4)),
-        builderName: KNOWN_BUILDERS[miner] || `Block Builder (${miner.slice(0, 8)}...)`,
+        builderName: KNOWN_BUILDERS_LOWER[miner] || `Block Builder (${miner.slice(0, 8)}...)`,
         txCount: txs.length,
         ethPriceUsd: mk.ethUsd,
         lastUpdated: Date.now(),
@@ -316,8 +354,8 @@ class EtherscanIntelligenceService {
         const valEth = parseInt(tx.value || '0x0', 16) / 1e18;
         const fromAddr = (tx.from || '').toLowerCase();
         const toAddr = (tx.to || '').toLowerCase();
-        const fromInfo = NOTABLE_WALLETS[fromAddr];
-        const toInfo = NOTABLE_WALLETS[toAddr];
+        const fromInfo = NOTABLE_WALLETS_LOWER[fromAddr];
+        const toInfo = NOTABLE_WALLETS_LOWER[toAddr];
 
         const isNotable = Boolean(fromInfo || toInfo);
         const isHighValue = valEth >= 2.0;
@@ -365,14 +403,17 @@ class EtherscanIntelligenceService {
         this.liveTransactions = [...newTransactions.filter((t) => !existing.has(t.hash)), ...this.liveTransactions].slice(0, 50);
       }
       this.lastError = null;
-      this.consecutiveRateLimits = 0;
+      this.consecutiveBackoffSteps = 0;
     } catch (err: any) {
-      const msg = err?.message || String(err);
+      const normalized = normalizeEtherscanError(err, 20_000);
+      const msg = normalized.message;
       this.lastError = msg;
-      if (isEtherscanRateLimitMessage(msg)) {
-        this.consecutiveRateLimits = Math.min(4, this.consecutiveRateLimits + 1);
+      if (isTransientEtherscanError(normalized)) {
+        this.consecutiveBackoffSteps = Math.min(4, this.consecutiveBackoffSteps + 1);
+        console.warn('Etherscan sync temporary delay (will retry):', msg);
+      } else {
+        console.warn('Etherscan sync warning:', msg);
       }
-      console.error('Etherscan sync failed:', this.lastError);
     }
   }
 

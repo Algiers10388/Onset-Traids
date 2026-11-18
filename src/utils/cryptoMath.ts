@@ -817,3 +817,55 @@ export function calculateRiskRewardTargets(
     targetGainUsd: takeProfitPrice - entryPrice,
   };
 }
+
+export interface SmartTrailingParams {
+  atr: number;
+  currentPrice: number;
+  atrMultiplier?: number; // default 1.5
+  leverage?: number; // default 1
+  minPercent?: number; // default 0.5%
+  maxPercent?: number; // default 15.0%
+}
+
+export interface SmartTrailingResult {
+  trailingPercent: number; // Leveraged % drop from peak matching trailingStopPercent evaluation
+  spotTrailPercent: number; // Unleveraged % price drop from peak
+  atrPercent: number; // Real-time ATR as % of currentPrice
+  volatilityRegime: 'LOW' | 'NORMAL' | 'ELEVATED' | 'EXTREME';
+}
+
+export function calculateSmartTrailingPercent(params: SmartTrailingParams): SmartTrailingResult {
+  const {
+    atr,
+    currentPrice,
+    atrMultiplier = 1.5,
+    leverage = 1,
+    minPercent = 0.5,
+    maxPercent = 15.0,
+  } = params;
+
+  const safePrice = Math.max(0.0001, currentPrice);
+  const safeAtr = Number.isFinite(atr) && atr > 0 ? atr : safePrice * 0.018;
+  const safeMult = Number.isFinite(atrMultiplier) && atrMultiplier > 0 ? atrMultiplier : 1.5;
+  const safeLev = Math.max(1, Number.isFinite(leverage) ? leverage : 1);
+
+  const atrPercent = (safeAtr / safePrice) * 100;
+  const spotTrailPercent = Math.round(atrPercent * safeMult * 100) / 100;
+  const rawLeveragedTrail = spotTrailPercent * safeLev;
+  const trailingPercent = Math.round(
+    Math.max(minPercent, Math.min(maxPercent, rawLeveragedTrail)) * 100
+  ) / 100;
+
+  let volatilityRegime: 'LOW' | 'NORMAL' | 'ELEVATED' | 'EXTREME' = 'NORMAL';
+  if (atrPercent < 0.9) volatilityRegime = 'LOW';
+  else if (atrPercent <= 2.2) volatilityRegime = 'NORMAL';
+  else if (atrPercent <= 4.0) volatilityRegime = 'ELEVATED';
+  else volatilityRegime = 'EXTREME';
+
+  return {
+    trailingPercent,
+    spotTrailPercent,
+    atrPercent: Math.round(atrPercent * 100) / 100,
+    volatilityRegime,
+  };
+}

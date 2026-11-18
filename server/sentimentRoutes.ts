@@ -88,24 +88,184 @@ export interface SentimentIntelligenceReport {
 //  - Per-article scoring: Gemini scores the REAL headlines (it is never asked to invent any).
 // If any of these is unavailable the endpoints return an error. There is no seeded or canned feed.
 // ----------------------------------------------------------------------------
-const NEWS_URL = 'https://min-api.cryptocompare.com/data/v2/news/?lang=EN';
 const FNG_URL = 'https://api.alternative.me/fng/?limit=1';
+const RSS_FEEDS: Array<{ url: string; source: SentimentFeedItem['source']; sourceName: string }> = [
+  { url: 'https://www.coindesk.com/arc/outboundfeeds/rss/', source: 'COINDESK', sourceName: 'CoinDesk' },
+  { url: 'https://cointelegraph.com/rss', source: 'COINTELEGRAPH', sourceName: 'Cointelegraph' },
+  { url: 'https://decrypt.co/feed', source: 'DECRYPT', sourceName: 'Decrypt' },
+];
 const CACHE_TTL_MS = 5 * 60 * 1000;
 const KNOWN_TICKERS = new Set(['BTC', 'ETH', 'SOL', 'XRP', 'ADA', 'DOGE', 'LINK', 'AVAX', 'DOT', 'LTC', 'BNB', 'USDT', 'USDC', 'PEPE', 'SHIB', 'XMR', 'TRX', 'ARB', 'OP', 'UNI', 'AAVE']);
+const TICKER_ALIASES: Array<[RegExp, string]> = [
+  [/\bbitcoin\b|\bbtc\b/i, 'BTC'],
+  [/\bethereum\b|\bether\b|\beth\b/i, 'ETH'],
+  [/\bsolana\b|\bsol\b/i, 'SOL'],
+  [/\bxrp\b|\bripple\b/i, 'XRP'],
+  [/\bcardano\b|\bada\b/i, 'ADA'],
+  [/\bdogecoin\b|\bdoge\b/i, 'DOGE'],
+  [/\bchainlink\b|\blink\b/i, 'LINK'],
+  [/\bavalanche\b|\bavax\b/i, 'AVAX'],
+  [/\bpolkadot\b|\bdot\b/i, 'DOT'],
+  [/\blitecoin\b|\bltc\b/i, 'LTC'],
+  [/\bbnb\b|\bbinance coin\b/i, 'BNB'],
+  [/\busdt\b|\btether\b/i, 'USDT'],
+  [/\busdc\b/i, 'USDC'],
+  [/\bpepe\b/i, 'PEPE'],
+  [/\bshiba\b|\bshib\b/i, 'SHIB'],
+  [/\bmonero\b|\bxmr\b/i, 'XMR'],
+  [/\btron\b|\btrx\b/i, 'TRX'],
+  [/\barbitrum\b|\barb\b/i, 'ARB'],
+  [/\boptimism\b/i, 'OP'],
+  [/\buniswap\b|\buni\b/i, 'UNI'],
+  [/\baave\b/i, 'AAVE'],
+];
 
 let lastReport: SentimentIntelligenceReport | null = null;
 let lastReportAt = 0;
 
-async function fetchJson(url: string): Promise<any> {
+async function fetchText(url: string): Promise<string> {
   const ctl = new AbortController();
   const t = setTimeout(() => ctl.abort(), 8000);
   try {
-    const r = await fetch(url, { signal: ctl.signal, headers: { 'User-Agent': 'TRAIDS-AGAIN/1.0' } });
+    const r = await fetch(url, { signal: ctl.signal, headers: { 'User-Agent': 'Mozilla/5.0 (compatible; TRAIDS-Sentiment/1.0)' } });
     if (!r.ok) throw new Error(`${url} -> HTTP ${r.status}`);
-    return await r.json();
+    return await r.text();
   } finally {
     clearTimeout(t);
   }
+}
+
+async function fetchJson(url: string): Promise<any> {
+  const txt = await fetchText(url);
+  return JSON.parse(txt);
+}
+
+function decodeXmlEntities(input: string): string {
+  return input
+    .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;|&apos;/g, "'")
+    .replace(/&#(\d+);/g, (_m, n) => String.fromCharCode(Number(n)))
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function extractTag(xml: string, tag: string): string {
+  const m = xml.match(new RegExp(`<${tag}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/${tag}>`, 'i'));
+  return m ? decodeXmlEntities(m[1]) : '';
+}
+
+export function parseRssItems(
+  xml: string,
+  source: SentimentFeedItem['source'],
+  sourceName: string
+): Array<{
+  id: string;
+  title: string;
+  body: string;
+  url: string;
+  published_on: number;
+  source: SentimentFeedItem['source'];
+  sourceName: string;
+  categories: string;
+}> {
+  const items: Array<{
+    id: string;
+    title: string;
+    body: string;
+    url: string;
+    published_on: number;
+    source: SentimentFeedItem['source'];
+    sourceName: string;
+    categories: string;
+  }> = [];
+  const itemMatches = xml.match(/<item\b[\s\S]*?<\/item>/gi) || [];
+  for (let i = 0; i < itemMatches.length; i++) {
+    const block = itemMatches[i];
+    const title = extractTag(block, 'title');
+    if (!title) continue;
+    const link = extractTag(block, 'link') || extractTag(block, 'guid');
+    const description = extractTag(block, 'description') || extractTag(block, 'content:encoded') || title;
+    const pubDateStr = extractTag(block, 'pubDate') || extractTag(block, 'dc:date');
+    const parsedMs = pubDateStr ? Date.parse(pubDateStr) : Date.now();
+    const published_on = Number.isFinite(parsedMs) ? Math.floor(parsedMs / 1000) : Math.floor(Date.now() / 1000);
+
+    const catMatches = [...block.matchAll(/<category(?:\s[^>]*)?>([\s\S]*?)<\/category>/gi)].map((m) =>
+      decodeXmlEntities(m[1]).toUpperCase()
+    );
+    const detectedTickers = new Set<string>();
+    for (const c of catMatches) {
+      if (KNOWN_TICKERS.has(c)) detectedTickers.add(c);
+    }
+    const textForMatch = `${title} ${description} ${catMatches.join(' ')}`;
+    for (const [rx, sym] of TICKER_ALIASES) {
+      if (rx.test(textForMatch)) detectedTickers.add(sym);
+    }
+
+    const idSeed = link || `${source}-${title.slice(0, 48)}`;
+    let hash = 0;
+    for (let k = 0; k < idSeed.length; k++) {
+      hash = ((hash << 5) - hash + idSeed.charCodeAt(k)) | 0;
+    }
+
+    items.push({
+      id: `${source.toLowerCase()}-${Math.abs(hash)}`,
+      title,
+      body: description.slice(0, 400),
+      url: link,
+      published_on,
+      source,
+      sourceName,
+      categories: [...detectedTickers].join('|'),
+    });
+  }
+  return items;
+}
+
+async function fetchLiveCryptoNews(): Promise<
+  Array<{
+    id: string;
+    title: string;
+    body: string;
+    url: string;
+    published_on: number;
+    source: SentimentFeedItem['source'];
+    sourceName: string;
+    categories: string;
+  }>
+> {
+  const settled = await Promise.allSettled(
+    RSS_FEEDS.map(async (feed) => {
+      const xml = await fetchText(feed.url);
+      return parseRssItems(xml, feed.source, feed.sourceName);
+    })
+  );
+  const combined: Array<{
+    id: string;
+    title: string;
+    body: string;
+    url: string;
+    published_on: number;
+    source: SentimentFeedItem['source'];
+    sourceName: string;
+    categories: string;
+  }> = [];
+  const seenTitles = new Set<string>();
+  for (const res of settled) {
+    if (res.status !== 'fulfilled') continue;
+    for (const item of res.value) {
+      const norm = item.title.toLowerCase();
+      if (seenTitles.has(norm)) continue;
+      seenTitles.add(norm);
+      combined.push(item);
+    }
+  }
+  combined.sort((a, b) => b.published_on - a.published_on);
+  return combined.slice(0, 25);
 }
 
 function mapPublisher(name: string): SentimentFeedItem['source'] {
@@ -121,9 +281,8 @@ async function buildReport(customAsset?: string): Promise<SentimentIntelligenceR
   const ai = getGenAI();
   if (!ai) throw new Error('GEMINI_API_KEY is not configured; cannot score headlines.');
 
-  const [news, fng] = await Promise.all([fetchJson(NEWS_URL), fetchJson(FNG_URL)]);
-  const articles: any[] = Array.isArray(news?.Data) ? news.Data.slice(0, 25) : [];
-  if (articles.length === 0) throw new Error('News API returned no articles.');
+  const [articles, fng] = await Promise.all([fetchLiveCryptoNews(), fetchJson(FNG_URL)]);
+  if (articles.length === 0) throw new Error('Live crypto news RSS feeds returned no articles.');
   const fngRow = fng?.data?.[0];
   const fearGreedIndex = Number(fngRow?.value);
   if (!Number.isFinite(fearGreedIndex)) throw new Error('Fear & Greed index unavailable.');
@@ -175,9 +334,9 @@ ${JSON.stringify(articles.map((a) => ({ id: String(a.id), title: a.title, body: 
     const related = cats.filter((c: string) => KNOWN_TICKERS.has(c));
     feed.push({
       id: `news-${a.id}`,
-      source: mapPublisher(a.source_info?.name || a.source),
-      sourceName: a.source_info?.name || a.source || 'News',
-      author: a.source_info?.name || a.source || 'News',
+      source: a.source || mapPublisher(a.sourceName),
+      sourceName: a.sourceName || a.source || 'News',
+      author: a.sourceName || a.source || 'News',
       title: a.title,
       content: String(a.body || a.title).slice(0, 400),
       url: a.url,

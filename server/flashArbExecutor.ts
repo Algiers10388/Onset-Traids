@@ -21,7 +21,252 @@ export interface ArbitrumTokenInfo {
   compatibilityNote?: string;
 }
 
-export type SupportedArbChain = 'arbitrum' | 'base' | 'optimism';
+export type BlockchainLayer = 'L1' | 'L2' | 'L3';
+export type AllLayerFilter = BlockchainLayer | 'L4' | 'ALL';
+
+export type SupportedArbChain =
+  | 'ethereum'
+  | 'polygon'
+  | 'bsc'
+  | 'avalanche'
+  | 'arbitrum'
+  | 'base'
+  | 'optimism'
+  | 'linea'
+  | 'scroll'
+  | 'apechain';
+
+export const ALL_SUPPORTED_ARB_CHAINS: SupportedArbChain[] = [
+  'ethereum',
+  'polygon',
+  'bsc',
+  'avalanche',
+  'arbitrum',
+  'base',
+  'optimism',
+  'linea',
+  'scroll',
+  'apechain',
+];
+
+export function isSupportedArbChain(chain: unknown): chain is SupportedArbChain {
+  return typeof chain === 'string' && (ALL_SUPPORTED_ARB_CHAINS as string[]).includes(chain.toLowerCase());
+}
+
+export interface ChainLayerMetadata {
+  chain: SupportedArbChain;
+  name: string;
+  shortName: string;
+  layer: BlockchainLayer;
+  chainId: number;
+  chainIdHex: string;
+  nativeSymbol: string;
+  wrappedNativeSymbol: string;
+  parentChain: SupportedArbChain | null;
+  settlementModel: string;
+  explorer: string;
+  balancerVault: string;
+  aavePool: string;
+  multicall3: string;
+  cancunEip1153: boolean;
+  defaultFlashProvider: 'BALANCER_V2' | 'AAVE_V3' | 'UNISWAP_V3_FLASH';
+  isRollup: boolean;
+}
+
+const MULTICALL3_CANONICAL = '0xcA11bde05977b3631167028862bE2a173976CA11';
+
+export const CHAIN_LAYER_META: Record<SupportedArbChain, ChainLayerMetadata> = {
+  ethereum: {
+    chain: 'ethereum',
+    name: 'Ethereum Mainnet',
+    shortName: 'Ethereum',
+    layer: 'L1',
+    chainId: 1,
+    chainIdHex: '0x1',
+    nativeSymbol: 'ETH',
+    wrappedNativeSymbol: 'WETH',
+    parentChain: null,
+    settlementModel: 'L1 Sovereign Proof-of-Stake Settlement',
+    explorer: 'https://etherscan.io',
+    balancerVault: '0xBA12222222228d8Ba445958a75a0704d566BF2C8',
+    aavePool: '0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2',
+    multicall3: MULTICALL3_CANONICAL,
+    cancunEip1153: true,
+    defaultFlashProvider: 'BALANCER_V2',
+    isRollup: false,
+  },
+  polygon: {
+    chain: 'polygon',
+    name: 'Polygon PoS',
+    shortName: 'Polygon',
+    layer: 'L1',
+    chainId: 137,
+    chainIdHex: '0x89',
+    nativeSymbol: 'POL',
+    wrappedNativeSymbol: 'WMATIC',
+    parentChain: 'ethereum',
+    settlementModel: 'L1 High-Throughput Sidechain / Heimdall PoS',
+    explorer: 'https://polygonscan.com',
+    balancerVault: '0xBA12222222228d8Ba445958a75a0704d566BF2C8',
+    aavePool: '0x794a61358D6845594F94dc1DB02A252b5b4814aD',
+    multicall3: MULTICALL3_CANONICAL,
+    cancunEip1153: true,
+    defaultFlashProvider: 'BALANCER_V2',
+    isRollup: false,
+  },
+  bsc: {
+    chain: 'bsc',
+    name: 'BNB Smart Chain',
+    shortName: 'BSC',
+    layer: 'L1',
+    chainId: 56,
+    chainIdHex: '0x38',
+    nativeSymbol: 'BNB',
+    wrappedNativeSymbol: 'WBNB',
+    parentChain: null,
+    settlementModel: 'L1 Parlia PoSA Consensus',
+    explorer: 'https://bscscan.com',
+    balancerVault: '0xBA12222222228d8Ba445958a75a0704d566BF2C8',
+    aavePool: '0x6807dc923806fE8Fd134338EABCA509979a7e0cB',
+    multicall3: MULTICALL3_CANONICAL,
+    cancunEip1153: true,
+    defaultFlashProvider: 'AAVE_V3',
+    isRollup: false,
+  },
+  avalanche: {
+    chain: 'avalanche',
+    name: 'Avalanche C-Chain',
+    shortName: 'Avalanche',
+    layer: 'L1',
+    chainId: 43114,
+    chainIdHex: '0xa86a',
+    nativeSymbol: 'AVAX',
+    wrappedNativeSymbol: 'WAVAX',
+    parentChain: null,
+    settlementModel: 'L1 Snowman Sub-Second Finality Consensus',
+    explorer: 'https://snowtrace.io',
+    balancerVault: '0xBA12222222228d8Ba445958a75a0704d566BF2C8',
+    aavePool: '0x794a61358D6845594F94dc1DB02A252b5b4814aD',
+    multicall3: MULTICALL3_CANONICAL,
+    cancunEip1153: true,
+    defaultFlashProvider: 'BALANCER_V2',
+    isRollup: false,
+  },
+  arbitrum: {
+    chain: 'arbitrum',
+    name: 'Arbitrum One',
+    shortName: 'Arbitrum',
+    layer: 'L2',
+    chainId: 42161,
+    chainIdHex: '0xa4b1',
+    nativeSymbol: 'ETH',
+    wrappedNativeSymbol: 'WETH',
+    parentChain: 'ethereum',
+    settlementModel: 'L2 Optimistic Nitro Rollup -> Ethereum L1',
+    explorer: 'https://arbiscan.io',
+    balancerVault: '0xBA12222222228d8Ba445958a75a0704d566BF2C8',
+    aavePool: '0x794a61358D6845594F94dc1DB02A252b5b4814aD',
+    multicall3: MULTICALL3_CANONICAL,
+    cancunEip1153: true,
+    defaultFlashProvider: 'BALANCER_V2',
+    isRollup: true,
+  },
+  base: {
+    chain: 'base',
+    name: 'Base Mainnet',
+    shortName: 'Base',
+    layer: 'L2',
+    chainId: 8453,
+    chainIdHex: '0x2105',
+    nativeSymbol: 'ETH',
+    wrappedNativeSymbol: 'WETH',
+    parentChain: 'ethereum',
+    settlementModel: 'L2 Optimistic OP-Stack Rollup -> Ethereum L1',
+    explorer: 'https://basescan.org',
+    balancerVault: '0xBA12222222228d8Ba445958a75a0704d566BF2C8',
+    aavePool: '0xA238Dd80C259a72e81d7e4664a9801593F98d1c5',
+    multicall3: MULTICALL3_CANONICAL,
+    cancunEip1153: true,
+    defaultFlashProvider: 'BALANCER_V2',
+    isRollup: true,
+  },
+  optimism: {
+    chain: 'optimism',
+    name: 'Optimism Mainnet',
+    shortName: 'Optimism',
+    layer: 'L2',
+    chainId: 10,
+    chainIdHex: '0xa',
+    nativeSymbol: 'ETH',
+    wrappedNativeSymbol: 'WETH',
+    parentChain: 'ethereum',
+    settlementModel: 'L2 Optimistic OP-Stack Bedrock -> Ethereum L1',
+    explorer: 'https://optimistic.etherscan.io',
+    balancerVault: '0xBA12222222228d8Ba445958a75a0704d566BF2C8',
+    aavePool: '0x794a61358D6845594F94dc1DB02A252b5b4814aD',
+    multicall3: MULTICALL3_CANONICAL,
+    cancunEip1153: true,
+    defaultFlashProvider: 'BALANCER_V2',
+    isRollup: true,
+  },
+  linea: {
+    chain: 'linea',
+    name: 'Linea zkEVM',
+    shortName: 'Linea',
+    layer: 'L2',
+    chainId: 59144,
+    chainIdHex: '0xe708',
+    nativeSymbol: 'ETH',
+    wrappedNativeSymbol: 'WETH',
+    parentChain: 'ethereum',
+    settlementModel: 'L2 Type-2 zkEVM Rollup -> Ethereum L1',
+    explorer: 'https://lineascan.build',
+    balancerVault: '0xBA12222222228d8Ba445958a75a0704d566BF2C8',
+    aavePool: '0x0000000000000000000000000000000000000000',
+    multicall3: MULTICALL3_CANONICAL,
+    cancunEip1153: true,
+    defaultFlashProvider: 'UNISWAP_V3_FLASH',
+    isRollup: true,
+  },
+  scroll: {
+    chain: 'scroll',
+    name: 'Scroll zkEVM',
+    shortName: 'Scroll',
+    layer: 'L2',
+    chainId: 534352,
+    chainIdHex: '0x82750',
+    nativeSymbol: 'ETH',
+    wrappedNativeSymbol: 'WETH',
+    parentChain: 'ethereum',
+    settlementModel: 'L2 Bytecode zkEVM Rollup -> Ethereum L1',
+    explorer: 'https://scrollscan.com',
+    balancerVault: '0xBA12222222228d8Ba445958a75a0704d566BF2C8',
+    aavePool: '0x11fCfe756c05AD438e312a7fd934381537D3cFfe',
+    multicall3: MULTICALL3_CANONICAL,
+    cancunEip1153: true,
+    defaultFlashProvider: 'AAVE_V3',
+    isRollup: true,
+  },
+  apechain: {
+    chain: 'apechain',
+    name: 'ApeChain Orbit L3',
+    shortName: 'ApeChain',
+    layer: 'L3',
+    chainId: 33139,
+    chainIdHex: '0x8173',
+    nativeSymbol: 'APE',
+    wrappedNativeSymbol: 'WAPE',
+    parentChain: 'arbitrum',
+    settlementModel: 'L3 Arbitrum Orbit App-Chain -> Arbitrum L2 -> Ethereum L1',
+    explorer: 'https://apescan.io',
+    balancerVault: '0x0000000000000000000000000000000000000000',
+    aavePool: '0x0000000000000000000000000000000000000000',
+    multicall3: MULTICALL3_CANONICAL,
+    cancunEip1153: true,
+    defaultFlashProvider: 'UNISWAP_V3_FLASH',
+    isRollup: true,
+  },
+};
 
 export const ARBITRUM_TOKENS: Record<string, ArbitrumTokenInfo> = {
   WETH: { sym: 'WETH', addr: '0x82aF49447D8a07e3bd95BD0d56f35241523fBab1', dec: 18, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 (WETH9) · FlashArb & Sweep Compatible' },
@@ -47,6 +292,44 @@ export const ARBITRUM_TOKENS: Record<string, ArbitrumTokenInfo> = {
 };
 
 export const CHAIN_TOKENS: Record<SupportedArbChain, Record<string, ArbitrumTokenInfo>> = {
+  ethereum: {
+    WETH: { sym: 'WETH', addr: '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2', dec: 18, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 (WETH9 L1) · FlashArb & Sweep Compatible' },
+    USDC: { sym: 'USDC', addr: '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48', dec: 6, ercStandard: 'ERC-2612', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 + ERC-2612 Permit · FlashArb & Sweep Compatible' },
+    USDT: { sym: 'USDT', addr: '0xdAC17F958D2ee523a2206206994597C13D831ec7', dec: 6, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'Non-standard approve ERC-20 (SafeERC20) · FlashArb & Sweep Compatible' },
+    WBTC: { sym: 'WBTC', addr: '0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599', dec: 8, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 · FlashArb & Sweep Compatible' },
+    DAI: { sym: 'DAI', addr: '0x6B175474E89094C44Da98b954EedeAC495271d0F', dec: 18, ercStandard: 'ERC-2612', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 + Permit · FlashArb & Sweep Compatible' },
+    LINK: { sym: 'LINK', addr: '0x514910771AF9Ca656af840dff83E8264EcF986CA', dec: 18, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 · FlashArb & Sweep Compatible' },
+    UNI: { sym: 'UNI', addr: '0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984', dec: 18, ercStandard: 'ERC-2612', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 · FlashArb & Sweep Compatible' },
+    AAVE: { sym: 'AAVE', addr: '0x7Fc66500c84A76Ad7e9c93437bFc5Ac33E2DDaE9', dec: 18, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 · FlashArb & Sweep Compatible' },
+  },
+  polygon: {
+    WMATIC: { sym: 'WMATIC', addr: '0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270', dec: 18, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 (Wrapped POL) · FlashArb & Sweep Compatible' },
+    WETH: { sym: 'WETH', addr: '0x7ceB23fD6bC0adD59E62ac25578270cFf1b9f619', dec: 18, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 (PoS WETH) · FlashArb & Sweep Compatible' },
+    USDC: { sym: 'USDC', addr: '0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359', dec: 6, ercStandard: 'ERC-2612', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'Native Circle USDC · FlashArb & Sweep Compatible' },
+    USDCe: { sym: 'USDC.e', addr: '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174', dec: 6, ercStandard: 'ERC-2612', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'Bridged USDC.e · FlashArb & Sweep Compatible' },
+    USDT: { sym: 'USDT', addr: '0xc2132D05D31c914a87C6611C10748AEb04B58e8F', dec: 6, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 (SafeERC20) · FlashArb & Sweep Compatible' },
+    WBTC: { sym: 'WBTC', addr: '0x1BFD67037B42Cf73acF2047067bd4F2C47D9BfD6', dec: 8, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 · FlashArb & Sweep Compatible' },
+    DAI: { sym: 'DAI', addr: '0x8f3Cf7ad23Cd3CaDbD9735AFf958023239c6A063', dec: 18, ercStandard: 'ERC-2612', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 · FlashArb & Sweep Compatible' },
+    LINK: { sym: 'LINK', addr: '0x53E0bca35eC356BD5ddDFebbD1Fc0fD03FaBad39', dec: 18, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 · FlashArb & Sweep Compatible' },
+    AAVE: { sym: 'AAVE', addr: '0xD6DF932A45C0f255f85145f286eA0b292B21C90B', dec: 18, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 · FlashArb & Sweep Compatible' },
+  },
+  bsc: {
+    WBNB: { sym: 'WBNB', addr: '0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c', dec: 18, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'BEP-20 Wrapped BNB · FlashArb & Sweep Compatible' },
+    USDT: { sym: 'USDT', addr: '0x55d398326f99059fF775485246999027B3197955', dec: 18, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'Binance-Peg BSC-USD (18 decimals) · FlashArb & Sweep Compatible' },
+    USDC: { sym: 'USDC', addr: '0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d', dec: 18, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'Binance-Peg USDC (18 decimals) · FlashArb & Sweep Compatible' },
+    WETH: { sym: 'WETH', addr: '0x2170Ed0880ac9A755fd29B2688956BD959F933F8', dec: 18, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'Binance-Peg ETH (18 decimals) · FlashArb & Sweep Compatible' },
+    BTCB: { sym: 'BTCB', addr: '0x7130d2A12B9BCbFAe4f2634d864A1Ee1Ce3Ead9c', dec: 18, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'Binance-Peg BTCB (18 decimals) · FlashArb & Sweep Compatible' },
+    CAKE: { sym: 'CAKE', addr: '0x0E09FaBB73Bd3Ade0a17ECC321fD13a19e81cE82', dec: 18, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'PancakeSwap Token · FlashArb & Sweep Compatible' },
+  },
+  avalanche: {
+    WAVAX: { sym: 'WAVAX', addr: '0xB31f66AA3C1e785363F0875A1B74E27b85FD66c7', dec: 18, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 Wrapped AVAX · FlashArb & Sweep Compatible' },
+    USDC: { sym: 'USDC', addr: '0xB97EF9Ef8734C71904D8002F8b6Bc66Dd9c48a6E', dec: 6, ercStandard: 'ERC-2612', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'Native Circle USDC · FlashArb & Sweep Compatible' },
+    USDT: { sym: 'USDT', addr: '0x9702230A8Ea53601f5cD2dc00fDBc13d4dF4A8c7', dec: 6, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'Native USDt on Avalanche · FlashArb & Sweep Compatible' },
+    WETH: { sym: 'WETH', addr: '0x49D5c2BdFfac6CE2BFdB6640F4F80f226bc10bAB', dec: 18, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'WETH.e · FlashArb & Sweep Compatible' },
+    BTCb: { sym: 'BTC.b', addr: '0x152b9d0FdC40C096757F570A51E494bd4b943E50', dec: 8, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'Avalanche Bitcoin Bridge · FlashArb & Sweep Compatible' },
+    WBTC: { sym: 'WBTC', addr: '0x50b7545627a5162F82A992c33b87aDc75187B218', dec: 8, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'WBTC.e · FlashArb & Sweep Compatible' },
+    JOE: { sym: 'JOE', addr: '0x6e84a6216eA6dACC71eE8E6b0a5B7322EEbC0fDd', dec: 18, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'JoeToken · FlashArb & Sweep Compatible' },
+  },
   arbitrum: ARBITRUM_TOKENS,
   base: {
     WETH: { sym: 'WETH', addr: '0x4200000000000000000000000000000000000006', dec: 18, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 (WETH9) · FlashArb & Sweep Compatible' },
@@ -73,11 +356,34 @@ export const CHAIN_TOKENS: Record<SupportedArbChain, Record<string, ArbitrumToke
     WBTC: { sym: 'WBTC', addr: '0x68f180fcCe6836688e9084f035309E29Bf0A2095', dec: 8, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 · FlashArb & Sweep Compatible' },
     wstETH: { sym: 'wstETH', addr: '0x1F32b1c2345538c0c6f582fCB022739c4A194Ebb', dec: 18, ercStandard: 'ERC-2612', arbCompatible: false, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 + ERC-2612 Non-rebasing LST · Sweep Compatible (excluded from arb swaps)' },
   },
+  linea: {
+    WETH: { sym: 'WETH', addr: '0xe5D7C2a44FfDDf6b295A15c148167daaAf5Cf34f', dec: 18, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 Wrapped ETH (Linea) · FlashArb & Sweep Compatible' },
+    USDC: { sym: 'USDC', addr: '0x176211869cA2b568f2A7D4EE941E073a821EE1ff', dec: 6, ercStandard: 'ERC-2612', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'USDC.e / Native USDC on Linea · FlashArb & Sweep Compatible' },
+    USDT: { sym: 'USDT', addr: '0xA219439258ca9da29E9Cc4cE5596924745e12B93', dec: 6, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 USDT (Linea) · FlashArb & Sweep Compatible' },
+    WBTC: { sym: 'WBTC', addr: '0x3aAB2285ddcDdaD8edf438C1bAB47e1a9D05a9b4', dec: 8, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 WBTC · FlashArb & Sweep Compatible' },
+    DAI: { sym: 'DAI', addr: '0x4AF15ec2A0BD43Db75dd04E62FAA3B8EF36b00d5', dec: 18, ercStandard: 'ERC-2612', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 DAI · FlashArb & Sweep Compatible' },
+    ezETH: { sym: 'ezETH', addr: '0x2416092f143378750bb29b79eD961ab195CcEea5', dec: 18, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'Renzo Restaked ETH · FlashArb & Sweep Compatible' },
+    wstETH: { sym: 'wstETH', addr: '0xB5beDd42000b71FddE22D3eE8a79Bd49A568fC8F', dec: 18, ercStandard: 'ERC-2612', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'Lido wstETH · FlashArb & Sweep Compatible' },
+  },
+  scroll: {
+    WETH: { sym: 'WETH', addr: '0x5300000000000000000000000000000000000004', dec: 18, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 Wrapped ETH (Scroll) · FlashArb & Sweep Compatible' },
+    USDC: { sym: 'USDC', addr: '0x06eFdBFf2a14a7c8E15944D1F4A48F9F95F663A4', dec: 6, ercStandard: 'ERC-2612', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 USDC (Scroll) · FlashArb & Sweep Compatible' },
+    USDT: { sym: 'USDT', addr: '0xf55BEC9cafDbE8730f096Aa55dad6D22d44099Df', dec: 6, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 USDT (Scroll) · FlashArb & Sweep Compatible' },
+    WBTC: { sym: 'WBTC', addr: '0x3C1BCa5a656e69edCD0D4E36BEbb3FcDAcA60Cf1', dec: 8, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 WBTC · FlashArb & Sweep Compatible' },
+    DAI: { sym: 'DAI', addr: '0xcA77eB3fEFe3725Dc33bccB54eDEFc3D9f764f97', dec: 18, ercStandard: 'ERC-2612', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 DAI · FlashArb & Sweep Compatible' },
+    SCR: { sym: 'SCR', addr: '0xd29687c813D741E2F938F4aC377128810E217b1b', dec: 18, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'Scroll Governance Token · FlashArb & Sweep Compatible' },
+  },
+  apechain: {
+    WAPE: { sym: 'WAPE', addr: '0x48b62137EdfA95a428D35C09E44256a739F6B557', dec: 18, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'Wrapped APE Native Gas Token (Orbit L3) · Sweep & L4 Compatible' },
+    ApeUSD: { sym: 'ApeUSD', addr: '0xA2235d059F80e176D931Ef76b6C51953Eb3fBEf4', dec: 18, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ApeChain Stablecoin (18 dec) · Sweep & L4 Compatible' },
+    ApeETH: { sym: 'ApeETH', addr: '0xcF800F4948D16F23333508191B1B1591daF70438', dec: 18, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ApeChain Yield-Bearing ETH · Sweep & L4 Compatible' },
+  },
 };
 
 export function getChainTokens(chain: string): ArbitrumTokenInfo[] {
-  const key = (chain || 'arbitrum').toLowerCase() as SupportedArbChain;
-  return Object.values(CHAIN_TOKENS[key] || CHAIN_TOKENS.arbitrum);
+  const raw = String(chain || 'arbitrum').toLowerCase();
+  const key = isSupportedArbChain(raw) ? raw : 'arbitrum';
+  return Object.values(CHAIN_TOKENS[key]);
 }
 
 export interface DexRouterSpec {
@@ -123,6 +429,102 @@ export const ARBITRUM_DEX_ROUTERS: Record<string, DexRouterSpec> = {
 };
 
 export const CHAIN_DEX_ROUTERS: Record<SupportedArbChain, Record<string, DexRouterSpec>> = {
+  ethereum: {
+    'Uniswap V3': {
+      router: '0xE592427A0AEce92De3Edee1F18E0157C05861564',
+      isV3: true,
+      supported: true,
+    },
+    'PancakeSwap V3': {
+      router: '0x1b81D678ffb9C0263b24A97847620C99d213eB14',
+      isV3: true,
+      supported: true,
+    },
+    'Uniswap V2': {
+      router: '0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D',
+      isV3: false,
+      supported: true,
+    },
+    'Sushiswap V2': {
+      router: '0xd9e1cE17f2641f24aE83637ab66a2cca9C378B9F',
+      isV3: false,
+      supported: true,
+    },
+  },
+  polygon: {
+    'Uniswap V3': {
+      router: '0xE592427A0AEce92De3Edee1F18E0157C05861564',
+      isV3: true,
+      supported: true,
+    },
+    'SushiSwap V3': {
+      router: '0x0aF89E1620b96170e2a9D0b68fEebb767eD044c3',
+      isV3: true,
+      supported: true,
+    },
+    'QuickSwap V2': {
+      router: '0xa5E0829CaCEd8fFDD4De3c43696c57F7D7A678ff',
+      isV3: false,
+      supported: true,
+    },
+    'Sushiswap V2': {
+      router: '0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506',
+      isV3: false,
+      supported: true,
+    },
+    'QuickSwap V3': {
+      // Algebra router omits `uint24 fee` in exactInputSingle; monitor-only unless contract exposes Algebra
+      router: null,
+      isV3: true,
+      supported: false,
+    },
+  },
+  bsc: {
+    'PancakeSwap V3': {
+      router: '0x1b81D678ffb9C0263b24A97847620C99d213eB14',
+      isV3: true,
+      supported: true,
+    },
+    'Uniswap V3': {
+      // SwapRouter02 on BSC (supported via ISwapRouter02 fallback in FlashArbOptimized._swapV3)
+      router: '0xB971eF87ede563556b2ED4b1C0b0019111Dd85d2',
+      isV3: true,
+      supported: true,
+    },
+    'PancakeSwap V2': {
+      router: '0x10ED43C718714eb63d5aA57B78B54704E256024E',
+      isV3: false,
+      supported: true,
+    },
+    'Sushiswap V2': {
+      router: '0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506',
+      isV3: false,
+      supported: true,
+    },
+  },
+  avalanche: {
+    'Uniswap V3': {
+      // SwapRouter02 on Avalanche
+      router: '0xbb00FF08d01D300023C629E8fFfFcb65A5a578cE',
+      isV3: true,
+      supported: true,
+    },
+    'Trader Joe V1': {
+      router: '0x60aE616a2155Ee3d9A68541Ba4544862310933d4',
+      isV3: false,
+      supported: true,
+    },
+    'Pangolin V2': {
+      router: '0xE54Ca86531e17Ef3616d22Ca28b0D458b6C89106',
+      isV3: false,
+      supported: true,
+    },
+    'Sushiswap V2': {
+      router: '0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506',
+      isV3: false,
+      supported: true,
+    },
+  },
   arbitrum: ARBITRUM_DEX_ROUTERS,
   base: {
     'Uniswap V3': {
@@ -191,6 +593,49 @@ export const CHAIN_DEX_ROUTERS: Record<SupportedArbChain, Record<string, DexRout
       supported: false,
     },
   },
+  linea: {
+    'Uniswap V3': {
+      router: '0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a',
+      isV3: true,
+      supported: true,
+    },
+    'PancakeSwap V3': {
+      router: '0x1b81D678ffb9C0263b24A97847620C99d213eB14',
+      isV3: true,
+      supported: true,
+    },
+    'Lynex V3': {
+      // Algebra exactInputSingle omits uint24 fee; monitor-only
+      router: null,
+      isV3: true,
+      supported: false,
+    },
+  },
+  scroll: {
+    'Uniswap V3': {
+      router: '0xfc30937f5cDe93Df8d48aCAF7e6f5D8D8A31F636',
+      isV3: true,
+      supported: true,
+    },
+    'SushiSwap V3': {
+      router: '0x734583f62Bb6ACe3c9bA9bd5A53143CA2Ce8C55A',
+      isV3: true,
+      supported: true,
+    },
+    'Nuri V3': {
+      router: '0xAAAE99091Fbb28D400029052821653C1C752483B',
+      isV3: true,
+      supported: true,
+    },
+  },
+  apechain: {
+    'Camelot V3': {
+      // Algebra router on ApeChain L3
+      router: null,
+      isV3: true,
+      supported: false,
+    },
+  },
 };
 
 export const CAMELOT_V3_ROUTER_ADDRESS = '0x1F721E2E82F6676FCE4eA07A5958cF098D339e18';
@@ -203,8 +648,9 @@ export interface RouterCapabilityOptions {
 }
 
 export function getChainDexRouters(chain?: string): Record<string, DexRouterSpec> {
-  const key = (chain || 'arbitrum').toLowerCase() as SupportedArbChain;
-  return CHAIN_DEX_ROUTERS[key] || ARBITRUM_DEX_ROUTERS;
+  const raw = String(chain || 'arbitrum').toLowerCase();
+  const key = isSupportedArbChain(raw) ? raw : 'arbitrum';
+  return CHAIN_DEX_ROUTERS[key];
 }
 
 /**
@@ -288,6 +734,34 @@ export function parseSimulatorDexSelection(label: string): ParsedSimulatorDexSel
   if (lower.startsWith('uniswap v2')) {
     return { dex: 'Uniswap V2', feePercent: 0.30, explicitFee: true };
   }
+  if (lower.startsWith('pancakeswap v2')) {
+    return { dex: 'PancakeSwap V2', feePercent: 0.25, explicitFee: true };
+  }
+  if (lower.startsWith('quickswap v3')) {
+    return { dex: 'QuickSwap V3', feePercent: 0.05, explicitFee: false };
+  }
+  if (lower.startsWith('quickswap v2')) {
+    return { dex: 'QuickSwap V2', feePercent: 0.30, explicitFee: true };
+  }
+  if (lower.startsWith('trader joe v1') || lower === 'trader joe v1') {
+    return { dex: 'Trader Joe V1', feePercent: 0.30, explicitFee: true };
+  }
+  if (lower.startsWith('pangolin v2')) {
+    return { dex: 'Pangolin V2', feePercent: 0.30, explicitFee: true };
+  }
+  if (lower.startsWith('lynex v3')) {
+    return { dex: 'Lynex V3', feePercent: 0.05, explicitFee: false };
+  }
+  if (lower.startsWith('nuri v3')) {
+    return {
+      dex: 'Nuri V3',
+      feePercent: Number.isFinite(parsedFee) && parsedFee > 0 ? parsedFee : 0.05,
+      explicitFee: Number.isFinite(parsedFee) && parsedFee > 0,
+    };
+  }
+  if (lower.startsWith('saru v2')) {
+    return { dex: 'Saru V2', feePercent: 0.30, explicitFee: true };
+  }
   if (lower.startsWith('baseswap v2')) {
     return { dex: 'BaseSwap V2', feePercent: 0.25, explicitFee: true };
   }
@@ -320,6 +794,20 @@ export function parseSimulatorDexSelection(label: string): ParsedSimulatorDexSel
 }
 
 export const V3_QUOTER_V2_ADDRESSES: Record<SupportedArbChain, Partial<Record<string, string>>> = {
+  ethereum: {
+    'Uniswap V3': '0x61fFE014bA17989E743c5F6cB21bF9697530B21e',
+    'PancakeSwap V3': '0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997',
+  },
+  polygon: {
+    'Uniswap V3': '0x61fFE014bA17989E743c5F6cB21bF9697530B21e',
+  },
+  bsc: {
+    'PancakeSwap V3': '0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997',
+    'Uniswap V3': '0x78D78E420Da98ad378D7799bE8f4AF69033EB077',
+  },
+  avalanche: {
+    'Uniswap V3': '0xbe0F5544EC67e9B3b2D979aaA43f18Fd87E6257F',
+  },
   arbitrum: {
     'Uniswap V3': '0x61fFE014bA17989E743c5F6cB21bF9697530B21e',
     'PancakeSwap V3': '0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997',
@@ -333,6 +821,14 @@ export const V3_QUOTER_V2_ADDRESSES: Record<SupportedArbChain, Partial<Record<st
   optimism: {
     'Uniswap V3': '0x61fFE014bA17989E743c5F6cB21bF9697530B21e',
   },
+  linea: {
+    'Uniswap V3': '0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a',
+    'PancakeSwap V3': '0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997',
+  },
+  scroll: {
+    'Uniswap V3': '0x61fFE014bA17989E743c5F6cB21bF9697530B21e',
+  },
+  apechain: {},
 };
 
 export const FLASH_ARB_OPTIMIZED_ABI = [
@@ -1004,4 +1500,271 @@ export function computeGasSurplusAllocation(params: {
     remainingReserveWei,
   };
 }
+
+export interface RouteTypeReadinessItem {
+  routeType: 1 | 2 | 3 | 4;
+  codeName: string;
+  description: string;
+  available: boolean;
+  samplePair: string;
+  legADex: string | null;
+  legBDex: string | null;
+  sampleSelector: string;
+  sampleCalldataPrefix: string | null;
+}
+
+export interface ChainRouteTypesReadiness {
+  chain: SupportedArbChain;
+  layer: BlockchainLayer;
+  supportedV3Routers: string[];
+  supportedV2Routers: string[];
+  monitorOnlyRouters: string[];
+  functionSelectors: {
+    executeOptimizedArbitrage: string;
+    executeDirectFlashArb: string;
+    rescueTokens: string;
+    rescueTokensTo: string;
+    routerCapabilities: string;
+    owner: string;
+  };
+  routeTypes: RouteTypeReadinessItem[];
+  allFourRouteTypesReady: boolean;
+}
+
+/**
+ * Verifies which of FlashArbOptimized's 4 atomic routeType execution modes
+ * (1=UniV3->V2, 2=V2->UniV3, 3=UniV3->UniV3, 4=V2->V2) have supported on-chain routers
+ * on the given blockchain and generates real ABI-encoded calldata previews.
+ */
+export function verifyChainRouteTypesReadiness(
+  chain: SupportedArbChain,
+  routerCaps?: RouterCapabilityOptions,
+  recipient = '0x000000000000000000000000000000000000dEaD'
+): ChainRouteTypesReadiness {
+  const meta = CHAIN_LAYER_META[chain];
+  const routers = getEffectiveChainDexRouters(chain, routerCaps);
+  const v3Entries = Object.entries(routers).filter(([, spec]) => spec.supported && spec.isV3 && spec.router);
+  const v2Entries = Object.entries(routers).filter(([, spec]) => spec.supported && !spec.isV3 && spec.router);
+  const monitorOnly = Object.entries(routers)
+    .filter(([, spec]) => !spec.supported)
+    .map(([name]) => name);
+
+  const tokens = getChainTokens(chain);
+  const tokA = tokens[0];
+  const tokB = tokens.find((t) => t.addr.toLowerCase() !== tokA.addr.toLowerCase() && t.arbCompatible !== false) || tokens[1] || tokA;
+  const sampleAmount = toTokenUnits(0.1, tokA.dec);
+
+  const buildItem = (
+    routeType: 1 | 2 | 3 | 4,
+    codeName: string,
+    description: string,
+    legA?: [string, DexRouterSpec],
+    legB?: [string, DexRouterSpec]
+  ): RouteTypeReadinessItem => {
+    if (!legA || !legB || !legA[1].router || !legB[1].router) {
+      return {
+        routeType,
+        codeName,
+        description,
+        available: false,
+        samplePair: `${tokA.sym}/${tokB.sym}`,
+        legADex: legA?.[0] || null,
+        legBDex: legB?.[0] || null,
+        sampleSelector: '0x23b3aa6b',
+        sampleCalldataPrefix: null,
+      };
+    }
+    const calldata = encodeExecuteOptimizedArbitrage({
+      tokenIn: tokA.addr,
+      tokenOut: tokB.addr,
+      amount: sampleAmount > 0n ? sampleAmount : 1000000n,
+      routerA: legA[1].router,
+      routerB: legB[1].router,
+      feeA: legA[1].isV3 ? 500 : 0,
+      feeB: legB[1].isV3 ? 500 : 0,
+      routeType,
+      minProfit: 1n,
+      recipient,
+    });
+    return {
+      routeType,
+      codeName,
+      description,
+      available: true,
+      samplePair: `${tokA.sym}/${tokB.sym}`,
+      legADex: legA[0],
+      legBDex: legB[0],
+      sampleSelector: calldata.slice(0, 10),
+      sampleCalldataPrefix: calldata.slice(0, 74),
+    };
+  };
+
+  const firstV3 = v3Entries[0];
+  const secondV3 = v3Entries[1] || v3Entries[0];
+  const firstV2 = v2Entries[0];
+  const secondV2 = v2Entries[1] || v2Entries[0];
+
+  const routeTypes: RouteTypeReadinessItem[] = [
+    buildItem(1, 'TYPE_1_V3_TO_V2', 'Leg 1 UniV3 Concentrated -> Leg 2 V2 CPMM', firstV3, firstV2),
+    buildItem(2, 'TYPE_2_V2_TO_V3', 'Leg 1 V2 CPMM -> Leg 2 UniV3 Concentrated', firstV2, firstV3),
+    buildItem(3, 'TYPE_3_V3_TO_V3', 'Leg 1 UniV3 -> Leg 2 UniV3 (Cross-Tier / Cross-DEX)', firstV3, secondV3),
+    buildItem(4, 'TYPE_4_V2_TO_V2', 'Leg 1 V2 CPMM -> Leg 2 V2 CPMM (Zero-Tick Overhead)', firstV2, secondV2),
+  ];
+
+  return {
+    chain,
+    layer: meta.layer,
+    supportedV3Routers: v3Entries.map(([name]) => name),
+    supportedV2Routers: v2Entries.map(([name]) => name),
+    monitorOnlyRouters: monitorOnly,
+    functionSelectors: {
+      executeOptimizedArbitrage: '0x23b3aa6b',
+      executeDirectFlashArb: '0x7804d9ac',
+      rescueTokens: '0x00ae3bf8',
+      rescueTokensTo: '0xa7070692',
+      routerCapabilities: '0x459a01ae',
+      owner: '0x8da5cb5b',
+    },
+    routeTypes,
+    allFourRouteTypesReady: routeTypes.every((r) => r.available),
+  };
+}
+
+export const KNOWN_FLASH_ARB_CONTRACTS: Record<SupportedArbChain, string[]> = {
+  ethereum: [],
+  polygon: [],
+  bsc: [],
+  avalanche: [],
+  arbitrum: [
+    '0xeee31ff9e69904b43c124095b6f33aa61505bcc2',
+    '0x19359c6C418669FCfC46196970814353b8766BE0',
+  ],
+  base: [
+    '0x37440674a814f24d9C6ea0990b272215D40c4512',
+    '0xBBA273E057cDa31bB359d8AA8749256246B6d0cC',
+    '0x29b35c83955146ba8fd754b4b96956d245a5661e',
+  ],
+  optimism: [
+    '0x738C8Eb31316B23d9b8A68B0c2658B456c932598',
+  ],
+  linea: [],
+  scroll: [],
+  apechain: [],
+};
+
+const ZERO_EVM_ADDRESS = '0x0000000000000000000000000000000000000000';
+
+function isContractPlaceholder(raw: unknown): boolean {
+  const s = String(raw ?? '').trim().toLowerCase();
+  return (
+    !s ||
+    s === 'undeployed' ||
+    s === 'none' ||
+    s === 'null' ||
+    s === 'undefined' ||
+    s === ZERO_EVM_ADDRESS
+  );
+}
+
+export function normalizeValidContractAddress(raw: unknown): string | null {
+  const s = String(raw ?? '').trim();
+  if (!/^0x[a-fA-F0-9]{40}$/.test(s)) return null;
+  const checksummed = ethers.getAddress(s.toLowerCase());
+  if (checksummed === ZERO_EVM_ADDRESS) return null;
+  return checksummed;
+}
+
+export interface ResolveSweepContractsInput {
+  chain: SupportedArbChain;
+  requestedContract?: unknown;
+  deployedContract?: unknown;
+  extraContracts?: unknown[];
+  hasWalletSweepTarget?: boolean;
+}
+
+export interface ResolveSweepContractsResult {
+  ok: boolean;
+  contracts: string[];
+  primaryContract: string | null;
+  invalidExtraContracts: string[];
+  usedFallbackKnownContracts: boolean;
+  error?: string;
+}
+
+export function resolveAndValidateSweepContracts(
+  params: ResolveSweepContractsInput
+): ResolveSweepContractsResult {
+  const rawRequested = String(params.requestedContract ?? '').trim();
+  const normalizedRequested = isContractPlaceholder(rawRequested)
+    ? null
+    : normalizeValidContractAddress(rawRequested);
+
+  if (!isContractPlaceholder(rawRequested) && !normalizedRequested) {
+    return {
+      ok: false,
+      contracts: [],
+      primaryContract: null,
+      invalidExtraContracts: [],
+      usedFallbackKnownContracts: false,
+      error: `Invalid contractAddress "${rawRequested}". Provide a valid 42-character 0x EVM address or leave blank to use known ${params.chain} contracts.`,
+    };
+  }
+
+  const dedup = new Map<string, string>();
+  const addCandidate = (addr: unknown) => {
+    const valid = normalizeValidContractAddress(addr);
+    if (valid && !dedup.has(valid.toLowerCase())) {
+      dedup.set(valid.toLowerCase(), valid);
+    }
+  };
+
+  if (normalizedRequested) {
+    dedup.set(normalizedRequested.toLowerCase(), normalizedRequested);
+  }
+  addCandidate(params.deployedContract);
+
+  const invalidExtraContracts: string[] = [];
+  if (Array.isArray(params.extraContracts)) {
+    for (const extra of params.extraContracts) {
+      if (isContractPlaceholder(extra)) continue;
+      const valid = normalizeValidContractAddress(extra);
+      if (valid) {
+        addCandidate(valid);
+      } else {
+        invalidExtraContracts.push(String(extra ?? '').trim());
+      }
+    }
+  }
+
+  const knownForChain = KNOWN_FLASH_ARB_CONTRACTS[params.chain] || [];
+  const beforeKnownCount = dedup.size;
+  for (const known of knownForChain) {
+    addCandidate(known);
+  }
+  const usedFallbackKnownContracts = !normalizedRequested && beforeKnownCount === 0 && dedup.size > 0;
+
+  const contracts = Array.from(dedup.values());
+  if (contracts.length === 0 && !params.hasWalletSweepTarget) {
+    const chainMeta = CHAIN_LAYER_META[params.chain];
+    const chainLabel = chainMeta ? `${params.chain.toUpperCase()} (${chainMeta.layer})` : params.chain;
+    return {
+      ok: false,
+      contracts: [],
+      primaryContract: null,
+      invalidExtraContracts,
+      usedFallbackKnownContracts: false,
+      error: `No deployed FlashArb contract registered on ${chainLabel} and no Gas/Connected Wallet sweep option is enabled. Deploy or save a contract address, or enable Gas Wallet sweep.`,
+    };
+  }
+
+  return {
+    ok: true,
+    contracts,
+    primaryContract: contracts[0] ?? null,
+    invalidExtraContracts,
+    usedFallbackKnownContracts,
+  };
+}
+
+
 

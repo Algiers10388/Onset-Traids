@@ -183,6 +183,8 @@ export interface StrategyParameters {
   stopLossPercent: number;
   trailingStopEnabled: boolean;
   trailingStopPercent: number;
+  smartTrailingEnabled?: boolean; // Dynamically adjusts trailing stop distance from real-time ATR volatility
+  smartTrailingAtrMultiplier?: number; // ATR multiplier used by Smart Trailing (default 1.5x)
   orderSizePercent: number;
   leverage: number;
   slippagePercent: number;

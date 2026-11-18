@@ -817,10 +817,326 @@ export const OPTIMISM_TOKENS: ArbTokenConfig[] = [
   },
 ];
 
-export function getChainTokenConfigs(chain: 'arbitrum' | 'base' | 'optimism'): ArbTokenConfig[] {
-  if (chain === 'base') return BASE_TOKENS;
-  if (chain === 'optimism') return OPTIMISM_TOKENS;
-  return ARB_TOKENS;
+export type BlockchainLayer = 'L1' | 'L2' | 'L3';
+export type AllLayerFilter = BlockchainLayer | 'L4' | 'ALL';
+
+export type ChainKey =
+  | 'ethereum'
+  | 'polygon'
+  | 'bsc'
+  | 'avalanche'
+  | 'arbitrum'
+  | 'base'
+  | 'optimism'
+  | 'linea'
+  | 'scroll'
+  | 'apechain';
+
+export type ChainDisplayName =
+  | 'Ethereum'
+  | 'Polygon'
+  | 'BSC'
+  | 'Avalanche'
+  | 'Arbitrum'
+  | 'Base'
+  | 'Optimism'
+  | 'Linea'
+  | 'Scroll'
+  | 'ApeChain';
+
+export interface ChainCatalogItem {
+  key: ChainKey;
+  name: string;
+  shortName: ChainDisplayName;
+  layer: BlockchainLayer;
+  chainIdDec: number;
+  chainIdHex: string;
+  nativeSymbol: string;
+  wrappedNativeSymbol: string;
+  explorer: string;
+  rpcUrl: string;
+  balancerVault: string;
+  aavePool: string;
+  defaultContract: string;
+  icon: string;
+  settlementModel: string;
+  defaultPoolCountEstimate: number;
+}
+
+export const CHAIN_CONFIG_CATALOG: ChainCatalogItem[] = [
+  {
+    key: 'ethereum',
+    name: 'Ethereum Mainnet',
+    shortName: 'Ethereum',
+    layer: 'L1',
+    chainIdDec: 1,
+    chainIdHex: '0x1',
+    nativeSymbol: 'ETH',
+    wrappedNativeSymbol: 'WETH',
+    explorer: 'https://etherscan.io',
+    rpcUrl: 'https://eth.llamarpc.com',
+    balancerVault: '0xBA12222222228d8Ba445958a75a0704d566BF2C8',
+    aavePool: '0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2',
+    defaultContract: '',
+    icon: '💎',
+    settlementModel: 'L1 Sovereign Proof-of-Stake Settlement',
+    defaultPoolCountEstimate: 57,
+  },
+  {
+    key: 'polygon',
+    name: 'Polygon PoS',
+    shortName: 'Polygon',
+    layer: 'L1',
+    chainIdDec: 137,
+    chainIdHex: '0x89',
+    nativeSymbol: 'POL',
+    wrappedNativeSymbol: 'WMATIC',
+    explorer: 'https://polygonscan.com',
+    rpcUrl: 'https://polygon-bor-rpc.publicnode.com',
+    balancerVault: '0xBA12222222228d8Ba445958a75a0704d566BF2C8',
+    aavePool: '0x794a61358D6845594F94dc1DB02A252b5b4814aD',
+    defaultContract: '',
+    icon: '🟣',
+    settlementModel: 'L1 High-Throughput Sidechain / Heimdall PoS',
+    defaultPoolCountEstimate: 84,
+  },
+  {
+    key: 'bsc',
+    name: 'BNB Smart Chain',
+    shortName: 'BSC',
+    layer: 'L1',
+    chainIdDec: 56,
+    chainIdHex: '0x38',
+    nativeSymbol: 'BNB',
+    wrappedNativeSymbol: 'WBNB',
+    explorer: 'https://bscscan.com',
+    rpcUrl: 'https://bsc-dataseed.binance.org',
+    balancerVault: '0xBA12222222228d8Ba445958a75a0704d566BF2C8',
+    aavePool: '0x6807dc923806fE8Fd134338EABCA509979a7e0cB',
+    defaultContract: '',
+    icon: '🟠',
+    settlementModel: 'L1 Parlia PoSA Consensus',
+    defaultPoolCountEstimate: 69,
+  },
+  {
+    key: 'avalanche',
+    name: 'Avalanche C-Chain',
+    shortName: 'Avalanche',
+    layer: 'L1',
+    chainIdDec: 43114,
+    chainIdHex: '0xa86a',
+    nativeSymbol: 'AVAX',
+    wrappedNativeSymbol: 'WAVAX',
+    explorer: 'https://snowtrace.io',
+    rpcUrl: 'https://api.avax.network/ext/bc/C/rpc',
+    balancerVault: '0xBA12222222228d8Ba445958a75a0704d566BF2C8',
+    aavePool: '0x794a61358D6845594F94dc1DB02A252b5b4814aD',
+    defaultContract: '',
+    icon: '🔺',
+    settlementModel: 'L1 Snowman Sub-Second Finality Consensus',
+    defaultPoolCountEstimate: 43,
+  },
+  {
+    key: 'arbitrum',
+    name: 'Arbitrum One',
+    shortName: 'Arbitrum',
+    layer: 'L2',
+    chainIdDec: 42161,
+    chainIdHex: '0xa4b1',
+    nativeSymbol: 'ETH',
+    wrappedNativeSymbol: 'WETH',
+    explorer: 'https://arbiscan.io',
+    rpcUrl: 'https://arb1.arbitrum.io/rpc',
+    balancerVault: '0xBA12222222228d8Ba445958a75a0704d566BF2C8',
+    aavePool: '0x794a61358D6845594F94dc1DB02A252b5b4814aD',
+    defaultContract: '0xeee31ff9e69904b43c124095b6f33aa61505bcc2',
+    icon: '🔵',
+    settlementModel: 'L2 Optimistic Nitro Rollup -> Ethereum L1',
+    defaultPoolCountEstimate: 70,
+  },
+  {
+    key: 'base',
+    name: 'Base L2',
+    shortName: 'Base',
+    layer: 'L2',
+    chainIdDec: 8453,
+    chainIdHex: '0x2105',
+    nativeSymbol: 'ETH',
+    wrappedNativeSymbol: 'WETH',
+    explorer: 'https://basescan.org',
+    rpcUrl: 'https://mainnet.base.org',
+    balancerVault: '0xBA12222222228d8Ba445958a75a0704d566BF2C8',
+    aavePool: '0xA238Dd80C259a72e81d7e4664a9801593F98d1c5',
+    defaultContract: '0x37440674a814f24d9C6ea0990b272215D40c4512',
+    icon: '🟡',
+    settlementModel: 'L2 Optimistic OP-Stack Rollup -> Ethereum L1',
+    defaultPoolCountEstimate: 95,
+  },
+  {
+    key: 'optimism',
+    name: 'Optimism Mainnet',
+    shortName: 'Optimism',
+    layer: 'L2',
+    chainIdDec: 10,
+    chainIdHex: '0xa',
+    nativeSymbol: 'ETH',
+    wrappedNativeSymbol: 'WETH',
+    explorer: 'https://optimistic.etherscan.io',
+    rpcUrl: 'https://mainnet.optimism.io',
+    balancerVault: '0xBA12222222228d8Ba445958a75a0704d566BF2C8',
+    aavePool: '0x794a61358D6845594F94dc1DB02A252b5b4814aD',
+    defaultContract: '0x738C8Eb31316B23d9b8A68B0c2658B456c932598',
+    icon: '🔴',
+    settlementModel: 'L2 Optimistic OP-Stack Bedrock -> Ethereum L1',
+    defaultPoolCountEstimate: 26,
+  },
+  {
+    key: 'linea',
+    name: 'Linea zkEVM',
+    shortName: 'Linea',
+    layer: 'L2',
+    chainIdDec: 59144,
+    chainIdHex: '0xe708',
+    nativeSymbol: 'ETH',
+    wrappedNativeSymbol: 'WETH',
+    explorer: 'https://lineascan.build',
+    rpcUrl: 'https://rpc.linea.build',
+    balancerVault: '0xBA12222222228d8Ba445958a75a0704d566BF2C8',
+    aavePool: '0x0000000000000000000000000000000000000000',
+    defaultContract: '',
+    icon: '🟢',
+    settlementModel: 'L2 Type-2 zkEVM Rollup -> Ethereum L1',
+    defaultPoolCountEstimate: 23,
+  },
+  {
+    key: 'scroll',
+    name: 'Scroll zkEVM',
+    shortName: 'Scroll',
+    layer: 'L2',
+    chainIdDec: 534352,
+    chainIdHex: '0x82750',
+    nativeSymbol: 'ETH',
+    wrappedNativeSymbol: 'WETH',
+    explorer: 'https://scrollscan.com',
+    rpcUrl: 'https://rpc.scroll.io',
+    balancerVault: '0xBA12222222228d8Ba445958a75a0704d566BF2C8',
+    aavePool: '0x11fCfe756c05AD438e312a7fd934381537D3cFfe',
+    defaultContract: '',
+    icon: '📜',
+    settlementModel: 'L2 Bytecode zkEVM Rollup -> Ethereum L1',
+    defaultPoolCountEstimate: 27,
+  },
+  {
+    key: 'apechain',
+    name: 'ApeChain Orbit L3',
+    shortName: 'ApeChain',
+    layer: 'L3',
+    chainIdDec: 33139,
+    chainIdHex: '0x8173',
+    nativeSymbol: 'APE',
+    wrappedNativeSymbol: 'WAPE',
+    explorer: 'https://apescan.io',
+    rpcUrl: 'https://rpc.apechain.com/http',
+    balancerVault: '0x0000000000000000000000000000000000000000',
+    aavePool: '0x0000000000000000000000000000000000000000',
+    defaultContract: '',
+    icon: '🦍',
+    settlementModel: 'L3 Arbitrum Orbit App-Chain -> Arbitrum L2 -> Ethereum L1',
+    defaultPoolCountEstimate: 3,
+  },
+];
+
+export const ETHEREUM_TOKENS: ArbTokenConfig[] = [
+  { symbol: 'WETH', name: 'Wrapped Ether (L1)', price: 2850, decimals: 18, category: 'Major', defaultLoan: 25, maxLoan: 250, loanStep: 1, aaveAvailable: true, balancerAvailable: true, typicalSpreadBps: 14, iconBg: 'bg-indigo-500/20 text-indigo-300 border-indigo-500/30', contractAddressArb: '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2' },
+  { symbol: 'USDC', name: 'USD Coin (L1)', price: 1.0, decimals: 6, category: 'Stablecoin', defaultLoan: 65000, maxLoan: 1000000, loanStep: 10000, aaveAvailable: true, balancerAvailable: true, typicalSpreadBps: 10, iconBg: 'bg-blue-500/20 text-blue-300 border-blue-500/30', contractAddressArb: '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48' },
+  { symbol: 'USDT', name: 'Tether USD (L1)', price: 1.0, decimals: 6, category: 'Stablecoin', defaultLoan: 65000, maxLoan: 1000000, loanStep: 10000, aaveAvailable: true, balancerAvailable: true, typicalSpreadBps: 12, iconBg: 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30', contractAddressArb: '0xdAC17F958D2ee523a2206206994597C13D831ec7' },
+  { symbol: 'WBTC', name: 'Wrapped Bitcoin (L1)', price: 65500, decimals: 8, category: 'Major', defaultLoan: 2, maxLoan: 20, loanStep: 0.1, aaveAvailable: true, balancerAvailable: true, typicalSpreadBps: 18, iconBg: 'bg-amber-500/20 text-amber-300 border-amber-500/30', contractAddressArb: '0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599' },
+  { symbol: 'DAI', name: 'Maker Dai (L1)', price: 1.0, decimals: 18, category: 'Stablecoin', defaultLoan: 65000, maxLoan: 1000000, loanStep: 10000, aaveAvailable: true, balancerAvailable: true, typicalSpreadBps: 12, iconBg: 'bg-amber-500/20 text-amber-300 border-amber-500/30', contractAddressArb: '0x6B175474E89094C44Da98b954EedeAC495271d0F' },
+  { symbol: 'LINK', name: 'Chainlink Token', price: 14.2, decimals: 18, category: 'Ecosystem', defaultLoan: 2500, maxLoan: 25000, loanStep: 250, aaveAvailable: true, balancerAvailable: true, typicalSpreadBps: 24, iconBg: 'bg-sky-500/20 text-sky-300 border-sky-500/30', contractAddressArb: '0x514910771AF9Ca656af840dff83E8264EcF986CA' },
+  { symbol: 'UNI', name: 'Uniswap Token', price: 8.2, decimals: 18, category: 'DeFi', defaultLoan: 6000, maxLoan: 60000, loanStep: 500, aaveAvailable: true, balancerAvailable: true, typicalSpreadBps: 24, iconBg: 'bg-pink-500/20 text-pink-300 border-pink-500/30', contractAddressArb: '0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984' },
+  { symbol: 'AAVE', name: 'Aave Token', price: 152.0, decimals: 18, category: 'DeFi', defaultLoan: 350, maxLoan: 3500, loanStep: 50, aaveAvailable: true, balancerAvailable: true, typicalSpreadBps: 24, iconBg: 'bg-cyan-500/20 text-cyan-300 border-cyan-500/30', contractAddressArb: '0x7Fc66500c84A76Ad7e9c93437bFc5Ac33E2DDaE9' },
+];
+
+export const POLYGON_TOKENS: ArbTokenConfig[] = [
+  { symbol: 'WMATIC', name: 'Wrapped POL (MATIC)', price: 0.45, decimals: 18, category: 'Ecosystem', defaultLoan: 50000, maxLoan: 500000, loanStep: 5000, aaveAvailable: true, balancerAvailable: true, typicalSpreadBps: 24, iconBg: 'bg-purple-500/20 text-purple-300 border-purple-500/30', contractAddressArb: '0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270' },
+  { symbol: 'WETH', name: 'Wrapped Ether (PoS)', price: 2850, decimals: 18, category: 'Major', defaultLoan: 20, maxLoan: 200, loanStep: 1, aaveAvailable: true, balancerAvailable: true, typicalSpreadBps: 18, iconBg: 'bg-indigo-500/20 text-indigo-300 border-indigo-500/30', contractAddressArb: '0x7ceB23fD6bC0adD59E62ac25578270cFf1b9f619' },
+  { symbol: 'USDC', name: 'USD Coin (Native)', price: 1.0, decimals: 6, category: 'Stablecoin', defaultLoan: 50000, maxLoan: 500000, loanStep: 5000, aaveAvailable: true, balancerAvailable: true, typicalSpreadBps: 12, iconBg: 'bg-blue-500/20 text-blue-300 border-blue-500/30', contractAddressArb: '0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359' },
+  { symbol: 'USDC.e', name: 'USD Coin (Bridged)', price: 1.0, decimals: 6, category: 'Stablecoin', defaultLoan: 50000, maxLoan: 500000, loanStep: 5000, aaveAvailable: true, balancerAvailable: true, typicalSpreadBps: 14, iconBg: 'bg-blue-600/20 text-blue-300 border-blue-600/30', contractAddressArb: '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174' },
+  { symbol: 'USDT', name: 'Tether USD (PoS)', price: 1.0, decimals: 6, category: 'Stablecoin', defaultLoan: 50000, maxLoan: 500000, loanStep: 5000, aaveAvailable: true, balancerAvailable: true, typicalSpreadBps: 14, iconBg: 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30', contractAddressArb: '0xc2132D05D31c914a87C6611C10748AEb04B58e8F' },
+  { symbol: 'WBTC', name: 'Wrapped Bitcoin (PoS)', price: 65500, decimals: 8, category: 'Major', defaultLoan: 1.5, maxLoan: 15, loanStep: 0.1, aaveAvailable: true, balancerAvailable: true, typicalSpreadBps: 22, iconBg: 'bg-amber-500/20 text-amber-300 border-amber-500/30', contractAddressArb: '0x1BFD67037B42Cf73acF2047067bd4F2C47D9BfD6' },
+  { symbol: 'DAI', name: 'Maker Dai (PoS)', price: 1.0, decimals: 18, category: 'Stablecoin', defaultLoan: 50000, maxLoan: 500000, loanStep: 5000, aaveAvailable: true, balancerAvailable: true, typicalSpreadBps: 15, iconBg: 'bg-amber-500/20 text-amber-300 border-amber-500/30', contractAddressArb: '0x8f3Cf7ad23Cd3CaDbD9735AFf958023239c6A063' },
+  { symbol: 'LINK', name: 'Chainlink (PoS)', price: 14.2, decimals: 18, category: 'Ecosystem', defaultLoan: 2000, maxLoan: 20000, loanStep: 200, aaveAvailable: true, balancerAvailable: true, typicalSpreadBps: 28, iconBg: 'bg-sky-500/20 text-sky-300 border-sky-500/30', contractAddressArb: '0x53E0bca35eC356BD5ddDFebbD1Fc0fD03FaBad39' },
+  { symbol: 'AAVE', name: 'Aave (PoS)', price: 152.0, decimals: 18, category: 'DeFi', defaultLoan: 250, maxLoan: 2500, loanStep: 25, aaveAvailable: true, balancerAvailable: true, typicalSpreadBps: 28, iconBg: 'bg-cyan-500/20 text-cyan-300 border-cyan-500/30', contractAddressArb: '0xD6DF932A45C0f255f85145f286eA0b292B21C90B' },
+];
+
+export const BSC_TOKENS: ArbTokenConfig[] = [
+  { symbol: 'WBNB', name: 'Wrapped BNB', price: 600, decimals: 18, category: 'Ecosystem', defaultLoan: 50, maxLoan: 500, loanStep: 5, aaveAvailable: true, balancerAvailable: false, typicalSpreadBps: 20, iconBg: 'bg-amber-500/20 text-amber-300 border-amber-500/30', contractAddressArb: '0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c' },
+  { symbol: 'USDT', name: 'BSC-USD (Tether 18-dec)', price: 1.0, decimals: 18, category: 'Stablecoin', defaultLoan: 50000, maxLoan: 500000, loanStep: 5000, aaveAvailable: true, balancerAvailable: false, typicalSpreadBps: 12, iconBg: 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30', contractAddressArb: '0x55d398326f99059fF775485246999027B3197955' },
+  { symbol: 'USDC', name: 'Binance-Peg USDC (18-dec)', price: 1.0, decimals: 18, category: 'Stablecoin', defaultLoan: 50000, maxLoan: 500000, loanStep: 5000, aaveAvailable: true, balancerAvailable: false, typicalSpreadBps: 12, iconBg: 'bg-blue-500/20 text-blue-300 border-blue-500/30', contractAddressArb: '0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d' },
+  { symbol: 'WETH', name: 'Binance-Peg ETH (18-dec)', price: 2850, decimals: 18, category: 'Major', defaultLoan: 15, maxLoan: 150, loanStep: 1, aaveAvailable: true, balancerAvailable: false, typicalSpreadBps: 18, iconBg: 'bg-indigo-500/20 text-indigo-300 border-indigo-500/30', contractAddressArb: '0x2170Ed0880ac9A755fd29B2688956BD959F933F8' },
+  { symbol: 'BTCB', name: 'Binance-Peg BTCB (18-dec)', price: 65500, decimals: 18, category: 'Major', defaultLoan: 1.5, maxLoan: 15, loanStep: 0.1, aaveAvailable: true, balancerAvailable: false, typicalSpreadBps: 20, iconBg: 'bg-amber-600/20 text-amber-300 border-amber-600/30', contractAddressArb: '0x7130d2A12B9BCbFAe4f2634d864A1Ee1Ce3Ead9c' },
+  { symbol: 'CAKE', name: 'PancakeSwap Token', price: 2.2, decimals: 18, category: 'DeFi', defaultLoan: 10000, maxLoan: 100000, loanStep: 1000, aaveAvailable: false, balancerAvailable: false, typicalSpreadBps: 32, iconBg: 'bg-yellow-500/20 text-yellow-300 border-yellow-500/30', contractAddressArb: '0x0E09FaBB73Bd3Ade0a17ECC321fD13a19e81cE82' },
+];
+
+export const AVALANCHE_TOKENS: ArbTokenConfig[] = [
+  { symbol: 'WAVAX', name: 'Wrapped AVAX', price: 28, decimals: 18, category: 'Ecosystem', defaultLoan: 1000, maxLoan: 10000, loanStep: 100, aaveAvailable: true, balancerAvailable: true, typicalSpreadBps: 24, iconBg: 'bg-rose-500/20 text-rose-300 border-rose-500/30', contractAddressArb: '0xB31f66AA3C1e785363F0875A1B74E27b85FD66c7' },
+  { symbol: 'USDC', name: 'USD Coin (Avalanche)', price: 1.0, decimals: 6, category: 'Stablecoin', defaultLoan: 50000, maxLoan: 500000, loanStep: 5000, aaveAvailable: true, balancerAvailable: true, typicalSpreadBps: 14, iconBg: 'bg-blue-500/20 text-blue-300 border-blue-500/30', contractAddressArb: '0xB97EF9Ef8734C71904D8002F8b6Bc66Dd9c48a6E' },
+  { symbol: 'USDT', name: 'Tether USD (Avalanche)', price: 1.0, decimals: 6, category: 'Stablecoin', defaultLoan: 50000, maxLoan: 500000, loanStep: 5000, aaveAvailable: true, balancerAvailable: true, typicalSpreadBps: 14, iconBg: 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30', contractAddressArb: '0x9702230A8Ea53601f5cD2dc00fDBc13d4dF4A8c7' },
+  { symbol: 'WETH', name: 'WETH.e (Avalanche)', price: 2850, decimals: 18, category: 'Major', defaultLoan: 15, maxLoan: 150, loanStep: 1, aaveAvailable: true, balancerAvailable: true, typicalSpreadBps: 20, iconBg: 'bg-indigo-500/20 text-indigo-300 border-indigo-500/30', contractAddressArb: '0x49D5c2BdFfac6CE2BFdB6640F4F80f226bc10bAB' },
+  { symbol: 'BTC.b', name: 'Avalanche Bitcoin Bridge', price: 65500, decimals: 8, category: 'Major', defaultLoan: 1.5, maxLoan: 15, loanStep: 0.1, aaveAvailable: true, balancerAvailable: true, typicalSpreadBps: 24, iconBg: 'bg-amber-500/20 text-amber-300 border-amber-500/30', contractAddressArb: '0x152b9d0FdC40C096757F570A51E494bd4b943E50' },
+  { symbol: 'WBTC', name: 'WBTC.e (Avalanche)', price: 65500, decimals: 8, category: 'Major', defaultLoan: 1.5, maxLoan: 15, loanStep: 0.1, aaveAvailable: true, balancerAvailable: true, typicalSpreadBps: 26, iconBg: 'bg-amber-600/20 text-amber-300 border-amber-600/30', contractAddressArb: '0x50b7545627a5162F82A992c33b87aDc75187B218' },
+  { symbol: 'JOE', name: 'JoeToken (Trader Joe)', price: 0.38, decimals: 18, category: 'DeFi', defaultLoan: 50000, maxLoan: 500000, loanStep: 5000, aaveAvailable: false, balancerAvailable: true, typicalSpreadBps: 38, iconBg: 'bg-orange-500/20 text-orange-300 border-orange-500/30', contractAddressArb: '0x6e84a6216eA6dACC71eE8E6b0a5B7322EEbC0fDd' },
+];
+
+export const LINEA_TOKENS: ArbTokenConfig[] = [
+  { symbol: 'WETH', name: 'Wrapped Ether (Linea)', price: 2850, decimals: 18, category: 'Major', defaultLoan: 15, maxLoan: 150, loanStep: 1, aaveAvailable: false, balancerAvailable: false, typicalSpreadBps: 22, iconBg: 'bg-indigo-500/20 text-indigo-300 border-indigo-500/30', contractAddressArb: '0xe5D7C2a44FfDDf6b295A15c148167daaAf5Cf34f' },
+  { symbol: 'USDC', name: 'USD Coin (Linea)', price: 1.0, decimals: 6, category: 'Stablecoin', defaultLoan: 35000, maxLoan: 350000, loanStep: 5000, aaveAvailable: false, balancerAvailable: false, typicalSpreadBps: 16, iconBg: 'bg-blue-500/20 text-blue-300 border-blue-500/30', contractAddressArb: '0x176211869cA2b568f2A7D4EE941E073a821EE1ff' },
+  { symbol: 'USDT', name: 'Tether USD (Linea)', price: 1.0, decimals: 6, category: 'Stablecoin', defaultLoan: 35000, maxLoan: 350000, loanStep: 5000, aaveAvailable: false, balancerAvailable: false, typicalSpreadBps: 18, iconBg: 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30', contractAddressArb: '0xA219439258ca9da29E9Cc4cE5596924745e12B93' },
+  { symbol: 'WBTC', name: 'Wrapped Bitcoin (Linea)', price: 65500, decimals: 8, category: 'Major', defaultLoan: 1.0, maxLoan: 10, loanStep: 0.1, aaveAvailable: false, balancerAvailable: false, typicalSpreadBps: 26, iconBg: 'bg-amber-500/20 text-amber-300 border-amber-500/30', contractAddressArb: '0x3aAB2285ddcDdaD8edf438C1bAB47e1a9D05a9b4' },
+  { symbol: 'DAI', name: 'Maker Dai (Linea)', price: 1.0, decimals: 18, category: 'Stablecoin', defaultLoan: 35000, maxLoan: 350000, loanStep: 5000, aaveAvailable: false, balancerAvailable: false, typicalSpreadBps: 18, iconBg: 'bg-amber-500/20 text-amber-300 border-amber-500/30', contractAddressArb: '0x4AF15ec2A0BD43Db75dd04E62FAA3B8EF36b00d5' },
+  { symbol: 'ezETH', name: 'Renzo Restaked ETH', price: 2920, decimals: 18, category: 'LST / LRT', defaultLoan: 12, maxLoan: 120, loanStep: 1, aaveAvailable: false, balancerAvailable: false, typicalSpreadBps: 36, iconBg: 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30', contractAddressArb: '0x2416092f143378750bb29b79eD961ab195CcEea5' },
+  { symbol: 'wstETH', name: 'Lido Wrapped Staked ETH', price: 3350, decimals: 18, category: 'LST / LRT', defaultLoan: 12, maxLoan: 120, loanStep: 1, aaveAvailable: false, balancerAvailable: false, typicalSpreadBps: 28, iconBg: 'bg-cyan-500/20 text-cyan-300 border-cyan-500/30', contractAddressArb: '0xB5beDd42000b71FddE22D3eE8a79Bd49A568fC8F' },
+];
+
+export const SCROLL_TOKENS: ArbTokenConfig[] = [
+  { symbol: 'WETH', name: 'Wrapped Ether (Scroll)', price: 2850, decimals: 18, category: 'Major', defaultLoan: 15, maxLoan: 150, loanStep: 1, aaveAvailable: true, balancerAvailable: false, typicalSpreadBps: 22, iconBg: 'bg-indigo-500/20 text-indigo-300 border-indigo-500/30', contractAddressArb: '0x5300000000000000000000000000000000000004' },
+  { symbol: 'USDC', name: 'USD Coin (Scroll)', price: 1.0, decimals: 6, category: 'Stablecoin', defaultLoan: 35000, maxLoan: 350000, loanStep: 5000, aaveAvailable: true, balancerAvailable: false, typicalSpreadBps: 16, iconBg: 'bg-blue-500/20 text-blue-300 border-blue-500/30', contractAddressArb: '0x06eFdBFf2a14a7c8E15944D1F4A48F9F95F663A4' },
+  { symbol: 'USDT', name: 'Tether USD (Scroll)', price: 1.0, decimals: 6, category: 'Stablecoin', defaultLoan: 35000, maxLoan: 350000, loanStep: 5000, aaveAvailable: true, balancerAvailable: false, typicalSpreadBps: 18, iconBg: 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30', contractAddressArb: '0xf55BEC9cafDbE8730f096Aa55dad6D22d44099Df' },
+  { symbol: 'WBTC', name: 'Wrapped Bitcoin (Scroll)', price: 65500, decimals: 8, category: 'Major', defaultLoan: 1.0, maxLoan: 10, loanStep: 0.1, aaveAvailable: true, balancerAvailable: false, typicalSpreadBps: 26, iconBg: 'bg-amber-500/20 text-amber-300 border-amber-500/30', contractAddressArb: '0x3C1BCa5a656e69edCD0D4E36BEbb3FcDAcA60Cf1' },
+  { symbol: 'DAI', name: 'Maker Dai (Scroll)', price: 1.0, decimals: 18, category: 'Stablecoin', defaultLoan: 35000, maxLoan: 350000, loanStep: 5000, aaveAvailable: false, balancerAvailable: false, typicalSpreadBps: 18, iconBg: 'bg-amber-500/20 text-amber-300 border-amber-500/30', contractAddressArb: '0xcA77eB3fEFe3725Dc33bccB54eDEFc3D9f764f97' },
+  { symbol: 'SCR', name: 'Scroll Governance Token', price: 0.75, decimals: 18, category: 'Ecosystem', defaultLoan: 25000, maxLoan: 250000, loanStep: 2500, aaveAvailable: false, balancerAvailable: false, typicalSpreadBps: 38, iconBg: 'bg-amber-600/20 text-amber-300 border-amber-600/30', contractAddressArb: '0xd29687c813D741E2F938F4aC377128810E217b1b' },
+];
+
+export const APECHAIN_TOKENS: ArbTokenConfig[] = [
+  { symbol: 'WAPE', name: 'Wrapped APE (Orbit L3)', price: 1.1, decimals: 18, category: 'Ecosystem', defaultLoan: 20000, maxLoan: 200000, loanStep: 2000, aaveAvailable: false, balancerAvailable: false, typicalSpreadBps: 38, iconBg: 'bg-blue-600/20 text-blue-300 border-blue-600/30', contractAddressArb: '0x48b62137EdfA95a428D35C09E44256a739F6B557' },
+  { symbol: 'ApeUSD', name: 'ApeChain Stablecoin', price: 1.0, decimals: 18, category: 'Stablecoin', defaultLoan: 25000, maxLoan: 250000, loanStep: 2500, aaveAvailable: false, balancerAvailable: false, typicalSpreadBps: 24, iconBg: 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30', contractAddressArb: '0xA2235d059F80e176D931Ef76b6C51953Eb3fBEf4' },
+  { symbol: 'ApeETH', name: 'ApeChain Yield ETH', price: 2850, decimals: 18, category: 'LST / LRT', defaultLoan: 10, maxLoan: 100, loanStep: 1, aaveAvailable: false, balancerAvailable: false, typicalSpreadBps: 30, iconBg: 'bg-indigo-500/20 text-indigo-300 border-indigo-500/30', contractAddressArb: '0xcF800F4948D16F23333508191B1B1591daF70438' },
+];
+
+export function getChainTokenConfigs(chain: ChainKey | string): ArbTokenConfig[] {
+  switch (String(chain || 'arbitrum').toLowerCase()) {
+    case 'ethereum':
+      return ETHEREUM_TOKENS;
+    case 'polygon':
+      return POLYGON_TOKENS;
+    case 'bsc':
+      return BSC_TOKENS;
+    case 'avalanche':
+      return AVALANCHE_TOKENS;
+    case 'base':
+      return BASE_TOKENS;
+    case 'optimism':
+      return OPTIMISM_TOKENS;
+    case 'linea':
+      return LINEA_TOKENS;
+    case 'scroll':
+      return SCROLL_TOKENS;
+    case 'apechain':
+      return APECHAIN_TOKENS;
+    case 'arbitrum':
+    default:
+      return ARB_TOKENS;
+  }
 }
 
 export interface DexPoolInfo {
@@ -835,10 +1151,17 @@ export interface DexPoolInfo {
     | 'VELODROME'
     | 'BALANCER_V2'
     | 'TRADER_JOE_V2'
+    | 'TRADER_JOE_V1'
+    | 'QUICKSWAP_V2'
+    | 'QUICKSWAP_V3'
     | 'PANCAKESWAP_V3'
+    | 'PANCAKESWAP_V2'
+    | 'PANGOLIN_V2'
+    | 'LYNEX_V3'
+    | 'NURI_V3'
     | 'DODO_V2';
   feeTier: string;
-  chains: ('Arbitrum' | 'Base' | 'Optimism')[];
+  chains: ChainDisplayName[];
   avgGas: number;
   slippageModel: string;
   tagColor: string;
@@ -850,7 +1173,7 @@ export const SUPPORTED_DEX_POOLS: DexPoolInfo[] = [
     name: 'Uniswap V3 (0.01% Tick)',
     protocol: 'UNISWAP_V3',
     feeTier: '0.01%',
-    chains: ['Arbitrum', 'Base', 'Optimism'],
+    chains: ['Ethereum', 'Polygon', 'BSC', 'Avalanche', 'Arbitrum', 'Base', 'Optimism', 'Linea', 'Scroll'],
     avgGas: 108000,
     slippageModel: 'Concentrated Liquidity (Ultra-tight LST & stablecoin ticks)',
     tagColor: 'text-pink-400 bg-pink-500/10 border-pink-500/30',
@@ -860,7 +1183,7 @@ export const SUPPORTED_DEX_POOLS: DexPoolInfo[] = [
     name: 'Uniswap V3 (0.05% Tick)',
     protocol: 'UNISWAP_V3',
     feeTier: '0.05%',
-    chains: ['Arbitrum', 'Base', 'Optimism'],
+    chains: ['Ethereum', 'Polygon', 'BSC', 'Avalanche', 'Arbitrum', 'Base', 'Optimism', 'Linea', 'Scroll'],
     avgGas: 110000,
     slippageModel: 'Concentrated Liquidity (Tick range spacing 10)',
     tagColor: 'text-pink-400 bg-pink-500/10 border-pink-500/30',
@@ -870,7 +1193,7 @@ export const SUPPORTED_DEX_POOLS: DexPoolInfo[] = [
     name: 'Uniswap V3 (0.30% Tick)',
     protocol: 'UNISWAP_V3',
     feeTier: '0.30%',
-    chains: ['Arbitrum', 'Base', 'Optimism'],
+    chains: ['Ethereum', 'Polygon', 'BSC', 'Avalanche', 'Arbitrum', 'Base', 'Optimism', 'Linea', 'Scroll'],
     avgGas: 110000,
     slippageModel: 'Concentrated Liquidity (Standard volatile pairs)',
     tagColor: 'text-pink-400 bg-pink-500/10 border-pink-500/30',
@@ -880,17 +1203,27 @@ export const SUPPORTED_DEX_POOLS: DexPoolInfo[] = [
     name: 'PancakeSwap V3',
     protocol: 'PANCAKESWAP_V3',
     feeTier: '0.01-0.25%',
-    chains: ['Arbitrum', 'Base'],
+    chains: ['Ethereum', 'BSC', 'Arbitrum', 'Base', 'Linea'],
     avgGas: 110000,
     slippageModel: 'Uniswap V3 Concentrated Fork (SwapRouter 0x1b81...eB14)',
     tagColor: 'text-yellow-400 bg-yellow-500/10 border-yellow-500/30',
     contractRouter: '0x1b81D678ffb9C0263b24A97847620C99d213eB14',
   },
   {
+    name: 'PancakeSwap V2',
+    protocol: 'PANCAKESWAP_V2',
+    feeTier: '0.25%',
+    chains: ['BSC'],
+    avgGas: 92000,
+    slippageModel: 'Constant Product V2 CPMM (FlashArb _swapV2 on BSC)',
+    tagColor: 'text-yellow-400 bg-yellow-500/10 border-yellow-500/30',
+    contractRouter: '0x10ED43C718714eb63d5aA57B78B54704E256024E',
+  },
+  {
     name: 'SushiSwap V3',
     protocol: 'UNISWAP_V3',
     feeTier: '0.05-0.30%',
-    chains: ['Arbitrum', 'Base', 'Optimism'],
+    chains: ['Polygon', 'Arbitrum', 'Base', 'Optimism', 'Scroll'],
     avgGas: 110000,
     slippageModel: 'SushiSwap V3 Concentrated Liquidity (SwapRouter)',
     tagColor: 'text-purple-400 bg-purple-500/10 border-purple-500/30',
@@ -900,7 +1233,7 @@ export const SUPPORTED_DEX_POOLS: DexPoolInfo[] = [
     name: 'Sushiswap V2',
     protocol: 'UNISWAP_V2',
     feeTier: '0.30%',
-    chains: ['Arbitrum', 'Base', 'Optimism'],
+    chains: ['Ethereum', 'Polygon', 'BSC', 'Avalanche', 'Arbitrum', 'Base', 'Optimism'],
     avgGas: 91000,
     slippageModel: 'Constant Product V2 CPMM (FlashArb _swapV2)',
     tagColor: 'text-purple-400 bg-purple-500/10 border-purple-500/30',
@@ -910,11 +1243,51 @@ export const SUPPORTED_DEX_POOLS: DexPoolInfo[] = [
     name: 'Uniswap V2 (CPMM)',
     protocol: 'UNISWAP_V2',
     feeTier: '0.30%',
-    chains: ['Base', 'Optimism'],
+    chains: ['Ethereum', 'Base', 'Optimism'],
     avgGas: 90000,
     slippageModel: 'Canonical Uniswap V2 Router02 (FlashArb _swapV2)',
     tagColor: 'text-pink-400 bg-pink-500/10 border-pink-500/30',
-    contractRouter: '0x4752ba5dbc23f44d87826276bf6fd6b1c372ad24',
+    contractRouter: '0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D',
+  },
+  {
+    name: 'QuickSwap V2',
+    protocol: 'QUICKSWAP_V2',
+    feeTier: '0.30%',
+    chains: ['Polygon'],
+    avgGas: 90000,
+    slippageModel: 'QuickSwap V2 Constant Product CPMM (FlashArb _swapV2)',
+    tagColor: 'text-indigo-400 bg-indigo-500/10 border-indigo-500/30',
+    contractRouter: '0xa5E0829CaCEd8fFDD4De3c43696c57F7D7A678ff',
+  },
+  {
+    name: 'QuickSwap V3 (Algebra)',
+    protocol: 'QUICKSWAP_V3',
+    feeTier: 'Dynamic (0.01-0.3%)',
+    chains: ['Polygon'],
+    avgGas: 106000,
+    slippageModel: 'Algebra Adaptive Concentrated Liquidity (Monitor-only)',
+    tagColor: 'text-purple-400 bg-purple-500/10 border-purple-500/30',
+    contractRouter: '0xf5b509bB0909a69B1c207E495f687a596C168E12',
+  },
+  {
+    name: 'Trader Joe V1 (CPMM)',
+    protocol: 'TRADER_JOE_V1',
+    feeTier: '0.30%',
+    chains: ['Avalanche'],
+    avgGas: 92000,
+    slippageModel: 'Avalanche Constant Product V2 Router (FlashArb _swapV2)',
+    tagColor: 'text-orange-400 bg-orange-500/10 border-orange-500/30',
+    contractRouter: '0x60aE616a2155Ee3d9A68541Ba4544862310933d4',
+  },
+  {
+    name: 'Pangolin V2',
+    protocol: 'PANGOLIN_V2',
+    feeTier: '0.30%',
+    chains: ['Avalanche'],
+    avgGas: 91000,
+    slippageModel: 'Avalanche Constant Product V2 Router (FlashArb _swapV2)',
+    tagColor: 'text-rose-400 bg-rose-500/10 border-rose-500/30',
+    contractRouter: '0xE54Ca86531e17Ef3616d22Ca28b0D458b6C89106',
   },
   {
     name: 'BaseSwap V2',
@@ -927,12 +1300,32 @@ export const SUPPORTED_DEX_POOLS: DexPoolInfo[] = [
     contractRouter: '0x327Df1E6de05895d2ab08513aaDD9313Fe505d86',
   },
   {
+    name: 'Lynex V3 (Algebra)',
+    protocol: 'LYNEX_V3',
+    feeTier: 'Dynamic (0.01-0.25%)',
+    chains: ['Linea'],
+    avgGas: 108000,
+    slippageModel: 'Linea Algebra Dynamic Fee Engine (Monitor-only)',
+    tagColor: 'text-emerald-400 bg-emerald-500/10 border-emerald-500/30',
+    contractRouter: '0x3921e8cb45B17fC029A0a6dE958b0E3c23B50741',
+  },
+  {
+    name: 'Nuri V3',
+    protocol: 'NURI_V3',
+    feeTier: '0.01-0.30%',
+    chains: ['Scroll'],
+    avgGas: 110000,
+    slippageModel: 'Scroll Concentrated Liquidity V3 SwapRouter',
+    tagColor: 'text-cyan-400 bg-cyan-500/10 border-cyan-500/30',
+    contractRouter: '0xAAAE99091Fbb28D400029052821653C1C752483B',
+  },
+  {
     name: 'Camelot V3 (Algebra Engine)',
     protocol: 'CAMELOT_V3',
     feeTier: 'Dynamic (0.01-0.2%)',
-    chains: ['Arbitrum'],
+    chains: ['Arbitrum', 'ApeChain'],
     avgGas: 104000,
-    slippageModel: 'Algebra Adaptive Directional Volatility Engine (Monitor-only)',
+    slippageModel: 'Algebra Adaptive Directional Volatility Engine',
     tagColor: 'text-amber-400 bg-amber-500/10 border-amber-500/30',
     contractRouter: '0x1F721E2E82F6676FCE4eA07A5958cF098D339e18',
   },
@@ -942,7 +1335,7 @@ export const SUPPORTED_DEX_POOLS: DexPoolInfo[] = [
     feeTier: '0.30%',
     chains: ['Arbitrum'],
     avgGas: 90000,
-    slippageModel: 'Constant Product x*y=k (Monitor-only)',
+    slippageModel: 'Constant Product x*y=k (Monitor-only / Native)',
     tagColor: 'text-amber-400 bg-amber-500/10 border-amber-500/30',
     contractRouter: '0xc873fEcbd354f5A56E00E710B90EF4201db2448d',
   },
@@ -970,7 +1363,7 @@ export const SUPPORTED_DEX_POOLS: DexPoolInfo[] = [
     name: 'Curve Finance (Stable / Tricrypto)',
     protocol: 'CURVE',
     feeTier: '0.04%',
-    chains: ['Arbitrum', 'Optimism'],
+    chains: ['Ethereum', 'Polygon', 'Arbitrum', 'Optimism'],
     avgGas: 128000,
     slippageModel: 'Amplified Stableswap + CryptoSwap dynamic curve',
     tagColor: 'text-cyan-400 bg-cyan-500/10 border-cyan-500/30',
@@ -980,7 +1373,7 @@ export const SUPPORTED_DEX_POOLS: DexPoolInfo[] = [
     name: 'Balancer V2 (Composable Vault)',
     protocol: 'BALANCER_V2',
     feeTier: '0.08%',
-    chains: ['Arbitrum', 'Base', 'Optimism'],
+    chains: ['Ethereum', 'Polygon', 'Avalanche', 'Arbitrum', 'Base', 'Optimism'],
     avgGas: 115000,
     slippageModel: 'Generalized Multi-Asset Weighted Invariant (0% Flash Fee)',
     tagColor: 'text-teal-400 bg-teal-500/10 border-teal-500/30',
@@ -990,7 +1383,7 @@ export const SUPPORTED_DEX_POOLS: DexPoolInfo[] = [
     name: 'Trader Joe V2.1 (LB Bins)',
     protocol: 'TRADER_JOE_V2',
     feeTier: '0.08%',
-    chains: ['Arbitrum'],
+    chains: ['Arbitrum', 'Avalanche'],
     avgGas: 118000,
     slippageModel: 'Discretized Liquidity Bins (Zero slippage inside bin)',
     tagColor: 'text-orange-400 bg-orange-500/10 border-orange-500/30',

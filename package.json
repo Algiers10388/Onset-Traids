@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
-    "build": "vite build",
+    "build": "node flash-arb/contracts/compile.mjs && vite build",
     "start": "node server.ts",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit"

@@ -51,6 +51,8 @@ import {
   computeIndicators,
   formatCurrency,
   calculateDynamicPositionSize,
+  calculateATR,
+  calculateSmartTrailingPercent,
   DynamicPositionSizeResult,
 } from './utils/cryptoMath';
 import {
@@ -157,6 +159,10 @@ function AppInner({ initialAssets, initialCandles }: { initialAssets: CryptoAsse
 
   // Candle map for each symbol
   const [candleMap, setCandleMap] = useState<Record<string, Candle[]>>(initialCandles);
+  const candleMapRef = useRef<Record<string, Candle[]>>(initialCandles);
+  useEffect(() => {
+    candleMapRef.current = candleMap;
+  }, [candleMap]);
 
   const [strategy, setStrategy] = useState<StrategyParameters>(() => ({
     ...STRATEGY_PRESETS[0],
@@ -1605,14 +1611,32 @@ function AppInner({ initialAssets, initialCandles }: { initialAssets: CryptoAsse
             return;
           }
 
-          // 4. Check Trailing Stop
+          // 4. Check Trailing Stop (Smart Trailing ATR-dynamic OR Static %)
           if (strategy.trailingStopEnabled && highestPrice > pos.entryPrice) {
             const dropFromHighPercent = ((highestPrice - markPrice) / highestPrice) * 100 * pos.leverage;
-            if (dropFromHighPercent >= strategy.trailingStopPercent) {
+            let activeTrailPercent = strategy.trailingStopPercent;
+            let trailLabel = `${strategy.trailingStopPercent}%`;
+            if (strategy.smartTrailingEnabled) {
+              const symCandles = candleMapRef.current[pos.symbol] ?? [];
+              const liveAtr = symCandles.length >= 2
+                ? calculateATR(symCandles, 14).atr
+                : pos.symbol === selectedSymbol && indicators.atr
+                  ? indicators.atr
+                  : markPrice * 0.018;
+              const smartTrail = calculateSmartTrailingPercent({
+                atr: liveAtr,
+                currentPrice: markPrice,
+                atrMultiplier: strategy.smartTrailingAtrMultiplier ?? 1.5,
+                leverage: pos.leverage,
+              });
+              activeTrailPercent = smartTrail.trailingPercent;
+              trailLabel = `Smart Trailing ATR ${activeTrailPercent.toFixed(2)}%`;
+            }
+            if (dropFromHighPercent >= activeTrailPercent) {
               closePosition(
                 pos.id,
                 'TRAILING_STOP',
-                `Trailing Stop Triggered (${strategy.trailingStopPercent}% drop from peak ${formatCurrency(highestPrice)})`
+                `Trailing Stop Triggered (${trailLabel} drop from peak ${formatCurrency(highestPrice)})`
               );
               return;
             }
