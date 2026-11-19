@@ -91,7 +91,10 @@ export const EtherscanIntelligencePage: React.FC<EtherscanIntelligencePageProps>
 
   useEffect(() => {
     loadFeed();
-    const interval = setInterval(loadFeed, 3500);
+    const interval = setInterval(() => {
+      if (typeof document !== 'undefined' && document.hidden) return;
+      loadFeed();
+    }, 12000);
     return () => clearInterval(interval);
   }, []);
 

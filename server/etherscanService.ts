@@ -270,6 +270,7 @@ class EtherscanIntelligenceService {
   private activeSync: Promise<void> | null = null;
   private pollTimer: NodeJS.Timeout | null = null;
   private consecutiveBackoffSteps = 0;
+  private lastAccessAt = 0;
   private autoExecutionEnabled = false;
   private minProfitThresholdPercent = 0.01;
 
@@ -281,10 +282,11 @@ class EtherscanIntelligenceService {
     if (this.pollTimer) clearTimeout(this.pollTimer);
     this.pollTimer = setTimeout(async () => {
       await this.syncLiveBlockAndTxs();
-      const baseDelay = 12_000;
+      const isActivelyViewed = this.lastAccessAt > 0 && Date.now() - this.lastAccessAt < 120_000;
+      const baseDelay = isActivelyViewed ? 45_000 : 180_000;
       const nextDelay =
         this.consecutiveBackoffSteps > 0
-          ? Math.min(60_000, baseDelay * Math.pow(2, this.consecutiveBackoffSteps))
+          ? Math.min(300_000, baseDelay * Math.pow(2, this.consecutiveBackoffSteps))
           : baseDelay;
       this.scheduleNextPoll(nextDelay);
     }, delayMs);
@@ -296,8 +298,7 @@ class EtherscanIntelligenceService {
   private startLivePolling(): void {
     if (this.isPolling) return;
     this.isPolling = true;
-    // Brief staggered startup delay so module import during tests or server boot does not contend with startup I/O
-    this.scheduleNextPoll(1500);
+    this.scheduleNextPoll(5000);
   }
 
   public syncLiveBlockAndTxs(): Promise<void> {
@@ -530,6 +531,7 @@ Respond ONLY with JSON: {"summary": string, "actionableStrategies": string[]} (s
   }
 
   public getState() {
+    this.lastAccessAt = Date.now();
     return {
       blockSnapshot: this.blockSnapshot,
       error: this.lastError,

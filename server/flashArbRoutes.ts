@@ -1,4 +1,6 @@
 import { Router, type Request, type Response } from 'express';
+import fs from 'node:fs';
+import path from 'node:path';
 import { ethers } from 'ethers';
 import { sizeArbitrage, computeAdaptiveDepthFraction } from './arbSizing.ts';
 import { fetchLiveTickers } from './liveMarketData.ts';
@@ -40,6 +42,8 @@ import {
   KNOWN_FLASH_ARB_CONTRACTS,
   normalizeValidContractAddress,
   resolveAndValidateSweepContracts,
+  getReceiptTimeoutMs,
+  computeOptimalFeeParams,
   type AllLayerFilter,
   type ArbitrumTokenInfo,
   type BlockchainLayer,
@@ -66,15 +70,33 @@ import {
 
 export const flashArbRouter = Router();
 
-// Wallet addresses come ONLY from env (FLASH_ARB_GAS_WALLET / FLASH_ARB_PROFIT_WALLET); no built-in defaults.
+const DEFAULT_PROFIT_WALLET = '0xD5503C876a5DFeE057727cfacb6a59E8C7554f5b';
+const LEGACY_DEFAULT_PROFIT_WALLET = '0x65602eb9e09b07002872e074004400d37e27ccb9';
+if (
+  !process.env.FLASH_ARB_PROFIT_WALLET ||
+  process.env.FLASH_ARB_PROFIT_WALLET.trim().toLowerCase() === LEGACY_DEFAULT_PROFIT_WALLET
+) {
+  process.env.FLASH_ARB_PROFIT_WALLET = DEFAULT_PROFIT_WALLET;
+}
 const gasWalletEnv = () => (process.env.FLASH_ARB_GAS_WALLET || '').trim();
-const profitWalletEnv = () => (process.env.FLASH_ARB_PROFIT_WALLET || '').trim();
+const profitWalletEnv = () =>
+  normalizeValidContractAddress(process.env.FLASH_ARB_PROFIT_WALLET || '') || DEFAULT_PROFIT_WALLET;
 
 export const ETHEREUM_RPC_POOL = [
   process.env.ETHEREUM_RPC_URL,
   'https://ethereum-rpc.publicnode.com',
   'https://eth.meowrpc.com',
+  'https://rpc.flashbots.net',
   'https://1rpc.io/eth',
+].filter(Boolean) as string[];
+
+// Single-request / tx-broadcast / receipt pool (drpc rejects batch >3 but handles single tx/receipt calls reliably)
+export const ETHEREUM_TX_RPC_POOL = [
+  process.env.ETHEREUM_RPC_URL,
+  'https://ethereum-rpc.publicnode.com',
+  'https://eth.meowrpc.com',
+  'https://rpc.flashbots.net',
+  'https://eth.drpc.org',
 ].filter(Boolean) as string[];
 
 export const POLYGON_RPC_POOL = [
@@ -278,6 +300,7 @@ async function fetchRpcBatchWithFailover(chain: SupportedArbChain, calls: any[])
 
 function getRpcPool(chain: string, txCapable = false): string[] {
   const c = parseSupportedChain(chain);
+  if (c === 'ethereum' && txCapable) return ETHEREUM_TX_RPC_POOL;
   if (c === 'arbitrum' && txCapable) return ARBITRUM_TX_RPC_POOL;
   return CHAIN_RPC_POOLS[c] || ARBITRUM_RPC_POOL;
 }
@@ -327,7 +350,11 @@ async function fetchRpcSingleWithFailover(
           throw revertErr;
         }
 
-        rpcCooldowns.set(url, Date.now() + 30000);
+        const isRateOrQuota =
+          errCode === -32001 ||
+          errCode === -32005 ||
+          /usage limit|rate limit|too many requests|upgrade/i.test(errMsg);
+        rpcCooldowns.set(url, Date.now() + (isRateOrQuota ? 60000 : 30000));
         lastError = new Error(errMsg);
         continue;
       }
@@ -352,11 +379,91 @@ async function fetchRpcSingleWithFailover(
   throw lastError || new Error(`All ${chain} RPC endpoints failed for ${method}`);
 }
 
+async function broadcastRawTxToPool(
+  chain: string,
+  rawSignedTx: string,
+  maxFanOut = 2
+): Promise<{ txHash: string; acceptedUrls: string[] }> {
+  const pool = getRpcPool(chain, true);
+  const candidates = [...pool].sort((a, b) => (rpcCooldowns.get(a) || 0) - (rpcCooldowns.get(b) || 0));
+  const acceptedUrls: string[] = [];
+  let txHash = '';
+  let lastErr: Error | null = null;
+
+  for (const url of candidates) {
+    if (acceptedUrls.length >= maxFanOut) break;
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 8000);
+      const resp = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          method: 'eth_sendRawTransaction',
+          params: [rawSignedTx],
+          id: Date.now(),
+        }),
+        signal: controller.signal,
+      });
+      clearTimeout(timeout);
+
+      if (resp.status === 429 || resp.status === 403) {
+        rpcCooldowns.set(url, Date.now() + 45000);
+        lastErr = new Error(`${chain} RPC HTTP ${resp.status} on ${url}`);
+        continue;
+      }
+
+      const json: any = await resp.json();
+      if (json?.error) {
+        const msg = String(json.error.message || `RPC error ${json.error.code}`);
+        if (/already known|already in (the )?mempool|known transaction/i.test(msg)) {
+          acceptedUrls.push(url);
+          continue;
+        }
+        const isQuotaOrTransport =
+          Number(json.error.code) === -32001 ||
+          Number(json.error.code) === -32005 ||
+          /usage limit|rate limit|timeout|internal error/i.test(msg);
+        if (isQuotaOrTransport) {
+          rpcCooldowns.set(url, Date.now() + 45000);
+          lastErr = new Error(msg);
+          continue;
+        }
+        throw new Error(msg);
+      }
+
+      if (typeof json?.result === 'string' && json.result.startsWith('0x')) {
+        txHash = json.result;
+        acceptedUrls.push(url);
+        rpcCooldowns.delete(url);
+      }
+    } catch (err: any) {
+      lastErr = err;
+      const msg = String(err?.message || '');
+      if (acceptedUrls.length === 0 && !/429|403|timeout|abort|fetch|network|rate limit|usage limit|ECONN|socket/i.test(msg)) {
+        throw err;
+      }
+    }
+  }
+
+  if (acceptedUrls.length === 0 || !txHash) {
+    throw lastErr || new Error(`Failed to broadcast raw transaction across ${chain} RPC pool`);
+  }
+  return { txHash, acceptedUrls };
+}
+
 async function waitForReceiptWithFailover(
   chain: string,
   txHash: string,
-  timeoutMs = 45000
+  timeoutMs?: number,
+  options?: {
+    isDeployment?: boolean;
+    rawSignedTx?: string;
+    onStuckPending?: (elapsedMs: number) => Promise<{ replacementHash?: string; rawSignedTx?: string } | null>;
+  }
 ): Promise<{
+  txHash: string;
   status: number;
   blockNumber: number;
   gasUsed: bigint;
@@ -364,12 +471,23 @@ async function waitForReceiptWithFailover(
   contractAddress?: string | null;
   logs: Array<{ address?: string; topics: string[]; data: string }>;
 }> {
-  const deadline = Date.now() + timeoutMs;
+  const c = parseSupportedChain(chain);
+  const effectiveTimeoutMs = timeoutMs ?? getReceiptTimeoutMs(c, Boolean(options?.isDeployment));
+  const pollIntervalMs = c === 'ethereum' ? 2000 : 1500;
+  const startedAt = Date.now();
+  const deadline = startedAt + effectiveTimeoutMs;
+
+  let activeTxHash = txHash;
+  let activeRawTx = options?.rawSignedTx;
+  let rebroadcasted = false;
+  let attemptedSpeedUp = false;
+
   while (Date.now() < deadline) {
     try {
-      const { result } = await fetchRpcSingleWithFailover(chain, 'eth_getTransactionReceipt', [txHash], true);
+      const { result } = await fetchRpcSingleWithFailover(chain, 'eth_getTransactionReceipt', [activeTxHash], true);
       if (result && result.blockNumber) {
         return {
+          txHash: activeTxHash,
           status: result.status === '0x1' || result.status === 1 ? 1 : 0,
           blockNumber: parseInt(result.blockNumber, 16),
           gasUsed: result.gasUsed ? BigInt(result.gasUsed) : 0n,
@@ -381,9 +499,188 @@ async function waitForReceiptWithFailover(
     } catch {
       // Transient RPC error; keep polling across remaining pool endpoints until deadline
     }
-    await new Promise((r) => setTimeout(r, 1500));
+
+    const elapsed = Date.now() - startedAt;
+    if (!rebroadcasted && activeRawTx && elapsed >= (c === 'ethereum' ? 18_000 : 12_000)) {
+      rebroadcasted = true;
+      void broadcastRawTxToPool(chain, activeRawTx, 3).catch(() => {});
+    }
+
+    if (!attemptedSpeedUp && options?.onStuckPending && elapsed >= (c === 'ethereum' ? 42_000 : 22_000)) {
+      attemptedSpeedUp = true;
+      try {
+        const txLookup = await fetchRpcSingleWithFailover(chain, 'eth_getTransactionByHash', [activeTxHash], true).catch(() => null);
+        if (txLookup?.result && !txLookup.result.blockNumber) {
+          const bumped = await options.onStuckPending(elapsed);
+          if (bumped?.replacementHash) {
+            activeTxHash = bumped.replacementHash;
+            activeRawTx = bumped.rawSignedTx || activeRawTx;
+            rebroadcasted = false;
+          }
+        }
+      } catch {
+        // Keep waiting for original txHash if speed-up skipped or failed
+      }
+    }
+
+    await new Promise((r) => setTimeout(r, pollIntervalMs));
   }
-  throw new Error(`Timed out waiting for transaction receipt (${txHash}) on ${chain}`);
+
+  // Final check of mempool state so timeout errors preserve actionable context
+  let pendingTx: any = null;
+  try {
+    const lookup = await fetchRpcSingleWithFailover(chain, 'eth_getTransactionByHash', [activeTxHash], true);
+    pendingTx = lookup?.result || null;
+  } catch {}
+
+  const rpcInfo = RPC_ENDPOINTS[c] || RPC_ENDPOINTS.arbitrum;
+  const pendingInMempool = Boolean(pendingTx && !pendingTx.blockNumber);
+  const nonceNum = pendingTx?.nonce ? parseInt(pendingTx.nonce, 16) : null;
+  const secs = Math.round(effectiveTimeoutMs / 1000);
+  const msg = pendingInMempool
+    ? `Timed out after ${secs}s waiting for confirmation of (${activeTxHash}) on ${chain}: transaction is still pending in mempool${nonceNum !== null ? ` (nonce ${nonceNum})` : ''}. Use Speed Up or verify status before submitting another tx.`
+    : `Timed out waiting for transaction receipt (${activeTxHash}) on ${chain} after ${secs}s.`;
+
+  const err: any = new Error(msg);
+  err.timedOut = true;
+  err.txHash = activeTxHash;
+  err.chain = c;
+  err.explorerUrl = `${rpcInfo.explorer}/tx/${activeTxHash}`;
+  err.pendingInMempool = pendingInMempool;
+  err.nonce = nonceNum;
+  throw err;
+}
+
+async function broadcastSignedTxAndWait(params: {
+  chain: SupportedArbChain;
+  cleanKey: string;
+  to?: string;
+  data?: string;
+  valueWei?: bigint;
+  gasLimit: bigint;
+  isDeployment?: boolean;
+  allowAutoSpeedUp?: boolean;
+  urgencyMultiplierPct?: number;
+  nonceOverride?: number;
+  minBalanceWei?: bigint;
+}): Promise<{
+  txHash: string;
+  receipt: Awaited<ReturnType<typeof waitForReceiptWithFailover>>;
+}> {
+  const { chain, cleanKey, to, data, valueWei = 0n, gasLimit } = params;
+  const c = parseSupportedChain(chain);
+  const rpcInfo = RPC_ENDPOINTS[c] || RPC_ENDPOINTS.arbitrum;
+  const signerAddress = new ethers.Wallet(cleanKey).address;
+
+  const [balResp, latestNonceResp, pendingNonceResp, blockResp, priorityResp, gasPriceResp] = await Promise.all([
+    fetchRpcSingleWithFailover(c, 'eth_getBalance', [signerAddress, 'latest'], true),
+    fetchRpcSingleWithFailover(c, 'eth_getTransactionCount', [signerAddress, 'latest'], true),
+    fetchRpcSingleWithFailover(c, 'eth_getTransactionCount', [signerAddress, 'pending'], true),
+    fetchRpcSingleWithFailover(c, 'eth_getBlockByNumber', ['latest', false], true).catch(() => ({ result: null })),
+    fetchRpcSingleWithFailover(c, 'eth_maxPriorityFeePerGas', [], true).catch(() => ({ result: null })),
+    fetchRpcSingleWithFailover(c, 'eth_gasPrice', [], true).catch(() => ({ result: null })),
+  ]);
+
+  const balanceWei = typeof balResp.result === 'string' ? BigInt(balResp.result) : 0n;
+  const minBalance = params.minBalanceWei ?? 50000000000000n;
+  if (balanceWei < minBalance) {
+    throw new Error(
+      `Gas wallet ${signerAddress} holds ${ethers.formatEther(balanceWei)} ${rpcInfo.nativeSymbol} on ${rpcInfo.name}, below minimum required gas balance (${ethers.formatEther(minBalance)} ${rpcInfo.nativeSymbol}).`
+    );
+  }
+
+  const latestNonce = typeof latestNonceResp.result === 'string' ? parseInt(latestNonceResp.result, 16) : 0;
+  const pendingNonce = typeof pendingNonceResp.result === 'string' ? parseInt(pendingNonceResp.result, 16) : latestNonce;
+
+  if (params.nonceOverride === undefined && pendingNonce > latestNonce) {
+    throw new Error(
+      `Signer ${signerAddress} already has a pending transaction at nonce ${latestNonce} on ${rpcInfo.name} (pending nonce ${pendingNonce}). Speed up or cancel nonce ${latestNonce} before sending a new transaction.`
+    );
+  }
+
+  const nonceToUse = params.nonceOverride ?? latestNonce;
+  const baseFeeWei = blockResp?.result?.baseFeePerGas ? BigInt(blockResp.result.baseFeePerGas) : null;
+  const rpcPriorityWei = typeof priorityResp?.result === 'string' ? BigInt(priorityResp.result) : null;
+  const rpcGasPriceWei = typeof gasPriceResp?.result === 'string' ? BigInt(gasPriceResp.result) : null;
+
+  const feeParams = computeOptimalFeeParams({
+    chain: c,
+    baseFeePerGasWei: baseFeeWei,
+    rpcMaxPriorityFeePerGasWei: rpcPriorityWei,
+    rpcGasPriceWei,
+    balanceWei,
+    gasLimit,
+    valueWei,
+    urgencyMultiplierPct: params.urgencyMultiplierPct ?? (c === 'ethereum' ? 125 : 110),
+  });
+
+  const signTxWithFees = async (fees: ReturnType<typeof computeOptimalFeeParams>) => {
+    const wallet = new ethers.Wallet(cleanKey);
+    const txReq: ethers.TransactionRequest = {
+      chainId: rpcInfo.chainId,
+      nonce: nonceToUse,
+      gasLimit,
+      value: valueWei,
+      ...(to ? { to } : {}),
+      ...(data ? { data } : {}),
+      ...(c === 'bsc'
+        ? { type: 0, gasPrice: fees.gasPrice }
+        : {
+            type: 2,
+            maxFeePerGas: fees.maxFeePerGas,
+            maxPriorityFeePerGas: fees.maxPriorityFeePerGas,
+          }),
+    };
+    const rawSignedTx = await wallet.signTransaction(txReq);
+    const txHash = ethers.keccak256(rawSignedTx);
+    return { rawSignedTx, txHash };
+  };
+
+  const initial = await signTxWithFees(feeParams);
+  await broadcastRawTxToPool(c, initial.rawSignedTx, c === 'ethereum' ? 3 : 2);
+
+  const receipt = await waitForReceiptWithFailover(c, initial.txHash, undefined, {
+    isDeployment: params.isDeployment,
+    rawSignedTx: initial.rawSignedTx,
+    onStuckPending: params.allowAutoSpeedUp
+      ? async () => {
+          const [latestBlock, latestPriority, latestGas] = await Promise.all([
+            fetchRpcSingleWithFailover(c, 'eth_getBlockByNumber', ['latest', false], true).catch(() => ({ result: null })),
+            fetchRpcSingleWithFailover(c, 'eth_maxPriorityFeePerGas', [], true).catch(() => ({ result: null })),
+            fetchRpcSingleWithFailover(c, 'eth_gasPrice', [], true).catch(() => ({ result: null })),
+          ]);
+          const bumpedBase = latestBlock?.result?.baseFeePerGas ? BigInt(latestBlock.result.baseFeePerGas) : baseFeeWei;
+          const bumpedPriority = typeof latestPriority?.result === 'string' ? BigInt(latestPriority.result) : rpcPriorityWei;
+          const bumpedGasPrice = typeof latestGas?.result === 'string' ? BigInt(latestGas.result) : rpcGasPriceWei;
+          const bumpedFees = computeOptimalFeeParams({
+            chain: c,
+            baseFeePerGasWei: bumpedBase,
+            rpcMaxPriorityFeePerGasWei:
+              bumpedPriority && bumpedPriority > feeParams.maxPriorityFeePerGas ? bumpedPriority : feeParams.maxPriorityFeePerGas,
+            rpcGasPriceWei: bumpedGasPrice && bumpedGasPrice > feeParams.gasPrice ? bumpedGasPrice : feeParams.gasPrice,
+            balanceWei,
+            gasLimit,
+            valueWei,
+            urgencyMultiplierPct: 140,
+          });
+          // Enforce strict +25% replacement bump required by geth/reth mempool rules
+          if (bumpedFees.maxPriorityFeePerGas < (feeParams.maxPriorityFeePerGas * 125n) / 100n) {
+            bumpedFees.maxPriorityFeePerGas = (feeParams.maxPriorityFeePerGas * 125n) / 100n;
+          }
+          if (bumpedFees.maxFeePerGas < (feeParams.maxFeePerGas * 125n) / 100n) {
+            bumpedFees.maxFeePerGas = (feeParams.maxFeePerGas * 125n) / 100n;
+          }
+          if (bumpedFees.gasPrice < (feeParams.gasPrice * 125n) / 100n) {
+            bumpedFees.gasPrice = (feeParams.gasPrice * 125n) / 100n;
+          }
+          const replacement = await signTxWithFees(bumpedFees);
+          await broadcastRawTxToPool(c, replacement.rawSignedTx, c === 'ethereum' ? 3 : 2);
+          return { replacementHash: replacement.txHash, rawSignedTx: replacement.rawSignedTx };
+        }
+      : undefined,
+  });
+
+  return { txHash: receipt.txHash, receipt };
 }
 
 /**
@@ -459,54 +756,39 @@ async function sweepGasWalletEthSurplus(params: {
     };
   }
 
-  let sentTxHash = '';
-  let lastErr: any = null;
-  for (const rpcUrl of getRpcPool(chain, true)) {
-    try {
-      const provider = new ethers.JsonRpcProvider(rpcUrl);
-      const wallet = new ethers.Wallet(cleanKey, provider);
-      const tx = await wallet.sendTransaction({
-        to: recipient,
-        value: alloc.sendWei,
-        gasLimit: alloc.gasLimit,
-      });
-      sentTxHash = tx.hash;
-      break;
-    } catch (err: any) {
-      lastErr = err;
-      const msg = String(err?.message || '');
-      if (!/429|403|timeout|fetch|coalesce|archive|network|ECONN|socket/i.test(msg)) {
-        break;
-      }
+  try {
+    const { txHash: sentTxHash, receipt } = await broadcastSignedTxAndWait({
+      chain,
+      cleanKey,
+      to: recipient,
+      valueWei: alloc.sendWei,
+      gasLimit: alloc.gasLimit,
+      allowAutoSpeedUp: true,
+    });
+    if (receipt.status !== 1) {
+      return {
+        swept: false,
+        sentWei: 0n,
+        sentEthFormatted: '0',
+        reason: `Gas surplus transfer ${sentTxHash} reverted on-chain.`,
+      };
     }
-  }
 
-  if (!sentTxHash) {
+    return {
+      swept: true,
+      sentWei: alloc.sendWei,
+      sentEthFormatted: Number(ethers.formatEther(alloc.sendWei)).toFixed(6),
+      txHash: sentTxHash,
+      explorerUrl: `${rpcInfo.explorer}/tx/${sentTxHash}`,
+    };
+  } catch (err: any) {
     return {
       swept: false,
       sentWei: 0n,
       sentEthFormatted: '0',
-      reason: lastErr?.message || 'Failed to broadcast gas surplus transfer.',
+      reason: err?.message || 'Failed to broadcast gas surplus transfer.',
     };
   }
-
-  const receipt = await waitForReceiptWithFailover(chain, sentTxHash, 45000);
-  if (receipt.status !== 1) {
-    return {
-      swept: false,
-      sentWei: 0n,
-      sentEthFormatted: '0',
-      reason: `Gas surplus transfer ${sentTxHash} reverted on-chain.`,
-    };
-  }
-
-  return {
-    swept: true,
-    sentWei: alloc.sendWei,
-    sentEthFormatted: Number(ethers.formatEther(alloc.sendWei)).toFixed(6),
-    txHash: sentTxHash,
-    explorerUrl: `${rpcInfo.explorer}/tx/${sentTxHash}`,
-  };
 }
 
 /**
@@ -611,6 +893,27 @@ async function queryChainGas(chain: SupportedArbChain, address: string) {
   };
 }
 
+const SHORT_BALANCE_CACHE_TTL_MS = 12_000;
+const SHORT_GAS_CACHE_TTL_MS = 15_000;
+const gasStatusResponseCache = new Map<string, { payload: any; fetchedAt: number }>();
+const walletBalancesResponseCache = new Map<string, { payload: any; fetchedAt: number }>();
+const contractBalancesResponseCache = new Map<string, { payload: any; fetchedAt: number }>();
+const holdingsOverviewResponseCache = new Map<string, { payload: any; fetchedAt: number }>();
+
+function invalidateBalanceResponseCaches(chain?: SupportedArbChain) {
+  gasStatusResponseCache.clear();
+  if (!chain) {
+    walletBalancesResponseCache.clear();
+    contractBalancesResponseCache.clear();
+    holdingsOverviewResponseCache.clear();
+    return;
+  }
+  const prefix = `${chain}:`;
+  for (const k of walletBalancesResponseCache.keys()) if (k.startsWith(prefix)) walletBalancesResponseCache.delete(k);
+  for (const k of contractBalancesResponseCache.keys()) if (k.startsWith(prefix)) contractBalancesResponseCache.delete(k);
+  for (const k of holdingsOverviewResponseCache.keys()) if (k.startsWith(prefix)) holdingsOverviewResponseCache.delete(k);
+}
+
 /**
  * GET /api/flash-arb/gas-status
  * Queries real-time on-chain native gas balance of the Gas Holder Wallet across all L1/L2/L3 chains
@@ -620,6 +923,12 @@ flashArbRouter.get('/gas-status', async (req: Request, res: Response) => {
     const address = String(req.query.address || gasWalletEnv());
     if (!/^0x[a-fA-F0-9]{40}$/.test(address)) {
       return res.status(400).json({ success: false, error: 'No valid address: pass ?address= or set FLASH_ARB_GAS_WALLET.' });
+    }
+    const forceRefresh = req.query.refresh === '1' || req.query.refresh === 'true';
+    const cacheKey = address.toLowerCase();
+    const cachedGas = gasStatusResponseCache.get(cacheKey);
+    if (!forceRefresh && cachedGas && Date.now() - cachedGas.fetchedAt < SHORT_GAS_CACHE_TTL_MS) {
+      return res.json(cachedGas.payload);
     }
 
     const [liveFeed, ...gasStatuses] = await Promise.all([
@@ -655,7 +964,7 @@ flashArbRouter.get('/gas-status', async (req: Request, res: Response) => {
 
     const isSignerConfigured = Boolean(process.env.FLASH_ARB_SIGNER_KEY);
 
-    res.json({
+    const payload = {
       success: true,
       gasWallet: address,
       profitWallet: profitWalletEnv(),
@@ -663,7 +972,9 @@ flashArbRouter.get('/gas-status', async (req: Request, res: Response) => {
       ethUsdPrice: ethUsdPrice > 0 ? ethUsdPrice : null,
       chains: chainsOut,
       timestamp: Date.now(),
-    });
+    };
+    gasStatusResponseCache.set(cacheKey, { payload, fetchedAt: Date.now() });
+    res.json(payload);
   } catch (err: any) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -726,18 +1037,20 @@ flashArbRouter.post('/signer-config', (req: Request, res: Response) => {
       process.env.FLASH_ARB_GAS_WALLET = gasWallet.trim();
     }
 
-    if (profitWallet && typeof profitWallet === 'string' && /^0x[a-fA-F0-9]{40}$/i.test(profitWallet.trim())) {
-      process.env.FLASH_ARB_PROFIT_WALLET = profitWallet.trim();
+    const normalizedProfit = normalizeValidContractAddress(profitWallet);
+    if (normalizedProfit) {
+      process.env.FLASH_ARB_PROFIT_WALLET = normalizedProfit;
     }
 
     const keyLast4 = process.env.FLASH_ARB_SIGNER_KEY.slice(-4);
+    invalidateBalanceResponseCaches();
 
     return res.json({
       success: true,
       message: 'Signer key successfully configured in server memory for live Arbitrum and Base execution',
       isKeyConfigured: true,
       gasWallet: process.env.FLASH_ARB_GAS_WALLET,
-      profitWallet: process.env.FLASH_ARB_PROFIT_WALLET,
+      profitWallet: profitWalletEnv(),
       keyPreview: `••••••••••••••••••••••••••••••••••••••••••••${keyLast4}`,
     });
   } catch (err: any) {
@@ -752,19 +1065,22 @@ flashArbRouter.post('/signer-config', (req: Request, res: Response) => {
 flashArbRouter.post('/profit-wallet', (req: Request, res: Response) => {
   try {
     const { profitWallet, gasWallet } = req.body || {};
-    if (!profitWallet || typeof profitWallet !== 'string' || !/^0x[a-fA-F0-9]{40}$/i.test(profitWallet.trim())) {
+    const normalizedProfit = normalizeValidContractAddress(profitWallet);
+    if (!normalizedProfit) {
       return res.status(400).json({
         success: false,
-        error: 'Valid 42-character EVM address (0x...) is required for profitWallet.',
+        error: 'Valid non-zero 42-character EVM address (0x...) is required for profitWallet.',
       });
     }
-    process.env.FLASH_ARB_PROFIT_WALLET = profitWallet.trim();
-    if (gasWallet && typeof gasWallet === 'string' && /^0x[a-fA-F0-9]{40}$/i.test(gasWallet.trim())) {
-      process.env.FLASH_ARB_GAS_WALLET = gasWallet.trim();
+    process.env.FLASH_ARB_PROFIT_WALLET = normalizedProfit;
+    const normalizedGas = normalizeValidContractAddress(gasWallet);
+    if (normalizedGas) {
+      process.env.FLASH_ARB_GAS_WALLET = normalizedGas;
     }
+    invalidateBalanceResponseCaches();
     return res.json({
       success: true,
-      profitWallet: process.env.FLASH_ARB_PROFIT_WALLET,
+      profitWallet: profitWalletEnv(),
       gasWallet: gasWalletEnv(),
     });
   } catch (err: any) {
@@ -842,12 +1158,52 @@ flashArbRouter.get('/contract-status', async (req: Request, res: Response) => {
     const code = codeRaw || '0x';
     const isDeployed = code !== '0x' && code.length > 2;
 
+    let contractOwner: string | null = null;
+    let supportsAlgebra = false;
+    let supportsCamelotV2 = false;
+    if (isDeployed) {
+      const [ownerRes, capsRes] = await Promise.all([
+        fetchRpcSingleWithFailover(chain, 'eth_call', [{ to: address, data: '0x8da5cb5b' }, 'latest'], false).catch(() => ({ result: '0x' })),
+        fetchRpcSingleWithFailover(chain, 'eth_call', [{ to: address, data: '0x459a01ae' }, 'latest'], false).catch(() => ({ result: '0x' })),
+      ]);
+      if (typeof ownerRes?.result === 'string' && ownerRes.result.length >= 66) {
+        try {
+          contractOwner = ethers.getAddress(`0x${ownerRes.result.slice(-40)}`);
+        } catch {}
+      }
+      if (typeof capsRes?.result === 'string' && capsRes.result.length >= 66) {
+        try {
+          const capMask = BigInt(capsRes.result.slice(0, 66));
+          supportsAlgebra = (capMask & 2n) !== 0n;
+          supportsCamelotV2 = (capMask & 4n) !== 0n;
+        } catch {}
+      }
+    }
+
+    let signerAddress: string | null = null;
+    const signerKey = (process.env.FLASH_ARB_SIGNER_KEY || '').trim();
+    if (signerKey) {
+      try {
+        signerAddress = new ethers.Wallet(signerKey.startsWith('0x') ? signerKey : `0x${signerKey}`).address;
+      } catch {}
+    }
+
+    const ownerMatchesSigner = Boolean(
+      contractOwner && signerAddress && contractOwner.toLowerCase() === signerAddress.toLowerCase()
+    );
+
     return res.json({
       success: true,
       chain,
       address,
       isDeployed,
       bytecodeLength: isDeployed ? (code.length - 2) / 2 : 0,
+      owner: contractOwner,
+      signerAddress,
+      ownerMatchesSigner,
+      supportsAlgebra,
+      supportsCamelotV2,
+      camelotV3Adapter: chain === 'arbitrum' ? DEPLOYED_CAMELOT_ADAPTERS.arbitrum || null : null,
       explorerUrl: `${rpcInfo.explorer}/address/${address}#code`,
     });
   } catch (err: any) {
@@ -884,14 +1240,12 @@ flashArbRouter.post('/broadcast', async (req: Request, res: Response) => {
     }
 
     const { ethers } = await import('ethers');
-    const txPool = getRpcPool(targetChain, true);
-    let tx: any = null;
-    let lastSendErr: any = null;
     const callData = typeof data === 'string' && data ? data : '0x';
     const isDirectSweepSelector = callData.toLowerCase().startsWith('0x7804d9ac');
+    let cleanKey = '';
     let signerAddress = '';
     try {
-      const cleanKey = process.env.FLASH_ARB_SIGNER_KEY.trim().startsWith('0x')
+      cleanKey = process.env.FLASH_ARB_SIGNER_KEY.trim().startsWith('0x')
         ? process.env.FLASH_ARB_SIGNER_KEY.trim()
         : `0x${process.env.FLASH_ARB_SIGNER_KEY.trim()}`;
       signerAddress = new ethers.Wallet(cleanKey).address;
@@ -969,43 +1323,21 @@ flashArbRouter.post('/broadcast', async (req: Request, res: Response) => {
       });
     }
 
-    for (const rpcUrl of txPool) {
-      try {
-        const provider = new ethers.JsonRpcProvider(rpcUrl);
-        const wallet = new ethers.Wallet(process.env.FLASH_ARB_SIGNER_KEY, provider);
+    const { txHash: sentTxHash, receipt } = await broadcastSignedTxAndWait({
+      chain: parseSupportedChain(targetChain),
+      cleanKey,
+      to,
+      data: callData,
+      gasLimit: preflightGasLimit,
+      allowAutoSpeedUp: isDirectSweepSelector,
+      minBalanceWei: 100000000000000n,
+    });
 
-        const balanceWei = await provider.getBalance(wallet.address);
-        if (balanceWei < 100000000000000n) { // 0.0001 ETH
-          return res.status(400).json({
-            success: false,
-            error: `Insufficient gas balance: ${wallet.address} holds ${ethers.formatEther(balanceWei)} ETH on ${rpcInfo.name}, which is below required gas threshold.`,
-          });
-        }
-
-        tx = await wallet.sendTransaction({
-          to,
-          data: callData,
-          gasLimit: preflightGasLimit,
-        });
-        break;
-      } catch (err: any) {
-        lastSendErr = err;
-        const msg = String(err?.message || '');
-        if (!/429|403|timeout|fetch|coalesce|archive|network|ECONN|socket/i.test(msg)) {
-          throw err;
-        }
-      }
-    }
-
-    if (!tx) {
-      throw lastSendErr || new Error(`Failed to broadcast transaction on ${rpcInfo.name}`);
-    }
-
-    const receipt = await waitForReceiptWithFailover(targetChain, tx.hash, 45000);
     if (!receipt || receipt.status !== 1) {
       return res.status(500).json({
         success: false,
-        txHash: tx.hash,
+        txHash: sentTxHash,
+        explorerUrl: `${rpcInfo.explorer}/tx/${sentTxHash}`,
         error: 'Transaction reverted on-chain.',
       });
     }
@@ -1014,18 +1346,23 @@ flashArbRouter.post('/broadcast', async (req: Request, res: Response) => {
 
     return res.json({
       success: true,
-      txHash: tx.hash,
+      txHash: sentTxHash,
       chain: rpcInfo.name,
       blockNumber: receipt.blockNumber,
       gasUsed: receipt.gasUsed.toString(),
       isEthSweepOnly: isDirectSweepSelector,
       arbitrageExecuted: Boolean(decodedSwap),
       sweptEthWei: isDirectSweepSelector ? contractBalanceWei.toString() : undefined,
-      explorerUrl: `${rpcInfo.explorer}/tx/${tx.hash}`,
+      explorerUrl: `${rpcInfo.explorer}/tx/${sentTxHash}`,
     });
   } catch (err: any) {
-    return res.status(500).json({
+    return res.status(err?.timedOut ? 504 : 500).json({
       success: false,
+      timedOut: Boolean(err?.timedOut),
+      pendingInMempool: Boolean(err?.pendingInMempool),
+      txHash: err?.txHash,
+      explorerUrl: err?.explorerUrl,
+      nonce: err?.nonce ?? null,
       error: err.message || 'On-chain broadcast failed',
     });
   }
@@ -1067,7 +1404,9 @@ flashArbRouter.get('/deploy-payload', async (req: Request, res: Response) => {
   }
 });
 
-// In-memory registry of active FlashArb contract addresses per chain (empty until actually deployed on-chain)
+const RUNTIME_DEPLOYMENTS_FILE = path.resolve(process.cwd(), '.flash-arb-deployments.json');
+
+// In-memory registry of active FlashArb contract addresses per chain (persisted to .flash-arb-deployments.json on updates)
 const DEPLOYED_CONTRACTS: Record<string, string> = {
   ethereum: (process.env.FLASH_ARB_CONTRACT_ETHEREUM || '').trim(),
   polygon: (process.env.FLASH_ARB_CONTRACT_POLYGON || '').trim(),
@@ -1080,6 +1419,59 @@ const DEPLOYED_CONTRACTS: Record<string, string> = {
   scroll: (process.env.FLASH_ARB_CONTRACT_SCROLL || '').trim(),
   apechain: (process.env.FLASH_ARB_CONTRACT_APECHAIN || '').trim(),
 };
+
+// In-memory registry of optional stateless CamelotV3SwapAdapter addresses (lets legacy FlashArbOptimized call Camelot V3)
+const DEPLOYED_CAMELOT_ADAPTERS: Record<string, string> = {
+  arbitrum: (process.env.CAMELOT_V3_ADAPTER_ARBITRUM || '').trim(),
+};
+
+function loadRuntimeDeployments() {
+  try {
+    if (!fs.existsSync(RUNTIME_DEPLOYMENTS_FILE)) return;
+    const raw = JSON.parse(fs.readFileSync(RUNTIME_DEPLOYMENTS_FILE, 'utf8'));
+    if (raw && typeof raw === 'object') {
+      if (raw.contracts && typeof raw.contracts === 'object') {
+        for (const [k, v] of Object.entries(raw.contracts)) {
+          const norm = normalizeValidContractAddress(String(v || ''));
+          if (norm && k in DEPLOYED_CONTRACTS) {
+            DEPLOYED_CONTRACTS[k] = norm;
+          }
+        }
+      }
+      if (raw.camelotAdapters && typeof raw.camelotAdapters === 'object') {
+        for (const [k, v] of Object.entries(raw.camelotAdapters)) {
+          const str = String(v || '').trim();
+          if (!str) {
+            DEPLOYED_CAMELOT_ADAPTERS[k] = '';
+          } else {
+            const norm = normalizeValidContractAddress(str);
+            if (norm) DEPLOYED_CAMELOT_ADAPTERS[k] = norm;
+          }
+        }
+      }
+    }
+  } catch {}
+}
+
+function persistRuntimeDeployments() {
+  try {
+    fs.writeFileSync(
+      RUNTIME_DEPLOYMENTS_FILE,
+      JSON.stringify(
+        {
+          updatedAt: new Date().toISOString(),
+          contracts: DEPLOYED_CONTRACTS,
+          camelotAdapters: DEPLOYED_CAMELOT_ADAPTERS,
+        },
+        null,
+        2
+      ),
+      'utf8'
+    );
+  } catch {}
+}
+
+loadRuntimeDeployments();
 
 /**
  * GET /api/flash-arb/deployed-contracts
@@ -1104,6 +1496,7 @@ flashArbRouter.post('/deployed-contracts', (req: Request, res: Response) => {
     return res.status(400).json({ success: false, error: 'Invalid non-zero EVM contract address format (must be 0x followed by 40 hex chars)' });
   }
   DEPLOYED_CONTRACTS[targetChain] = normalizedAddr;
+  persistRuntimeDeployments();
   liveAgent.invalidateChainInfraCache(targetChain as SupportedArbChain);
   return res.json({
     success: true,
@@ -1150,61 +1543,45 @@ flashArbRouter.post('/deploy-contract', async (req: Request, res: Response) => {
 
     const txPool = getRpcPool(targetChain, true);
     const cleanKey = signerKey.startsWith('0x') ? signerKey : `0x${signerKey}`;
-    let deployedAddress: string | null = null;
-    let txHash = '';
-    let walletAddress = '';
-    let lastDeployErr: any = null;
-
-    for (const rpcUrl of txPool) {
-      try {
-        const provider = new ethers.JsonRpcProvider(rpcUrl);
-        const wallet = new ethers.Wallet(cleanKey, provider);
-        walletAddress = wallet.address;
-
-        const balanceWei = await provider.getBalance(wallet.address);
-        const minRequiredWei = 100000000000000n; // 0.0001 ETH
-        if (balanceWei < minRequiredWei) {
-          return res.status(400).json({
-            success: false,
-            error: `Deployer wallet ${wallet.address} has ${ethers.formatEther(balanceWei)} ETH on ${rpcInfo.name}. Contract deployment requires ~0.0003 ETH for L2 gas. Please fund ${wallet.address} or deploy with your connected wallet.`,
-            deployerAddress: wallet.address,
-            balanceEth: ethers.formatEther(balanceWei),
-          });
-        }
-
-        const factory = new ethers.ContractFactory(artifact.abi, artifact.bytecode, wallet);
-        const contract = await factory.deploy(rpcInfo.balancerVault, rpcInfo.aavePool);
-        const deployTx = contract.deploymentTransaction();
-        txHash = deployTx ? deployTx.hash : '';
-
-        if (txHash) {
-          const receipt = await waitForReceiptWithFailover(targetChain, txHash, 60000);
-          if (receipt.status !== 1) {
-            throw new Error('Contract deployment transaction reverted on-chain.');
-          }
-          deployedAddress = receipt.contractAddress || (await contract.getAddress());
-        } else {
-          await contract.waitForDeployment();
-          deployedAddress = await contract.getAddress();
-        }
-        break;
-      } catch (err: any) {
-        lastDeployErr = err;
-        const msg = String(err?.message || '');
-        if (!/429|403|timeout|fetch|coalesce|archive|network|ECONN|socket/i.test(msg)) {
-          throw err;
-        }
+    const walletAddress = new ethers.Wallet(cleanKey).address;
+    const factory = new ethers.ContractFactory(artifact.abi, artifact.bytecode);
+    const deployTxReq = await factory.getDeployTransaction(rpcInfo.balancerVault, rpcInfo.aavePool);
+    let deployGasLimit = 3200000n;
+    try {
+      const { result: estHex } = await fetchRpcSingleWithFailover(
+        targetChain,
+        'eth_estimateGas',
+        [{ from: walletAddress, data: deployTxReq.data }, 'latest'],
+        true
+      );
+      if (typeof estHex === 'string' && estHex.startsWith('0x')) {
+        const est = BigInt(estHex);
+        if (est > 0n) deployGasLimit = (est * 125n) / 100n;
       }
-    }
+    } catch {}
 
+    const { txHash, receipt } = await broadcastSignedTxAndWait({
+      chain: parseSupportedChain(targetChain),
+      cleanKey,
+      data: deployTxReq.data,
+      gasLimit: deployGasLimit,
+      isDeployment: true,
+      allowAutoSpeedUp: true,
+      minBalanceWei: 100000000000000n,
+    });
+    if (receipt.status !== 1) {
+      throw new Error('Contract deployment transaction reverted on-chain.');
+    }
+    const deployedAddress = receipt.contractAddress || '';
     if (!deployedAddress) {
-      throw lastDeployErr || new Error(`Contract deployment failed on ${rpcInfo.name}`);
+      throw new Error(`Contract deployment mined (${txHash}) without contractAddress on ${rpcInfo.name}`);
     }
     const contractAddress = deployedAddress;
     const wallet = { address: walletAddress };
 
     // Register into active deployed contracts store
     DEPLOYED_CONTRACTS[targetChain] = contractAddress;
+    persistRuntimeDeployments();
     liveAgent.invalidateChainInfraCache(targetChain as SupportedArbChain);
 
     return res.json({
@@ -1221,26 +1598,40 @@ flashArbRouter.post('/deploy-contract', async (req: Request, res: Response) => {
       txExplorerUrl: `${rpcInfo.explorer}/tx/${txHash}`,
     });
   } catch (err: any) {
-    return res.status(500).json({
+    return res.status(err?.timedOut ? 504 : 500).json({
       success: false,
+      timedOut: Boolean(err?.timedOut),
+      pendingInMempool: Boolean(err?.pendingInMempool),
+      txHash: err?.txHash,
+      explorerUrl: err?.explorerUrl,
+      nonce: err?.nonce ?? null,
       error: err.message || 'Contract deployment failed',
     });
   }
 });
 
-// In-memory registry of optional stateless CamelotV3SwapAdapter addresses (lets legacy FlashArbOptimized call Camelot V3)
-const DEPLOYED_CAMELOT_ADAPTERS: Record<string, string> = {
-  arbitrum: (process.env.CAMELOT_V3_ADAPTER_ARBITRUM || '').trim(),
-};
-
 flashArbRouter.get('/camelot-adapter', async (_req: Request, res: Response) => {
   const arbInfra = await liveAgent.getChainInfra('arbitrum').catch(() => null);
+  const signerKey = (process.env.FLASH_ARB_SIGNER_KEY || '').trim();
+  let signerAddress: string | null = null;
+  if (signerKey) {
+    try {
+      signerAddress = new ethers.Wallet(signerKey.startsWith('0x') ? signerKey : `0x${signerKey}`).address;
+    } catch {}
+  }
+  const contractOwner = arbInfra?.contractOwner ?? null;
   res.json({
     success: true,
     adapters: DEPLOYED_CAMELOT_ADAPTERS,
     camelotV3Router: CAMELOT_V3_ROUTER_ADDRESS,
     arbitrumCapabilities: arbInfra
       ? {
+          contractAddr: arbInfra.contractAddr,
+          contractOwner,
+          signerAddress,
+          ownerMatchesSigner: Boolean(
+            contractOwner && signerAddress && contractOwner.toLowerCase() === signerAddress.toLowerCase()
+          ),
           supportsAlgebra: arbInfra.contractSupportsAlgebra,
           supportsCamelotV2: arbInfra.contractSupportsCamelotV2,
           camelotV3Adapter: arbInfra.camelotV3Adapter,
@@ -1256,7 +1647,8 @@ flashArbRouter.post('/camelot-adapter', (req: Request, res: Response) => {
   if (cleanAddr && !/^0x[a-fA-F0-9]{40}$/i.test(cleanAddr)) {
     return res.status(400).json({ success: false, error: 'Invalid adapter address format (must be 0x + 40 hex chars)' });
   }
-  DEPLOYED_CAMELOT_ADAPTERS[targetChain] = cleanAddr;
+  DEPLOYED_CAMELOT_ADAPTERS[targetChain] = cleanAddr ? ethers.getAddress(cleanAddr) : '';
+  persistRuntimeDeployments();
   liveAgent.invalidateChainInfraCache(targetChain as SupportedArbChain);
   return res.json({
     success: true,
@@ -1317,65 +1709,65 @@ flashArbRouter.post('/deploy-camelot-adapter', async (req: Request, res: Respons
       });
     }
 
-    const txPool = getRpcPool(targetChain, true);
     const cleanKey = signerKey.startsWith('0x') ? signerKey : `0x${signerKey}`;
-    let deployedAddress: string | null = null;
-    let txHash = '';
-    let walletAddress = '';
-    let lastDeployErr: any = null;
-
-    for (const rpcUrl of txPool) {
-      try {
-        const provider = new ethers.JsonRpcProvider(rpcUrl);
-        const wallet = new ethers.Wallet(cleanKey, provider);
-        walletAddress = wallet.address;
-        const balanceWei = await provider.getBalance(wallet.address);
-        if (balanceWei < 50000000000000n) {
-          return res.status(400).json({
-            success: false,
-            error: `Deployer wallet ${wallet.address} holds ${ethers.formatEther(balanceWei)} ETH on ${rpcInfo.name}. Adapter deployment requires ~0.00008 ETH.`,
-          });
-        }
-        const factory = new ethers.ContractFactory(artifact.abi, artifact.bytecode, wallet);
-        const contract = await factory.deploy(CAMELOT_V3_ROUTER_ADDRESS);
-        const deployTx = contract.deploymentTransaction();
-        txHash = deployTx ? deployTx.hash : '';
-        if (txHash) {
-          const receipt = await waitForReceiptWithFailover(targetChain, txHash, 60000);
-          if (receipt.status !== 1) throw new Error('Adapter deployment transaction reverted on-chain.');
-          deployedAddress = receipt.contractAddress || (await contract.getAddress());
-        } else {
-          await contract.waitForDeployment();
-          deployedAddress = await contract.getAddress();
-        }
-        break;
-      } catch (err: any) {
-        lastDeployErr = err;
-        const msg = String(err?.message || '');
-        if (!/429|403|timeout|fetch|coalesce|archive|network|ECONN|socket/i.test(msg)) throw err;
+    const walletAddress = new ethers.Wallet(cleanKey).address;
+    const factory = new ethers.ContractFactory(artifact.abi, artifact.bytecode);
+    const deployTxReq = await factory.getDeployTransaction(CAMELOT_V3_ROUTER_ADDRESS);
+    let deployGasLimit = 1200000n;
+    try {
+      const { result: estHex } = await fetchRpcSingleWithFailover(
+        targetChain,
+        'eth_estimateGas',
+        [{ from: walletAddress, data: deployTxReq.data }, 'latest'],
+        true
+      );
+      if (typeof estHex === 'string' && estHex.startsWith('0x')) {
+        const est = BigInt(estHex);
+        if (est > 0n) deployGasLimit = (est * 125n) / 100n;
       }
-    }
+    } catch {}
 
+    const { txHash, receipt } = await broadcastSignedTxAndWait({
+      chain: parseSupportedChain(targetChain),
+      cleanKey,
+      data: deployTxReq.data,
+      gasLimit: deployGasLimit,
+      isDeployment: true,
+      allowAutoSpeedUp: true,
+      minBalanceWei: 50000000000000n,
+    });
+    if (receipt.status !== 1) throw new Error('Adapter deployment transaction reverted on-chain.');
+    const deployedAddress = receipt.contractAddress || '';
     if (!deployedAddress) {
-      throw lastDeployErr || new Error('CamelotV3SwapAdapter deployment failed on Arbitrum One');
+      throw new Error(`CamelotV3SwapAdapter deployment mined (${txHash}) without contractAddress on Arbitrum One`);
     }
 
-    DEPLOYED_CAMELOT_ADAPTERS.arbitrum = deployedAddress;
+    DEPLOYED_CAMELOT_ADAPTERS.arbitrum = ethers.getAddress(deployedAddress);
+    persistRuntimeDeployments();
     liveAgent.invalidateChainInfraCache('arbitrum');
+
+    const arbInfra = await liveAgent.getChainInfra('arbitrum').catch(() => null);
+    const activeContractOwner = arbInfra?.contractOwner ?? null;
+    const ownerMismatch = Boolean(
+      activeContractOwner && activeContractOwner.toLowerCase() !== walletAddress.toLowerCase()
+    );
 
     return res.json({
       success: true,
-      adapterAddress: deployedAddress,
+      adapterAddress: DEPLOYED_CAMELOT_ADAPTERS.arbitrum,
       txHash,
       chain: 'arbitrum',
       chainName: rpcInfo.name,
       deployer: walletAddress,
       camelotV3Router: CAMELOT_V3_ROUTER_ADDRESS,
-      explorerUrl: `${rpcInfo.explorer}/address/${deployedAddress}`,
+      activeContract: DEPLOYED_CONTRACTS.arbitrum,
+      activeContractOwner,
+      ownerMismatch,
+      explorerUrl: `${rpcInfo.explorer}/address/${DEPLOYED_CAMELOT_ADAPTERS.arbitrum}`,
       txExplorerUrl: `${rpcInfo.explorer}/tx/${txHash}`,
     });
   } catch (err: any) {
-    return res.status(500).json({ success: false, error: err.message || 'Adapter deployment failed' });
+    return res.status(err?.timedOut ? 504 : 500).json({ success: false, error: err.message || 'Adapter deployment failed' });
   }
 });
 
@@ -1848,7 +2240,12 @@ class LiveMevAgent {
   public opportunitiesByChain: Record<SupportedArbChain, LiveArbitrageOpportunity[]> = initChainRecord<LiveArbitrageOpportunity[]>(() => []);
   public latestBlockByChain: Record<SupportedArbChain, number> = initChainRecord<number>(() => 0);
   public lastErrorByChain: Record<SupportedArbChain, string | null> = initChainRecord<string | null>(() => null);
-  public lastSuccessfulScanByChain: Record<SupportedArbChain, number> = initChainRecord<number>(() => Date.now());
+  public lastSuccessfulScanByChain: Record<SupportedArbChain, number> = initChainRecord<number>(() => 0);
+  private lastAttemptedScanByChain: Record<SupportedArbChain, number> = initChainRecord<number>(() => 0);
+  private activeUiChain: SupportedArbChain = 'arbitrum';
+  private activeUiAllMode: boolean = false;
+  private lastStatusRequestAt: number = 0;
+  private bgChainCursor: number = 0;
   private loopTimer: NodeJS.Timeout | null = null;
   public isScanning: boolean = false;
   private consecutiveFailures: number = 0;
@@ -1906,7 +2303,7 @@ class LiveMevAgent {
       existing &&
       existing.contractAddr.toLowerCase() === contractAddr.toLowerCase() &&
       (existing.camelotV3Adapter || '').toLowerCase() === configuredAdapter.toLowerCase() &&
-      Date.now() - existing.fetchedAt < 60000
+      Date.now() - existing.fetchedAt < 300_000
     ) {
       return existing;
     }
@@ -2013,8 +2410,22 @@ class LiveMevAgent {
   public getCachedChainCapabilities(chain: SupportedArbChain) {
     const cached = this.chainInfraCache.get(chain);
     const configuredAdapter = (chain === 'arbitrum' ? DEPLOYED_CAMELOT_ADAPTERS.arbitrum : '') || '';
+    const signerKey = (process.env.FLASH_ARB_SIGNER_KEY || '').trim();
+    let signerAddress: string | null = null;
+    if (signerKey) {
+      try {
+        signerAddress = new ethers.Wallet(signerKey.startsWith('0x') ? signerKey : `0x${signerKey}`).address;
+      } catch {}
+    }
+    const contractOwner = cached?.contractOwner ?? null;
+    const ownerMatchesSigner = Boolean(
+      contractOwner && signerAddress && contractOwner.toLowerCase() === signerAddress.toLowerCase()
+    );
     return {
       contractAddr: DEPLOYED_CONTRACTS[chain] || '',
+      contractOwner,
+      signerAddress,
+      ownerMatchesSigner,
       supportsAlgebra: cached?.contractSupportsAlgebra ?? false,
       supportsCamelotV2: cached?.contractSupportsCamelotV2 ?? false,
       camelotV3Adapter: cached?.camelotV3Adapter ?? (configuredAdapter || null),
@@ -2036,14 +2447,102 @@ class LiveMevAgent {
   public start() {
     this.stop();
     this.isRunning = true;
+    this.agentState =
+      this.isAutonomousExecutionEnabled && !process.env.FLASH_ARB_SIGNER_KEY
+        ? 'AWAITING_GAS_SIGNER'
+        : 'SCANNING';
     this.scheduleNextScan(100);
   }
 
   public stop() {
     this.isRunning = false;
+    this.agentState = 'IDLE';
     if (this.loopTimer) {
       clearTimeout(this.loopTimer);
       this.loopTimer = null;
+    }
+  }
+
+  public getActiveUiChain(): SupportedArbChain {
+    return this.activeUiChain;
+  }
+
+  public markUiChainActive(requestedChain: string) {
+    this.lastStatusRequestAt = Date.now();
+    const key = (requestedChain || 'arbitrum').toLowerCase();
+    if (key === 'all') {
+      this.activeUiAllMode = true;
+      return;
+    }
+    this.activeUiAllMode = false;
+    const c = parseSupportedChain(key);
+    this.activeUiChain = c;
+    const stale = Date.now() - (this.lastAttemptedScanByChain[c] || 0) > 4000;
+    if (!this.isScanning && ((this.poolsByChain[c] || []).length === 0 || stale)) {
+      void this.scan(c);
+    }
+  }
+
+  private async scanSmartCycle() {
+    const now = Date.now();
+    const uiRecentlyActive = this.lastStatusRequestAt > 0 && now - this.lastStatusRequestAt < 60_000;
+    const deployedChains = SUPPORTED_SCAN_CHAINS.filter((c) => Boolean(DEPLOYED_CONTRACTS[c]));
+
+    if (this.scanCount === 0) {
+      // Initial boot warmup: prioritize arbitrum + active UI chain immediately without 10-chain blast
+      const bootChains = Array.from(new Set<SupportedArbChain>(['arbitrum', this.activeUiChain]));
+      await this.scan(bootChains.length === 1 ? bootChains[0] : bootChains);
+      return;
+    }
+
+    const targets = new Set<SupportedArbChain>();
+    if (uiRecentlyActive) {
+      if (this.activeUiAllMode) {
+        // Rotate 2 chains per tick when user is on 'all' view
+        for (let step = 0; step < 2; step++) {
+          const c = SUPPORTED_SCAN_CHAINS[(this.bgChainCursor + step) % SUPPORTED_SCAN_CHAINS.length];
+          if (now - (this.lastAttemptedScanByChain[c] || 0) >= 8_000) targets.add(c);
+        }
+        this.bgChainCursor = (this.bgChainCursor + 2) % SUPPORTED_SCAN_CHAINS.length;
+      } else {
+        if (now - (this.lastAttemptedScanByChain[this.activeUiChain] || 0) >= 4_500) {
+          targets.add(this.activeUiChain);
+        }
+        if (this.isAutonomousExecutionEnabled) {
+          for (const c of deployedChains) {
+            if (c !== this.activeUiChain && now - (this.lastAttemptedScanByChain[c] || 0) >= 12_000) {
+              targets.add(c);
+            }
+          }
+        }
+        // Keep background chains fresh via single round-robin probe every 45s
+        const bgChain = SUPPORTED_SCAN_CHAINS[this.bgChainCursor % SUPPORTED_SCAN_CHAINS.length];
+        this.bgChainCursor = (this.bgChainCursor + 1) % SUPPORTED_SCAN_CHAINS.length;
+        if (!targets.has(bgChain) && now - (this.lastAttemptedScanByChain[bgChain] || 0) >= 45_000) {
+          targets.add(bgChain);
+        }
+      }
+    } else if (this.isAutonomousExecutionEnabled) {
+      // UI idle/backgrounded but continuous autonomous trading armed: keep deployed chains scanned at 8s cadence
+      for (const c of deployedChains) {
+        if (now - (this.lastAttemptedScanByChain[c] || 0) >= 8_000) {
+          targets.add(c);
+        }
+      }
+      if (!targets.has(this.activeUiChain) && now - (this.lastAttemptedScanByChain[this.activeUiChain] || 0) >= 12_000) {
+        targets.add(this.activeUiChain);
+      }
+    } else {
+      // Completely idle: rotate at most 1 chain per 25s tick so warm cache doesn't burn RPC quota
+      const idleChain = SUPPORTED_SCAN_CHAINS[this.bgChainCursor % SUPPORTED_SCAN_CHAINS.length];
+      this.bgChainCursor = (this.bgChainCursor + 1) % SUPPORTED_SCAN_CHAINS.length;
+      if (now - (this.lastAttemptedScanByChain[idleChain] || 0) >= 45_000) {
+        targets.add(idleChain);
+      }
+    }
+
+    if (targets.size > 0) {
+      await this.scan(Array.from(targets));
     }
   }
 
@@ -2053,15 +2552,16 @@ class LiveMevAgent {
     this.loopTimer = setTimeout(async () => {
       if (!this.isRunning) return;
       try {
-        await this.scan();
+        await this.scanSmartCycle();
       } catch {
         // Handled internally in scan()
       }
       if (this.isRunning) {
-        // Normal scan interval is 3500ms for fast L2 block coverage. Back off exponentially up to 25s on RPC errors
+        const uiRecentlyActive = this.lastStatusRequestAt > 0 && Date.now() - this.lastStatusRequestAt < 60_000;
+        const baseInterval = this.isAutonomousExecutionEnabled ? 4_500 : uiRecentlyActive ? 5_000 : 20_000;
         const nextDelay = this.consecutiveFailures > 0
-          ? Math.min(25000, 3500 * (1.5 ** Math.min(this.consecutiveFailures, 5)))
-          : 3500;
+          ? Math.min(45_000, baseInterval * (1.5 ** Math.min(this.consecutiveFailures, 5)))
+          : baseInterval;
         this.scheduleNextScan(nextDelay);
       }
     }, delayMs);
@@ -2215,6 +2715,14 @@ class LiveMevAgent {
     simulationFailed?: boolean;
     requiresWallet?: boolean;
     error?: string;
+    requiresContractUpgradeOrAdapter?: boolean;
+    camelotSetupRequired?: boolean;
+    canDeployAdapter?: boolean;
+    recommendUpgradeFlashArb?: boolean;
+    ownerMismatch?: boolean;
+    activeContract?: string;
+    activeContractOwner?: string | null;
+    signerAddress?: string | null;
     txHash?: string;
     explorerUrl?: string;
     trade?: ExecutedAgentTrade;
@@ -2278,17 +2786,44 @@ class LiveMevAgent {
         }
       : undefined;
 
+    const signerKeyRaw = (process.env.FLASH_ARB_SIGNER_KEY || '').trim();
+    let currentSignerAddress: string | null = null;
+    if (signerKeyRaw) {
+      try {
+        currentSignerAddress = new ethers.Wallet(signerKeyRaw.startsWith('0x') ? signerKeyRaw : `0x${signerKeyRaw}`).address;
+      } catch {}
+    }
+    const ownerMismatch = Boolean(
+      infra?.contractOwner && currentSignerAddress && infra.contractOwner.toLowerCase() !== currentSignerAddress.toLowerCase()
+    );
+
     // Check raw unscaled route router support first
     const baseRoutersCheck = resolveArbitrageCandidates({ ...routeInput, chain }, profitWallet, 1, routerCaps);
     if (baseRoutersCheck.length === 0) {
       const involvesCamelotV3 = routeInput.buyDex === 'Camelot V3' || routeInput.sellDex === 'Camelot V3';
+      const involvesCamelotV2 = routeInput.buyDex === 'Camelot V2' || routeInput.sellDex === 'Camelot V2';
+      const setupNeeded = involvesCamelotV3 || involvesCamelotV2;
+      let errMsg = `Route ${routeInput.buyDex} -> ${routeInput.sellDex} on ${rpcInfo.name} uses an unsupported router. Pick a FlashArbOptimized-supported pool pair (Uniswap V3, PancakeSwap V3, SushiSwap V3, Uniswap V2, Sushiswap V2, BaseSwap V2).`;
+      if (involvesCamelotV3) {
+        errMsg = ownerMismatch
+          ? `Route ${routeInput.buyDex} -> ${routeInput.sellDex} requires upgrading FlashArbOptimized on ${rpcInfo.name} in the Contract panel (active contract ${contractAddr} is owned by ${infra?.contractOwner}, whereas active signer is ${currentSignerAddress}; upgrading adds native Camelot V3 & V2 support and sets your active signer as owner).`
+          : `Route ${routeInput.buyDex} -> ${routeInput.sellDex} requires either upgrading FlashArbOptimized on ${rpcInfo.name} or deploying the CamelotV3SwapAdapter in the Contract panel.`;
+      } else if (involvesCamelotV2) {
+        errMsg = `Route ${routeInput.buyDex} -> ${routeInput.sellDex} requires upgrading FlashArbOptimized on ${rpcInfo.name} in the Contract panel (adds native Camelot V2 support).`;
+      }
       return {
         ok: false,
         statusCode: 422,
         simulationFailed: true,
-        error: involvesCamelotV3
-          ? `Route ${routeInput.buyDex} -> ${routeInput.sellDex} requires either upgrading FlashArbOptimized on ${rpcInfo.name} or deploying the CamelotV3SwapAdapter in the Contract panel.`
-          : `Route ${routeInput.buyDex} -> ${routeInput.sellDex} on ${rpcInfo.name} uses an unsupported router. Pick a FlashArbOptimized-supported pool pair (Uniswap V3, PancakeSwap V3, SushiSwap V3, Uniswap V2, Sushiswap V2, BaseSwap V2).`,
+        requiresContractUpgradeOrAdapter: setupNeeded,
+        camelotSetupRequired: setupNeeded,
+        canDeployAdapter: involvesCamelotV3 && !involvesCamelotV2 && !ownerMismatch,
+        recommendUpgradeFlashArb: setupNeeded && (ownerMismatch || involvesCamelotV2),
+        ownerMismatch,
+        activeContract: contractAddr,
+        activeContractOwner: infra?.contractOwner || null,
+        signerAddress: currentSignerAddress,
+        error: errMsg,
       };
     }
 
@@ -2299,7 +2834,7 @@ class LiveMevAgent {
       { ...routeInput, chain },
       profitWallet,
       balancerVaultBalances,
-      [3, 2, 1.5, 1, 0.75, 0.5, 0.25, 0.1, 0.03],
+      [10, 5, 3, 2, 1.5, 1, 0.75, 0.5, 0.25, 0.1, 0.03],
       routerCaps
     );
     if (candidates.length === 0) {
@@ -2310,8 +2845,6 @@ class LiveMevAgent {
         error: `Balancer V2 Vault has insufficient liquidity in both ${routeInput.baseToken.sym} and ${routeInput.quoteToken.sym} on ${rpcInfo.name} for this flash loan.`,
       };
     }
-
-    const { ethers } = await import('ethers');
 
     // Verify deployed contract exists and actually implements executeOptimizedArbitrage (0x23b3aa6b)
     const { result: codeRaw } = await fetchRpcSingleWithFailover(chain, 'eth_getCode', [contractAddr, 'latest'], true);
@@ -2375,7 +2908,18 @@ class LiveMevAgent {
     // Step 1: Profit-maximization batch eth_call across ALL scaled candidates (both Base & Quote borrow directions)
     // Using minProfit = MaxUint256 exposes exact on-chain output via InsufficientProfit(actualWei, MaxUint256).
     const chainPoolsPre = this.poolsByChain[chain] || this.pools;
-    const ethUsdPre = chainPoolsPre.find((p) => p.pair === 'WETH/USDC')?.priceUsd || opp.buyPrice || 2000;
+    const chainMetaPre = CHAIN_LAYER_META[chain];
+    const ethUsdPre =
+      getLiveTokenUsdPrice('WETH', chain) ||
+      chainPoolsPre.find((p) => p.pair === 'WETH/USDC')?.priceUsd ||
+      cachedPriceFeed?.ethUsd ||
+      2500;
+    const nativeUsdPre =
+      chainMetaPre.nativeSymbol === 'ETH'
+        ? ethUsdPre
+        : getLiveTokenUsdPrice(chainMetaPre.wrappedNativeSymbol, chain) ||
+          getLiveTokenUsdPrice(chainMetaPre.nativeSymbol, chain) ||
+          ethUsdPre;
     const quoteUsdPrice =
       routeInput.buyPriceQuotePerBase > 0 && routeInput.buyPriceUsd > 0
         ? routeInput.buyPriceUsd / routeInput.buyPriceQuotePerBase
@@ -2383,9 +2927,13 @@ class LiveMevAgent {
     const tokenUsdPrice = (sym: string): number => {
       const upper = sym.toUpperCase();
       if (upper === routeInput.baseToken.sym.toUpperCase() && routeInput.buyPriceUsd > 0) return routeInput.buyPriceUsd;
-      if (['USDC', 'USDC.E', 'USDBC', 'USDT', 'DAI'].includes(upper)) return 1;
-      if (upper === 'WETH') return ethUsdPre;
-      return quoteUsdPrice > 0 ? quoteUsdPrice : 1;
+      if (upper === routeInput.quoteToken.sym.toUpperCase() && quoteUsdPrice > 0) return quoteUsdPrice;
+      if (['USDC', 'USDC.E', 'USDBC', 'USDT', 'DAI', 'FRAX', 'USDE', 'APEUSD'].includes(upper)) return 1;
+      if (upper === 'WETH' || upper === 'ETH' || upper === 'APEETH') return ethUsdPre;
+      if (upper === chainMetaPre.wrappedNativeSymbol.toUpperCase() || upper === chainMetaPre.nativeSymbol.toUpperCase()) {
+        return nativeUsdPre;
+      }
+      return getLiveTokenUsdPrice(sym, chain) || (quoteUsdPrice > 0 ? quoteUsdPrice : 1);
     };
 
     const orderedCandidates: EncodedArbitrageCandidate[] = [];
@@ -2405,8 +2953,9 @@ class LiveMevAgent {
         ],
       }));
       const { results: probeResults } = await fetchRpcBatchWithFailover(chain, probeBatch);
-      const scored: Array<{ cand: EncodedArbitrageCandidate; actualProfitUsd: number; actualProfitWei: bigint }> = [];
+      const scored: Array<{ cand: EncodedArbitrageCandidate; netProfitUsd: number; actualProfitUsd: number; actualProfitWei: bigint }> = [];
 
+      const estGasUsd = opp.gasCostUsd || 0;
       for (const item of probeResults) {
         const idx = Number(item?.id) - 1;
         const cand = candidates[idx];
@@ -2416,20 +2965,21 @@ class LiveMevAgent {
           const tokPrice = tokenUsdPrice(cand.borrowedToken.sym);
           const actualHuman = Number(ethers.formatUnits(ins.actual, cand.borrowedToken.dec));
           const actualProfitUsd = actualHuman * tokPrice;
-          const minRequiredUsd = options?.forceTestExecution ? 0 : this.minProfitThresholdUsd + (opp.gasCostUsd || 0);
+          const minRequiredUsd = options?.forceTestExecution ? 0 : this.minProfitThresholdUsd + estGasUsd;
           if (actualProfitUsd >= minRequiredUsd) {
-            // Set minProfit to max(gas+profitFloor, 50% of probed output), capped strictly below actual output
-            // so normal block-time flow doesn't cause unnecessary reverts while Profit Guard stays intact.
+            // Set minProfit to max(gas+profitFloor, 75% of probed output), capped strictly below actual output
+            // so MEV sandwich / slippage spikes cannot drain execution profit while Profit Guard stays intact.
             const floorWei =
               minRequiredUsd > 0 && tokPrice > 0
                 ? toTokenUnits(minRequiredUsd / tokPrice, cand.borrowedToken.dec)
                 : 1n;
-            const halfActual = (ins.actual * 50n) / 100n;
-            const desiredMin = floorWei > halfActual ? floorWei : halfActual;
+            const seventyFivePctActual = (ins.actual * 75n) / 100n;
+            const desiredMin = floorWei > seventyFivePctActual ? floorWei : seventyFivePctActual;
             const maxSafeMin = ins.actual > 1n ? ins.actual - 1n : 1n;
             const tightenedMinProfit = desiredMin > maxSafeMin ? maxSafeMin : desiredMin > 1n ? desiredMin : 1n;
             scored.push({
               cand: rebuildCandidateWithMinProfit(cand, tightenedMinProfit),
+              netProfitUsd: actualProfitUsd - estGasUsd,
               actualProfitUsd,
               actualProfitWei: ins.actual,
             });
@@ -2441,7 +2991,7 @@ class LiveMevAgent {
         }
       }
 
-      scored.sort((a, b) => b.actualProfitUsd - a.actualProfitUsd);
+      scored.sort((a, b) => b.netProfitUsd - a.netProfitUsd);
       for (const s of scored) orderedCandidates.push(s.cand);
     } catch {
       // If batch probe RPC call fails transiently, fall back to standard candidate order
@@ -2485,49 +3035,15 @@ class LiveMevAgent {
 
     this.agentState = 'EXECUTING';
     const gasLimitWithHeadroom = (estimatedGas * 125n) / 100n;
-    const txPool = getRpcPool(chain, true);
-    let sentTxHash = '';
-    let lastBroadcastErr: any = null;
-
-    for (const rpcUrl of txPool) {
-      try {
-        const provider = new ethers.JsonRpcProvider(rpcUrl);
-        const wallet = new ethers.Wallet(cleanKey, provider);
-        const balWei = await provider.getBalance(wallet.address);
-        if (balWei < 100000000000000n) {
-          this.agentState = 'SCANNING';
-          return {
-            ok: false,
-            statusCode: 400,
-            error: `Gas wallet ${wallet.address} holds ${ethers.formatEther(balWei)} ETH on ${rpcInfo.name} (< 0.0001 ETH required for L2 gas).`,
-          };
-        }
-        const tx = await wallet.sendTransaction({
-          to: contractAddr,
-          data: verifiedCandidate.calldata,
-          gasLimit: gasLimitWithHeadroom,
-        });
-        sentTxHash = tx.hash;
-        break;
-      } catch (err: any) {
-        lastBroadcastErr = err;
-        const msg = String(err?.message || '');
-        if (!/429|403|timeout|fetch|coalesce|archive|network|ECONN|socket/i.test(msg)) {
-          break;
-        }
-      }
-    }
-
-    if (!sentTxHash) {
-      this.agentState = 'SCANNING';
-      return {
-        ok: false,
-        statusCode: 500,
-        error: lastBroadcastErr?.message || `Failed to broadcast verified arbitrage transaction on ${rpcInfo.name}.`,
-      };
-    }
-
-    const receipt = await waitForReceiptWithFailover(chain, sentTxHash, 45000);
+    const { txHash: sentTxHash, receipt } = await broadcastSignedTxAndWait({
+      chain,
+      cleanKey,
+      to: contractAddr,
+      data: verifiedCandidate.calldata,
+      gasLimit: gasLimitWithHeadroom,
+      allowAutoSpeedUp: false,
+      minBalanceWei: 100000000000000n,
+    });
     const isSuccess = receipt.status === 1;
     const gasCostEth =
       receipt.effectiveGasPrice !== null
@@ -2791,27 +3307,45 @@ class LiveMevAgent {
         : CHAIN_TOKENS[chain]?.USDC || CHAIN_TOKENS[chain]?.WETH || chainTokenList.find((t) => t.addr.toLowerCase() !== baseToken.addr.toLowerCase())!;
     }
 
-    // Refine DEX fee tiers against live pool specs when the dropdown didn't specify a tick tier
-    const resolvePoolFee = (dex: string, fallbackFee: number, explicit: boolean) => {
-      if (explicit) return fallbackFee;
-      const spec = specs.find(
-        (s) =>
-          s.dex === dex &&
-          ((s.base.addr.toLowerCase() === baseToken.addr.toLowerCase() &&
-            s.quote.addr.toLowerCase() === quoteToken!.addr.toLowerCase()) ||
-            (s.quote.addr.toLowerCase() === baseToken.addr.toLowerCase() &&
-              s.base.addr.toLowerCase() === quoteToken!.addr.toLowerCase()))
-      );
-      return spec ? spec.fee : fallbackFee;
+    // Collect all candidate DEX fee tiers from live pool specs when dropdown didn't lock a single tick tier
+    const resolvePoolFees = (dex: string, fallbackFee: number, explicit: boolean): number[] => {
+      if (explicit) return [fallbackFee];
+      const matchingFees = specs
+        .filter(
+          (s) =>
+            s.dex === dex &&
+            ((s.base.addr.toLowerCase() === baseToken.addr.toLowerCase() &&
+              s.quote.addr.toLowerCase() === quoteToken!.addr.toLowerCase()) ||
+              (s.quote.addr.toLowerCase() === baseToken.addr.toLowerCase() &&
+                s.base.addr.toLowerCase() === quoteToken!.addr.toLowerCase()))
+        )
+        .map((s) => s.fee)
+        .filter((f) => Number.isFinite(f) && f > 0);
+      if (matchingFees.length === 0) return [fallbackFee];
+      return Array.from(new Set(matchingFees)).slice(0, 3);
     };
-    const buyFeePercent = resolvePoolFee(buyParsed.dex, buyParsed.feePercent, buyParsed.explicitFee);
-    const sellFeePercent = resolvePoolFee(sellParsed.dex, sellParsed.feePercent, sellParsed.explicitFee);
+    const buyFees = resolvePoolFees(buyParsed.dex, buyParsed.feePercent, buyParsed.explicitFee);
+    const sellFees = resolvePoolFees(sellParsed.dex, sellParsed.feePercent, sellParsed.explicitFee);
+    const buyFeePercent = buyFees[0];
+    const sellFeePercent = sellFees[0];
     const pair = `${baseToken.sym}/${quoteToken.sym}`;
 
     const baseFailResult = (
       statusCode: number,
       reason: string,
-      opts?: { verifiedOnChain?: boolean; requiresWallet?: boolean; simulationFailed?: boolean }
+      opts?: {
+        verifiedOnChain?: boolean;
+        requiresWallet?: boolean;
+        simulationFailed?: boolean;
+        requiresContractUpgradeOrAdapter?: boolean;
+        camelotSetupRequired?: boolean;
+        canDeployAdapter?: boolean;
+        recommendUpgradeFlashArb?: boolean;
+        ownerMismatch?: boolean;
+        activeContract?: string;
+        activeContractOwner?: string | null;
+        signerAddress?: string | null;
+      }
     ) => ({
       ok: false,
       statusCode,
@@ -2837,6 +3371,14 @@ class LiveMevAgent {
       revertReason: reason,
       requiresWallet: opts?.requiresWallet,
       simulationFailed: opts?.simulationFailed ?? true,
+      requiresContractUpgradeOrAdapter: opts?.requiresContractUpgradeOrAdapter,
+      camelotSetupRequired: opts?.camelotSetupRequired,
+      canDeployAdapter: opts?.canDeployAdapter,
+      recommendUpgradeFlashArb: opts?.recommendUpgradeFlashArb,
+      ownerMismatch: opts?.ownerMismatch,
+      activeContract: opts?.activeContract,
+      activeContractOwner: opts?.activeContractOwner,
+      signerAddress: opts?.signerAddress,
       error: reason,
       checkedCandidates: [] as Array<{
         label: string;
@@ -2875,10 +3417,35 @@ class LiveMevAgent {
     const routers = getEffectiveChainDexRouters(chain, routerCaps);
     if (!routers[buyParsed.dex]?.supported || !routers[sellParsed.dex]?.supported) {
       const badDex = !routers[buyParsed.dex]?.supported ? buyParsed.dex : sellParsed.dex;
-      return baseFailResult(
-        422,
-        `Venue "${badDex}" is monitor-only on ${rpcInfo.name} and cannot be routed atomically by FlashArbOptimized.`
+      const involvesCamelotV3 = buyParsed.dex === 'Camelot V3' || sellParsed.dex === 'Camelot V3';
+      const involvesCamelotV2 = buyParsed.dex === 'Camelot V2' || sellParsed.dex === 'Camelot V2';
+      let currentSignerAddress: string | null = null;
+      const signerKeyRaw = (process.env.FLASH_ARB_SIGNER_KEY || '').trim();
+      if (signerKeyRaw) {
+        try {
+          currentSignerAddress = new ethers.Wallet(signerKeyRaw.startsWith('0x') ? signerKeyRaw : `0x${signerKeyRaw}`).address;
+        } catch {}
+      }
+      const ownerMismatch = Boolean(
+        infra.contractOwner && currentSignerAddress && infra.contractOwner.toLowerCase() !== currentSignerAddress.toLowerCase()
       );
+      const setupMsg = involvesCamelotV3
+        ? ownerMismatch
+          ? `Route ${buyParsed.dex} -> ${sellParsed.dex} requires upgrading FlashArbOptimized on ${rpcInfo.name} in the Contract panel (active contract ${contractAddr} is owned by ${infra.contractOwner}, whereas active signer is ${currentSignerAddress}).`
+          : `Route ${buyParsed.dex} -> ${sellParsed.dex} requires either upgrading FlashArbOptimized on ${rpcInfo.name} or deploying the CamelotV3SwapAdapter in the Contract panel.`
+        : involvesCamelotV2
+        ? `Route ${buyParsed.dex} -> ${sellParsed.dex} requires upgrading FlashArbOptimized on ${rpcInfo.name} in the Contract panel (adds native Camelot V2 support).`
+        : `Venue "${badDex}" is monitor-only on ${rpcInfo.name} and cannot be routed atomically by FlashArbOptimized.`;
+      return baseFailResult(422, setupMsg, {
+        requiresContractUpgradeOrAdapter: involvesCamelotV3 || involvesCamelotV2,
+        camelotSetupRequired: involvesCamelotV3 || involvesCamelotV2,
+        canDeployAdapter: involvesCamelotV3 && !involvesCamelotV2 && !ownerMismatch,
+        recommendUpgradeFlashArb: (involvesCamelotV3 || involvesCamelotV2) && (ownerMismatch || involvesCamelotV2),
+        ownerMismatch,
+        activeContract: contractAddr,
+        activeContractOwner: infra.contractOwner || null,
+        signerAddress: currentSignerAddress,
+      });
     }
 
     // Ensure live token price feed & gas price are available
@@ -2908,25 +3475,38 @@ class LiveMevAgent {
     } catch {}
 
     const vaultBalances = Object.keys(infra.vaultBalances).length > 0 ? infra.vaultBalances : undefined;
-    const candidates = buildScaledArbitrageCandidates(
-      {
-        chain,
-        baseToken,
-        quoteToken,
-        buyDex: buyParsed.dex,
-        buyFeePercent,
-        sellDex: sellParsed.dex,
-        sellFeePercent,
-        optimalLoanBaseUnits: params.loanAmount,
-        buyPriceQuotePerBase,
-        buyPriceUsd: baseUsd,
-        estNetProfitUsd: Math.max(0.01, minProfitUsd),
-      },
-      profitWallet,
-      vaultBalances,
-      [1, 0.5, 0.25, 0.1],
-      routerCaps
-    );
+    const candidateMap = new Map<string, EncodedArbitrageCandidate>();
+    for (const bf of buyFees) {
+      for (const sf of sellFees) {
+        const comboCands = buildScaledArbitrageCandidates(
+          {
+            chain,
+            baseToken,
+            quoteToken,
+            buyDex: buyParsed.dex,
+            buyFeePercent: bf,
+            sellDex: sellParsed.dex,
+            sellFeePercent: sf,
+            optimalLoanBaseUnits: params.loanAmount,
+            buyPriceQuotePerBase,
+            buyPriceUsd: baseUsd,
+            estNetProfitUsd: Math.max(0.01, minProfitUsd),
+          },
+          profitWallet,
+          vaultBalances,
+          [5, 3, 2, 1.5, 1, 0.5, 0.25, 0.1],
+          routerCaps
+        );
+        for (const c of comboCands) {
+          const dedupKey = `${c.borrowedToken.addr.toLowerCase()}:${c.amountUnits.toString()}:${c.feeA}:${c.feeB}:${c.routeType}`;
+          if (!candidateMap.has(dedupKey)) {
+            const feeTag = buyFees.length > 1 || sellFees.length > 1 ? ` [${(c.feeA / 10000).toFixed(2)}%/${(c.feeB / 10000).toFixed(2)}%]` : '';
+            candidateMap.set(dedupKey, feeTag ? { ...c, label: `${c.label}${feeTag}` } : c);
+          }
+        }
+      }
+    }
+    const candidates = Array.from(candidateMap.values());
 
     if (candidates.length === 0) {
       return baseFailResult(
@@ -3017,7 +3597,8 @@ class LiveMevAgent {
             ? `On-chain round-trip returned +${actualFmt} ${cand.borrowedToken.sym} (+$${actualUsd.toFixed(2)})`
             : `InsufficientProfit(actual=0): live ${buyParsed.dex} -> ${sellParsed.dex} pool spread is negative after DEX fees & price impact (0 profit on-chain).`,
         });
-        if (isPos && (!bestPositive || actualUsd > bestPositive.actualUsd)) {
+        const bestNetUsd = bestPositive ? bestPositive.actualUsd - defaultGasCostUsd : -Infinity;
+        if (isPos && (!bestPositive || (actualUsd - defaultGasCostUsd) > bestNetUsd)) {
           bestPositive = { cand, actualWei: ins.actual, actualFmt, actualUsd };
         }
       } else {
@@ -3046,8 +3627,8 @@ class LiveMevAgent {
       const minRequiredUsd = minProfitUsd + defaultGasCostUsd;
       const floorWei =
         minRequiredUsd > 0 && tokPx > 0 ? toTokenUnits(minRequiredUsd / tokPx, bestPositive.cand.borrowedToken.dec) : 1n;
-      const halfActual = (bestPositive.actualWei * 50n) / 100n;
-      const desiredMin = floorWei > halfActual ? floorWei : halfActual;
+      const seventyFivePctActual = (bestPositive.actualWei * 75n) / 100n;
+      const desiredMin = floorWei > seventyFivePctActual ? floorWei : seventyFivePctActual;
       const maxSafeMin = bestPositive.actualWei > 1n ? bestPositive.actualWei - 1n : 1n;
       const tightenedMin = desiredMin > maxSafeMin ? maxSafeMin : desiredMin > 1n ? desiredMin : 1n;
 
@@ -3146,53 +3727,15 @@ class LiveMevAgent {
 
     this.agentState = 'EXECUTING';
     const gasLimitWithHeadroom = (estimatedGas * 125n) / 100n;
-    const txPool = getRpcPool(chain, true);
-    let sentTxHash = '';
-    let lastBroadcastErr: any = null;
-
-    for (const rpcUrl of txPool) {
-      try {
-        const provider = new ethers.JsonRpcProvider(rpcUrl);
-        const wallet = new ethers.Wallet(cleanKey, provider);
-        const balWei = await provider.getBalance(wallet.address);
-        if (balWei < 100000000000000n) {
-          this.agentState = 'SCANNING';
-          return {
-            ...baseFailResult(
-              400,
-              `Gas wallet ${wallet.address} holds ${ethers.formatEther(balWei)} ETH on ${rpcInfo.name} (< 0.0001 ETH required).`,
-              { verifiedOnChain: true }
-            ),
-            checkedCandidates,
-          };
-        }
-        const tx = await wallet.sendTransaction({
-          to: contractAddr,
-          data: verifiedCandidate.calldata,
-          gasLimit: gasLimitWithHeadroom,
-        });
-        sentTxHash = tx.hash;
-        break;
-      } catch (err: any) {
-        lastBroadcastErr = err;
-        const msg = String(err?.message || '');
-        if (!/429|403|timeout|fetch|coalesce|archive|network|ECONN|socket/i.test(msg)) {
-          break;
-        }
-      }
-    }
-
-    if (!sentTxHash) {
-      this.agentState = 'SCANNING';
-      return {
-        ...baseFailResult(500, lastBroadcastErr?.message || `Failed to broadcast on ${rpcInfo.name}.`, {
-          verifiedOnChain: true,
-        }),
-        checkedCandidates,
-      };
-    }
-
-    const receipt = await waitForReceiptWithFailover(chain, sentTxHash, 45000);
+    const { txHash: sentTxHash, receipt } = await broadcastSignedTxAndWait({
+      chain,
+      cleanKey,
+      to: contractAddr,
+      data: verifiedCandidate.calldata,
+      gasLimit: gasLimitWithHeadroom,
+      allowAutoSpeedUp: false,
+      minBalanceWei: 100000000000000n,
+    });
     const isSuccess = receipt.status === 1;
     const decodedSwap = decodeArbitrageSwapsExecutedLogs(receipt.logs || [], contractAddr);
     const sweptAmount = decodedSwap
@@ -3347,11 +3890,11 @@ class LiveMevAgent {
     const candidates = allOpps
       .filter((o) => o.isProfitable && o.contractExecutable && (this.failedSimCooldownByOppId.get(o.id) ?? 0) <= now)
       .sort((a, b) => {
+        const netDelta = b.estNetProfitUsd - a.estNetProfitUsd;
+        if (Math.abs(netDelta) >= 0.05) return netDelta;
         const ratioA = a.estNetProfitUsd / Math.max(0.002, a.gasCostUsd);
         const ratioB = b.estNetProfitUsd / Math.max(0.002, b.gasCostUsd);
-        const scoreA = a.estNetProfitUsd * 10 + Math.min(200, ratioA);
-        const scoreB = b.estNetProfitUsd * 10 + Math.min(200, ratioB);
-        return scoreB - scoreA;
+        return ratioB - ratioA;
       })
       .slice(0, 5);
 
@@ -3848,15 +4391,22 @@ class LiveMevAgent {
   }
 
   /**
-   * Scans Arbitrum One, Base L2, and Optimism Mainnet in parallel via Multicall3.
+   * Scans specified chains (or all configured chains) in parallel via Multicall3.
    */
-  public async scan(targetChain?: SupportedArbChain) {
+  public async scan(targetChain?: SupportedArbChain | SupportedArbChain[]) {
     if (this.isScanning) return;
     this.isScanning = true;
     try {
       this.scanCount++;
       this.lastScanTimestamp = Date.now();
-      const chainsToScan: SupportedArbChain[] = targetChain ? [targetChain] : SUPPORTED_SCAN_CHAINS;
+      const chainsToScan: SupportedArbChain[] = Array.isArray(targetChain)
+        ? targetChain
+        : targetChain
+        ? [targetChain]
+        : SUPPORTED_SCAN_CHAINS;
+      for (const c of chainsToScan) {
+        this.lastAttemptedScanByChain[c] = this.lastScanTimestamp;
+      }
 
       const results = await Promise.allSettled(
         chainsToScan.map((c) => this.scanChain(c))
@@ -3923,6 +4473,7 @@ const liveAgent = new LiveMevAgent();
  */
 flashArbRouter.get('/agent/status', (req: Request, res: Response) => {
   const chainParam = String(req.query.chain || 'arbitrum').toLowerCase();
+  liveAgent.markUiChainActive(chainParam);
   const statusView = liveAgent.getStatusForChain(chainParam);
   res.json({
     success: true,
@@ -4023,13 +4574,38 @@ flashArbRouter.post('/agent/config', (req: Request, res: Response) => {
     }
     if (typeof isAutonomousExecutionEnabled === 'boolean') {
       liveAgent.isAutonomousExecutionEnabled = isAutonomousExecutionEnabled;
+      if (isAutonomousExecutionEnabled) {
+        if (!liveAgent.isRunning) {
+          liveAgent.start();
+        } else {
+          liveAgent.agentState = !process.env.FLASH_ARB_SIGNER_KEY ? 'AWAITING_GAS_SIGNER' : 'SCANNING';
+        }
+      } else if (
+        liveAgent.agentState === 'AWAITING_GAS_SIGNER' ||
+        liveAgent.agentState === 'EXECUTING' ||
+        liveAgent.agentState === 'OPPORTUNITY_FOUND'
+      ) {
+        liveAgent.agentState = liveAgent.isRunning ? 'SCANNING' : 'IDLE';
+      }
     }
 
-    liveAgent.scan();
+    if (liveAgent.isAutonomousExecutionEnabled) {
+      const deployedAndActive = Array.from(
+        new Set<SupportedArbChain>([
+          ...SUPPORTED_SCAN_CHAINS.filter((c) => Boolean(DEPLOYED_CONTRACTS[c])),
+          liveAgent.getActiveUiChain(),
+        ])
+      );
+      void liveAgent.scan(deployedAndActive);
+    } else {
+      void liveAgent.scan(liveAgent.getActiveUiChain());
+    }
 
     return res.json({
       success: true,
       message: 'Agent optimizer parameters and profit guard updated successfully',
+      isRunning: liveAgent.isRunning,
+      agentState: liveAgent.agentState,
       config: {
         minProfitThresholdUsd: liveAgent.minProfitThresholdUsd,
         maxProfitCap: null,
@@ -4312,12 +4888,28 @@ flashArbRouter.post('/agent/verify-v3', async (req: Request, res: Response) => {
  * POST /api/flash-arb/agent/start
  * Starts the live continuous background MEV agent
  */
-flashArbRouter.post('/agent/start', (_req: Request, res: Response) => {
+flashArbRouter.post('/agent/start', (req: Request, res: Response) => {
+  if (typeof req.body?.enableAutonomous === 'boolean') {
+    liveAgent.isAutonomousExecutionEnabled = req.body.enableAutonomous;
+  }
   liveAgent.start();
+  if (liveAgent.isAutonomousExecutionEnabled) {
+    const deployedAndActive = Array.from(
+      new Set<SupportedArbChain>([
+        ...SUPPORTED_SCAN_CHAINS.filter((c) => Boolean(DEPLOYED_CONTRACTS[c])),
+        liveAgent.getActiveUiChain(),
+      ])
+    );
+    void liveAgent.scan(deployedAndActive);
+  }
   res.json({
     success: true,
-    message: 'Live Autonomous Arbitrage Agent activated on Arbitrum One',
-    isRunning: true,
+    message: liveAgent.isAutonomousExecutionEnabled
+      ? 'Live Continuous Scanner & Autonomous Execution Agent activated'
+      : 'Live Continuous MEV Scanner Agent activated',
+    isRunning: liveAgent.isRunning,
+    isAutonomousExecutionEnabled: liveAgent.isAutonomousExecutionEnabled,
+    agentState: liveAgent.agentState,
   });
 });
 
@@ -4325,12 +4917,17 @@ flashArbRouter.post('/agent/start', (_req: Request, res: Response) => {
  * POST /api/flash-arb/agent/stop
  * Pauses the live background MEV agent
  */
-flashArbRouter.post('/agent/stop', (_req: Request, res: Response) => {
+flashArbRouter.post('/agent/stop', (req: Request, res: Response) => {
+  if (req.body?.disableAutonomous === true) {
+    liveAgent.isAutonomousExecutionEnabled = false;
+  }
   liveAgent.stop();
   res.json({
     success: true,
     message: 'Live Autonomous Arbitrage Agent paused',
-    isRunning: false,
+    isRunning: liveAgent.isRunning,
+    isAutonomousExecutionEnabled: liveAgent.isAutonomousExecutionEnabled,
+    agentState: liveAgent.agentState,
   });
 });
 
@@ -4346,6 +4943,9 @@ flashArbRouter.post('/agent/trigger', async (req: Request, res: Response) => {
     await liveAgent.scan(targetChain);
     const chainOpps = liveAgent.opportunitiesByChain[targetChain] || [];
     const sortedOpps = [...chainOpps].sort((a, b) => {
+      const readyA = Boolean(a.isProfitable && a.contractExecutable);
+      const readyB = Boolean(b.isProfitable && b.contractExecutable);
+      if (readyA !== readyB) return Number(readyB) - Number(readyA);
       const execDelta = Number(Boolean(b.contractExecutable)) - Number(Boolean(a.contractExecutable));
       if (execDelta !== 0) return execDelta;
       return b.estNetProfitUsd - a.estNetProfitUsd;
@@ -4369,6 +4969,14 @@ flashArbRouter.post('/agent/trigger', async (req: Request, res: Response) => {
         blockedByProfitGuard: result.blockedByProfitGuard,
         simulationFailed: result.simulationFailed,
         requiresWallet: result.requiresWallet,
+        requiresContractUpgradeOrAdapter: result.requiresContractUpgradeOrAdapter,
+        camelotSetupRequired: result.camelotSetupRequired,
+        canDeployAdapter: result.canDeployAdapter,
+        recommendUpgradeFlashArb: result.recommendUpgradeFlashArb,
+        ownerMismatch: result.ownerMismatch,
+        activeContract: result.activeContract,
+        activeContractOwner: result.activeContractOwner,
+        signerAddress: result.signerAddress,
         txPayload: result.txPayload,
         txHash: result.txHash,
         explorerUrl: result.explorerUrl,
@@ -4396,7 +5004,15 @@ flashArbRouter.post('/agent/trigger', async (req: Request, res: Response) => {
     });
   } catch (err: any) {
     liveAgent.agentState = 'SCANNING';
-    return res.status(500).json({ success: false, error: err.message });
+    return res.status(err?.timedOut ? 504 : 500).json({
+      success: false,
+      timedOut: Boolean(err?.timedOut),
+      pendingInMempool: Boolean(err?.pendingInMempool),
+      txHash: err?.txHash,
+      explorerUrl: err?.explorerUrl,
+      nonce: err?.nonce ?? null,
+      error: err.message,
+    });
   }
 });
 
@@ -4449,7 +5065,15 @@ flashArbRouter.post('/simulator/execute', async (req: Request, res: Response) =>
     });
   } catch (err: any) {
     liveAgent.agentState = 'SCANNING';
-    return res.status(500).json({ success: false, error: err.message || 'Simulator execution failed' });
+    return res.status(err?.timedOut ? 504 : 500).json({
+      success: false,
+      timedOut: Boolean(err?.timedOut),
+      pendingInMempool: Boolean(err?.pendingInMempool),
+      txHash: err?.txHash,
+      explorerUrl: err?.explorerUrl,
+      nonce: err?.nonce ?? null,
+      error: err.message || 'Simulator execution failed',
+    });
   }
 });
 
@@ -4532,6 +5156,187 @@ flashArbRouter.post('/agent/verify-receipt', async (req: Request, res: Response)
     });
   } catch (err: any) {
     return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+/**
+ * GET /api/flash-arb/tx-status?chain=ethereum&txHash=0x...
+ * Checks receipt + mempool state + pending signer nonce for any transaction hash
+ */
+flashArbRouter.get('/tx-status', async (req: Request, res: Response) => {
+  try {
+    const chain = parseSupportedChain(req.query.chain);
+    const txHash = String(req.query.txHash || '').trim();
+    if (!/^0x[a-fA-F0-9]{64}$/i.test(txHash)) {
+      return res.status(400).json({ success: false, error: 'Valid 66-character 0x txHash is required.' });
+    }
+    const rpcInfo = RPC_ENDPOINTS[chain] || RPC_ENDPOINTS.arbitrum;
+    const signerAddress = (process.env.FLASH_ARB_SIGNER_KEY || '').trim()
+      ? (() => {
+          try {
+            const k = process.env.FLASH_ARB_SIGNER_KEY!.trim();
+            return new ethers.Wallet(k.startsWith('0x') ? k : `0x${k}`).address;
+          } catch {
+            return gasWalletEnv();
+          }
+        })()
+      : gasWalletEnv();
+
+    const [receiptResp, txResp, latestNonceResp, pendingNonceResp] = await Promise.all([
+      fetchRpcSingleWithFailover(chain, 'eth_getTransactionReceipt', [txHash], true).catch(() => ({ result: null })),
+      fetchRpcSingleWithFailover(chain, 'eth_getTransactionByHash', [txHash], true).catch(() => ({ result: null })),
+      signerAddress
+        ? fetchRpcSingleWithFailover(chain, 'eth_getTransactionCount', [signerAddress, 'latest'], true).catch(() => ({ result: null }))
+        : Promise.resolve({ result: null }),
+      signerAddress
+        ? fetchRpcSingleWithFailover(chain, 'eth_getTransactionCount', [signerAddress, 'pending'], true).catch(() => ({ result: null }))
+        : Promise.resolve({ result: null }),
+    ]);
+
+    const receipt = receiptResp?.result;
+    const txObj = txResp?.result;
+    const latestNonce = typeof latestNonceResp?.result === 'string' ? parseInt(latestNonceResp.result, 16) : null;
+    const pendingNonce = typeof pendingNonceResp?.result === 'string' ? parseInt(pendingNonceResp.result, 16) : null;
+
+    if (receipt && receipt.blockNumber) {
+      const ok = receipt.status === '0x1' || receipt.status === 1;
+      const effGasGwei = receipt.effectiveGasPrice ? Number(BigInt(receipt.effectiveGasPrice)) / 1e9 : null;
+      return res.json({
+        success: true,
+        chain,
+        txHash,
+        status: ok ? 'CONFIRMED' : 'REVERTED',
+        isMined: true,
+        blockNumber: parseInt(receipt.blockNumber, 16),
+        gasUsed: receipt.gasUsed ? BigInt(receipt.gasUsed).toString() : null,
+        effectiveGasPriceGwei: effGasGwei !== null ? Number(effGasGwei.toFixed(6)) : null,
+        nonce: txObj?.nonce ? parseInt(txObj.nonce, 16) : null,
+        signerLatestNonce: latestNonce,
+        signerPendingNonce: pendingNonce,
+        explorerUrl: `${rpcInfo.explorer}/tx/${txHash}`,
+      });
+    }
+
+    if (txObj) {
+      const maxFeeGwei = txObj.maxFeePerGas ? Number(BigInt(txObj.maxFeePerGas)) / 1e9 : null;
+      const priorityGwei = txObj.maxPriorityFeePerGas ? Number(BigInt(txObj.maxPriorityFeePerGas)) / 1e9 : null;
+      return res.json({
+        success: true,
+        chain,
+        txHash,
+        status: 'PENDING',
+        isMined: false,
+        nonce: txObj.nonce ? parseInt(txObj.nonce, 16) : null,
+        maxFeePerGasGwei: maxFeeGwei !== null ? Number(maxFeeGwei.toFixed(6)) : null,
+        maxPriorityFeePerGasGwei: priorityGwei !== null ? Number(priorityGwei.toFixed(6)) : null,
+        signerLatestNonce: latestNonce,
+        signerPendingNonce: pendingNonce,
+        explorerUrl: `${rpcInfo.explorer}/tx/${txHash}`,
+      });
+    }
+
+    return res.json({
+      success: true,
+      chain,
+      txHash,
+      status: 'NOT_FOUND',
+      isMined: false,
+      signerLatestNonce: latestNonce,
+      signerPendingNonce: pendingNonce,
+      explorerUrl: `${rpcInfo.explorer}/tx/${txHash}`,
+    });
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err.message || 'Failed to inspect tx status' });
+  }
+});
+
+/**
+ * POST /api/flash-arb/tx-speedup
+ * Replaces a pending signer transaction on the same nonce with bumped EIP-1559 fees (RBF)
+ */
+flashArbRouter.post('/tx-speedup', async (req: Request, res: Response) => {
+  try {
+    const chain = parseSupportedChain(req.body?.chain);
+    const txHash = String(req.body?.txHash || '').trim();
+    const cancel = Boolean(req.body?.cancel);
+    const rawKey = (process.env.FLASH_ARB_SIGNER_KEY || '').trim();
+    if (!rawKey) {
+      return res.status(409).json({ success: false, requiresWallet: true, error: 'FLASH_ARB_SIGNER_KEY is not configured.' });
+    }
+    const cleanKey = rawKey.startsWith('0x') ? rawKey : `0x${rawKey}`;
+    const signerAddress = new ethers.Wallet(cleanKey).address;
+    const rpcInfo = RPC_ENDPOINTS[chain] || RPC_ENDPOINTS.arbitrum;
+
+    if (!/^0x[a-fA-F0-9]{64}$/i.test(txHash)) {
+      return res.status(400).json({ success: false, error: 'Valid 66-character 0x txHash is required.' });
+    }
+
+    const [receiptResp, txResp] = await Promise.all([
+      fetchRpcSingleWithFailover(chain, 'eth_getTransactionReceipt', [txHash], true).catch(() => ({ result: null })),
+      fetchRpcSingleWithFailover(chain, 'eth_getTransactionByHash', [txHash], true).catch(() => ({ result: null })),
+    ]);
+
+    if (receiptResp?.result?.blockNumber) {
+      return res.json({
+        success: true,
+        alreadyMined: true,
+        txHash,
+        status: receiptResp.result.status === '0x1' ? 'CONFIRMED' : 'REVERTED',
+        blockNumber: parseInt(receiptResp.result.blockNumber, 16),
+        explorerUrl: `${rpcInfo.explorer}/tx/${txHash}`,
+      });
+    }
+
+    const pendingTx = txResp?.result;
+    if (!pendingTx) {
+      return res.status(404).json({
+        success: false,
+        error: `Transaction ${txHash} was not found in ${rpcInfo.name} mempool (may already be dropped or replaced).`,
+      });
+    }
+    if (String(pendingTx.from || '').toLowerCase() !== signerAddress.toLowerCase()) {
+      return res.status(403).json({
+        success: false,
+        error: `Transaction sender ${pendingTx.from} does not match configured signer ${signerAddress}.`,
+      });
+    }
+
+    const nonce = parseInt(pendingTx.nonce, 16);
+    const gasLimit = cancel ? 21000n : pendingTx.gas ? BigInt(pendingTx.gas) : 300000n;
+    const prevMaxFee = pendingTx.maxFeePerGas ? BigInt(pendingTx.maxFeePerGas) : pendingTx.gasPrice ? BigInt(pendingTx.gasPrice) : 0n;
+    const prevPriority = pendingTx.maxPriorityFeePerGas ? BigInt(pendingTx.maxPriorityFeePerGas) : 0n;
+
+    const { txHash: replacementHash, receipt } = await broadcastSignedTxAndWait({
+      chain,
+      cleanKey,
+      to: cancel ? signerAddress : pendingTx.to,
+      data: cancel ? '0x' : pendingTx.input || '0x',
+      valueWei: cancel ? 0n : pendingTx.value ? BigInt(pendingTx.value) : 0n,
+      gasLimit,
+      nonceOverride: nonce,
+      urgencyMultiplierPct: prevMaxFee > 0n || prevPriority > 0n ? 150 : 135,
+      allowAutoSpeedUp: true,
+    });
+
+    return res.json({
+      success: receipt.status === 1,
+      replacedTxHash: txHash,
+      txHash: replacementHash,
+      nonce,
+      cancelled: cancel,
+      blockNumber: receipt.blockNumber,
+      gasUsed: receipt.gasUsed.toString(),
+      explorerUrl: `${rpcInfo.explorer}/tx/${replacementHash}`,
+      error: receipt.status === 1 ? undefined : `Replacement tx ${replacementHash} reverted on-chain.`,
+    });
+  } catch (err: any) {
+    return res.status(err?.timedOut ? 504 : 500).json({
+      success: false,
+      timedOut: Boolean(err?.timedOut),
+      txHash: err?.txHash,
+      explorerUrl: err?.explorerUrl,
+      error: err.message || 'Transaction speed-up failed',
+    });
   }
 });
 
@@ -5185,6 +5990,13 @@ flashArbRouter.get('/wallet-balances', async (req: Request, res: Response) => {
     const extraTokens = normalizeExtraTokenSpecs(
       typeof req.query.extraTokens === 'string' ? req.query.extraTokens.split(',') : []
     );
+    const forceRefresh = req.query.refresh === '1' || req.query.refresh === 'true';
+    const extraKey = extraTokens.map((e) => `${e.address.toLowerCase()}:${e.tokenId ?? ''}`).join(',');
+    const cacheKey = `${chain}:${address.toLowerCase()}:${extraKey}`;
+    const cached = walletBalancesResponseCache.get(cacheKey);
+    if (!forceRefresh && cached && Date.now() - cached.fetchedAt < SHORT_BALANCE_CACHE_TTL_MS) {
+      return res.json(cached.payload);
+    }
 
     const balInfo = await queryAllChainBalances(chain, address, extraTokens);
     const ethBalance = Number(balInfo.ethFormatted);
@@ -5199,7 +6011,7 @@ flashArbRouter.get('/wallet-balances', async (req: Request, res: Response) => {
     const tokenUsdTotal = balInfo.tokens.reduce((sum, t) => sum + (t.hasBalance && t.usdValue ? t.usdValue : 0), 0);
     const totalUsd = (balInfo.ethUsd ?? 0) + tokenUsdTotal;
 
-    return res.json({
+    const payload = {
       success: true,
       address,
       chain: rpcInfo.name,
@@ -5244,7 +6056,9 @@ flashArbRouter.get('/wallet-balances', async (req: Request, res: Response) => {
       totalUsd: Number(totalUsd.toFixed(2)),
       explorerUrl: `${rpcInfo.explorer}/address/${address}`,
       timestamp: Date.now(),
-    });
+    };
+    walletBalancesResponseCache.set(cacheKey, { payload, fetchedAt: Date.now() });
+    return res.json(payload);
   } catch (err: any) {
     return res.status(500).json({ success: false, error: err.message });
   }
@@ -5294,6 +6108,13 @@ flashArbRouter.get('/contract-balances', async (req: Request, res: Response) => 
     const extraTokens = normalizeExtraTokenSpecs(
       typeof req.query.extraTokens === 'string' ? req.query.extraTokens.split(',') : []
     );
+    const forceRefresh = req.query.refresh === '1' || req.query.refresh === 'true';
+    const extraKey = extraTokens.map((e) => `${e.address.toLowerCase()}:${e.tokenId ?? ''}`).join(',');
+    const cacheKey = `${chain}:${contractAddr.toLowerCase()}:${extraKey}`;
+    const cachedContract = contractBalancesResponseCache.get(cacheKey);
+    if (!forceRefresh && cachedContract && Date.now() - cachedContract.fetchedAt < SHORT_BALANCE_CACHE_TTL_MS) {
+      return res.json(cachedContract.payload);
+    }
 
     const [balInfo, codeResp, ownerResp] = await Promise.all([
       queryAllChainBalances(chain, contractAddr, extraTokens),
@@ -5308,7 +6129,7 @@ flashArbRouter.get('/contract-balances', async (req: Request, res: Response) => 
         ? ethers.getAddress(`0x${ownerResp.result.slice(-40)}`)
         : null;
 
-    return res.json({
+    const payload = {
       success: true,
       chain,
       chainName: rpcInfo.name,
@@ -5338,7 +6159,9 @@ flashArbRouter.get('/contract-balances', async (req: Request, res: Response) => 
       nonZeroCount: (balInfo.ethWei > 0n ? 1 : 0) + balInfo.tokens.filter((t) => t.rawBalance > 0n).length,
       explorerUrl: `${rpcInfo.explorer}/address/${contractAddr}`,
       timestamp: Date.now(),
-    });
+    };
+    contractBalancesResponseCache.set(cacheKey, { payload, fetchedAt: Date.now() });
+    return res.json(payload);
   } catch (err: any) {
     return res.status(500).json({ success: false, error: err.message });
   }
@@ -5368,6 +6191,19 @@ flashArbRouter.get('/holdings-overview', async (req: Request, res: Response) => 
     const extraTokens = normalizeExtraTokenSpecs(
       typeof req.query.extraTokens === 'string' ? req.query.extraTokens.split(',') : []
     );
+    const forceRefresh = req.query.refresh === '1' || req.query.refresh === 'true';
+    const overviewCacheKey = [
+      chain,
+      gasWallet.toLowerCase(),
+      profitWallet.toLowerCase(),
+      connectedWallet.toLowerCase(),
+      contractAddrs.map((c) => c.toLowerCase()).join(','),
+      extraTokens.map((e) => `${e.address.toLowerCase()}:${e.tokenId ?? ''}`).join(','),
+    ].join(':');
+    const cachedOverview = holdingsOverviewResponseCache.get(overviewCacheKey);
+    if (!forceRefresh && cachedOverview && Date.now() - cachedOverview.fetchedAt < SHORT_BALANCE_CACHE_TTL_MS) {
+      return res.json(cachedOverview.payload);
+    }
 
     const signerKey = (process.env.FLASH_ARB_SIGNER_KEY || '').trim();
     const signerAddress = signerKey
@@ -5536,7 +6372,7 @@ flashArbRouter.get('/holdings-overview', async (req: Request, res: Response) => 
       gasWalletInfo?.sweepableEthWei && BigInt(gasWalletInfo.sweepableEthWei) > 0n ? 1 : 0;
     const sweepableConnectedCount = connectedWalletInfo?.compatibleNonZeroCount || 0;
 
-    return res.json({
+    const payload = {
       success: true,
       chain,
       chainName: rpcInfo.name,
@@ -5559,7 +6395,9 @@ flashArbRouter.get('/holdings-overview', async (req: Request, res: Response) => 
           sweepableContractCount + sweepableGasCount + sweepableGasEthCount + sweepableConnectedCount,
       },
       timestamp: Date.now(),
-    });
+    };
+    holdingsOverviewResponseCache.set(overviewCacheKey, { payload, fetchedAt: Date.now() });
+    return res.json(payload);
   } catch (err: any) {
     return res.status(500).json({ success: false, error: err.message });
   }
@@ -5648,30 +6486,15 @@ flashArbRouter.post('/sweep-all', async (req: Request, res: Response) => {
       }
       const estGas = await estimateSweepGas(signerAddress, to, data);
       const gasLimit = (estGas * 130n) / 100n;
-
-      let sentHash = '';
-      let lastErr: any = null;
-      for (const rpcUrl of getRpcPool(chain, true)) {
-        try {
-          const provider = new ethers.JsonRpcProvider(rpcUrl);
-          const wallet = new ethers.Wallet(cleanKey, provider);
-          const bal = await provider.getBalance(wallet.address);
-          if (bal < 50000000000000n) {
-            throw new Error(`Gas wallet ${wallet.address} holds ${ethers.formatEther(bal)} ETH on ${rpcInfo.name}; fund it with ETH for gas.`);
-          }
-          const tx = await wallet.sendTransaction({ to, data, gasLimit });
-          sentHash = tx.hash;
-          break;
-        } catch (e: any) {
-          lastErr = e;
-          const msg = String(e?.message || '');
-          if (!/429|403|timeout|fetch|coalesce|archive|network|ECONN|socket/i.test(msg)) {
-            throw e;
-          }
-        }
-      }
-      if (!sentHash) throw lastErr || new Error('Broadcast failed across all RPC endpoints');
-      const receipt = await waitForReceiptWithFailover(chain, sentHash, 45000);
+      const { txHash: sentHash, receipt } = await broadcastSignedTxAndWait({
+        chain,
+        cleanKey,
+        to,
+        data,
+        gasLimit,
+        allowAutoSpeedUp: true,
+        minBalanceWei: 50000000000000n,
+      });
       if (receipt.status !== 1) {
         throw new Error(`Sweep tx ${sentHash} reverted on-chain`);
       }
@@ -6166,6 +6989,7 @@ flashArbRouter.post('/sweep-all', async (req: Request, res: Response) => {
         ? `No compatible holdings swept (${skippedIncompatible.length} incompatible/blocked asset(s) safely skipped).`
         : `All inspected contract & wallet compatible token holdings are already $0.00.`;
 
+    invalidateBalanceResponseCaches(chain);
     return res.json({
       success: true,
       chain,

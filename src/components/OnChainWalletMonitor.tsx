@@ -42,6 +42,13 @@ import { PrivacyAssetProcessor } from './PrivacyAssetProcessor';
 
 const PRESET_WALLETS = [
   {
+    name: 'Primary Profit Vault (..f5b)',
+    address: '0xD5503C876a5DFeE057727cfacb6a59E8C7554f5b',
+    network: 'arbitrum' as const,
+    label: 'Primary FlashArb Profit Vault (..f5b)',
+    icon: '🏦',
+  },
+  {
     name: 'MetaMask Vault (..cb9)',
     address: '0x65602EB9e09B07002872E074004400d37e27CCB9',
     network: 'arbitrum' as const,

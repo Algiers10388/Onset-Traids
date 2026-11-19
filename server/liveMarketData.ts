@@ -425,14 +425,20 @@ export function getAssetDefinition(symbol: string): AssetDef {
   };
 }
 
-// In-memory ticker cache with fast TTL for low latency
+// In-memory ticker cache with short TTL to deduplicate bursts while staying live
 let cachedTickers: LiveTicker[] = [];
 let lastTickerFetchTime = 0;
-const TICKER_CACHE_TTL_MS = 1500; // 1.5 seconds
+let inFlightTickersPromise: Promise<{ tickers: LiveTicker[]; source: string; timestamp: number }> | null = null;
+const TICKER_CACHE_TTL_MS = 3500; // 3.5 seconds
 
 // In-memory candle cache per symbol
 const candleCache = new Map<string, { candles: LiveCandle[]; lastFetched: number }>();
-const CANDLE_CACHE_TTL_MS = 5000; // 5 seconds
+const CANDLE_CACHE_TTL_MS = 12000; // 12 seconds
+
+// Short cache + in-flight dedup for multi-exchange order book quotes
+const quoteCache = new Map<string, { quotes: ExchangeQuoteResult[]; lastFetched: number }>();
+const quoteInFlight = new Map<string, Promise<ExchangeQuoteResult[]>>();
+const QUOTE_CACHE_TTL_MS = 3000; // 3 seconds
 
 // Helper to fetch with timeout
 async function fetchWithTimeout(url: string, options: RequestInit = {}, timeoutMs = 3500): Promise<Response> {
@@ -469,7 +475,18 @@ export async function fetchLiveTickers(): Promise<{ tickers: LiveTicker[]; sourc
   if (cachedTickers.length > 0 && now - lastTickerFetchTime < TICKER_CACHE_TTL_MS) {
     return { tickers: cachedTickers, source: 'live-cache', timestamp: lastTickerFetchTime };
   }
+  if (inFlightTickersPromise) {
+    return inFlightTickersPromise;
+  }
 
+  inFlightTickersPromise = fetchLiveTickersUncached().finally(() => {
+    inFlightTickersPromise = null;
+  });
+  return inFlightTickersPromise;
+}
+
+async function fetchLiveTickersUncached(): Promise<{ tickers: LiveTicker[]; source: string; timestamp: number }> {
+  const now = Date.now();
   const newTickers: LiveTicker[] = [];
 
   let binanceData: any[] | null = null;
@@ -714,6 +731,27 @@ async function getJson(url: string, headers: Record<string, string> = {}): Promi
  * Throws if no venue returned a real quote.
  */
 export async function fetchLiveExchangeQuotes(symbol: string): Promise<ExchangeQuoteResult[]> {
+  const key = String(symbol || '').toUpperCase();
+  const now = Date.now();
+  const cached = quoteCache.get(key);
+  if (cached && now - cached.lastFetched < QUOTE_CACHE_TTL_MS) {
+    return cached.quotes;
+  }
+  const existing = quoteInFlight.get(key);
+  if (existing) {
+    return existing;
+  }
+  const task = fetchLiveExchangeQuotesUncached(symbol).then((quotes) => {
+    quoteCache.set(key, { quotes, lastFetched: Date.now() });
+    return quotes;
+  }).finally(() => {
+    quoteInFlight.delete(key);
+  });
+  quoteInFlight.set(key, task);
+  return task;
+}
+
+async function fetchLiveExchangeQuotesUncached(symbol: string): Promise<ExchangeQuoteResult[]> {
   const def = getAssetDefinition(symbol);
   const now = Date.now();
   const UA = { 'User-Agent': 'Mozilla/5.0' };

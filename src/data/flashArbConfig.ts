@@ -3953,7 +3953,7 @@ excluded_tokens = [
 
 # NOTE: [beneficiary]/[signer] below are informational only. The searcher reads FLASH_ARB_PROFIT_WALLET and FLASH_ARB_SIGNER_KEY from the environment.
 [beneficiary]
-profit_recipient_address = "0x65602EB9e09B07002872E074004400d37e27CCB9"  # MetaMask (informational: the searcher reads FLASH_ARB_PROFIT_WALLET, see run-live.sh)
+profit_recipient_address = "0xD5503C876a5DFeE057727cfacb6a59E8C7554f5b"  # Primary Profit Vault (informational: the searcher reads FLASH_ARB_PROFIT_WALLET, see run-live.sh)
 label = "Main Arb Profit Vault"
 auto_sweep = true
 
@@ -4016,7 +4016,7 @@ excluded_tokens = []
 
 # NOTE: [beneficiary]/[signer] below are informational only. The searcher reads FLASH_ARB_PROFIT_WALLET and FLASH_ARB_SIGNER_KEY from the environment.
 [beneficiary]
-profit_recipient_address = "0x65602EB9e09B07002872E074004400d37e27CCB9"  # MetaMask (informational: the searcher reads FLASH_ARB_PROFIT_WALLET, see run-live.sh)
+profit_recipient_address = "0xD5503C876a5DFeE057727cfacb6a59E8C7554f5b"  # Primary Profit Vault (informational: the searcher reads FLASH_ARB_PROFIT_WALLET, see run-live.sh)
 label = "Main Arb Profit Vault"
 auto_sweep = true
 
@@ -4081,7 +4081,7 @@ excluded_tokens = [
 
 # NOTE: [beneficiary]/[signer] below are informational only. The searcher reads FLASH_ARB_PROFIT_WALLET and FLASH_ARB_SIGNER_KEY from the environment.
 [beneficiary]
-profit_recipient_address = "0x65602EB9e09B07002872E074004400d37e27CCB9"  # MetaMask (informational: the searcher reads FLASH_ARB_PROFIT_WALLET, see run-live.sh)
+profit_recipient_address = "0xD5503C876a5DFeE057727cfacb6a59E8C7554f5b"  # Primary Profit Vault (informational: the searcher reads FLASH_ARB_PROFIT_WALLET, see run-live.sh)
 label = "Main Arb Profit Vault"
 auto_sweep = true
 

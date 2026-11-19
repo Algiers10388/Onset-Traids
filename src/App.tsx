@@ -205,10 +205,13 @@ function AppInner({ initialAssets, initialCandles }: { initialAssets: CryptoAsse
     }
   };
 
-  // Poll real-time sentiment intelligence on mount and every 25s
+  // Poll real-time sentiment intelligence on mount and every 120s when tab is visible
   useEffect(() => {
     loadSentiment();
-    const interval = setInterval(loadSentiment, 25000);
+    const interval = setInterval(() => {
+      if (typeof document !== 'undefined' && document.hidden) return;
+      loadSentiment();
+    }, 120000);
     return () => clearInterval(interval);
   }, []);
 
@@ -392,6 +395,7 @@ function AppInner({ initialAssets, initialCandles }: { initialAssets: CryptoAsse
   useEffect(() => {
     let isMounted = true;
     const fetchOnChainCount = async () => {
+      if (typeof document !== 'undefined' && document.hidden) return;
       try {
         const res = await fetch('/api/etherscan/live-feed');
         if (res.ok && isMounted) {
@@ -403,7 +407,7 @@ function AppInner({ initialAssets, initialCandles }: { initialAssets: CryptoAsse
       } catch {}
     };
     fetchOnChainCount();
-    const interval = setInterval(fetchOnChainCount, 6000);
+    const interval = setInterval(fetchOnChainCount, 20000);
     return () => {
       isMounted = false;
       clearInterval(interval);
@@ -484,7 +488,10 @@ function AppInner({ initialAssets, initialCandles }: { initialAssets: CryptoAsse
     };
 
     pollLiveTickers();
-    const tickerInterval = setInterval(pollLiveTickers, 1200);
+    const tickerInterval = setInterval(() => {
+      if (typeof document !== 'undefined' && document.hidden) return;
+      pollLiveTickers();
+    }, 4000);
 
     return () => {
       isMounted = false;
@@ -515,7 +522,10 @@ function AppInner({ initialAssets, initialCandles }: { initialAssets: CryptoAsse
     };
 
     pollLiveCandles();
-    const candleInterval = setInterval(pollLiveCandles, 5000);
+    const candleInterval = setInterval(() => {
+      if (typeof document !== 'undefined' && document.hidden) return;
+      pollLiveCandles();
+    }, 15000);
 
     return () => {
       isMounted = false;
@@ -561,7 +571,10 @@ function AppInner({ initialAssets, initialCandles }: { initialAssets: CryptoAsse
     };
 
     pollLiveQuotes();
-    const quotesInterval = setInterval(pollLiveQuotes, 1500);
+    const quotesInterval = setInterval(() => {
+      if (typeof document !== 'undefined' && document.hidden) return;
+      pollLiveQuotes();
+    }, 5000);
 
     return () => {
       isMounted = false;

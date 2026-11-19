@@ -159,6 +159,7 @@ interface SimulatedOpp {
   gasSavingsPercent?: number;
   priceImpactBps?: number;
   dexFeeBps?: number;
+  contractExecutable?: boolean;
 }
 
 export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
@@ -222,9 +223,19 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
     blockLatency: string;
   } | null>(null);
   const [liveExecutionError, setLiveExecutionError] = useState<string | null>(null);
+  const [camelotSetupPrompt, setCamelotSetupPrompt] = useState<{
+    recommendUpgrade: boolean;
+    canDeployAdapter: boolean;
+    ownerMismatch: boolean;
+    activeContract?: string | null;
+    activeContractOwner?: string | null;
+    signerAddress?: string | null;
+  } | null>(null);
 
   // Treasury & Execution Architecture Configuration
-  const defaultProfitWallet = '0x65602EB9e09B07002872E074004400d37e27CCB9';
+  const defaultProfitWallet = '0xD5503C876a5DFeE057727cfacb6a59E8C7554f5b';
+  const defaultProfitWalletLabel = 'Primary Profit Vault (..f5b)';
+  const legacyDefaultProfitWallet = '0x65602eb9e09b07002872e074004400d37e27ccb9';
   const defaultGasWallet = '0xF1d765d693f9e6fAb0c4a2FCa942d9D54233C966';
 
   const ZERO_EVM_ADDRESS = '0x0000000000000000000000000000000000000000';
@@ -260,17 +271,33 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
     return `${trimmed.slice(0, 6)}...${trimmed.slice(-4)}`;
   };
 
-  // Profit Recipient / Treasury Vault State (Default: MetaMask 0x65602EB9e09B07002872E074004400d37e27CCB9)
+  // Profit Recipient / Treasury Vault State (Default: 0xD5503C876a5DFeE057727cfacb6a59E8C7554f5b)
   const [profitWalletAddress, setProfitWalletAddress] = useState<string>(() => {
     const saved = localStorage.getItem('flash_arb_profit_wallet');
-    if (saved && isValidEvmAddress(saved)) return saved;
+    if (saved && isValidEvmAddress(saved)) {
+      if (saved.trim().toLowerCase() !== legacyDefaultProfitWallet) {
+        return saved.trim();
+      }
+      try {
+        localStorage.setItem('flash_arb_profit_wallet', defaultProfitWallet);
+      } catch {}
+    }
     return defaultProfitWallet;
   });
 
   const [profitWalletLabel, setProfitWalletLabel] = useState<string>(() => {
     const savedLabel = localStorage.getItem('flash_arb_profit_wallet_label');
-    if (savedLabel && !savedLabel.includes('Cake Wallet Vault (..5d)')) return savedLabel;
-    return 'MetaMask Profit Vault (..cb9)';
+    if (
+      savedLabel &&
+      !savedLabel.includes('Cake Wallet Vault (..5d)') &&
+      !savedLabel.includes('MetaMask Profit Vault (..cb9)')
+    ) {
+      return savedLabel;
+    }
+    try {
+      localStorage.setItem('flash_arb_profit_wallet_label', defaultProfitWalletLabel);
+    } catch {}
+    return defaultProfitWalletLabel;
   });
 
   const [profitWalletInput, setProfitWalletInput] = useState<string>(profitWalletAddress);
@@ -362,6 +389,10 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
   const [customContractError, setCustomContractError] = useState<string | null>(null);
   const [isVerifyingCustomContract, setIsVerifyingCustomContract] = useState<boolean>(false);
   const [arbitrumCapabilities, setArbitrumCapabilities] = useState<{
+    contractAddr?: string;
+    contractOwner?: string | null;
+    signerAddress?: string | null;
+    ownerMatchesSigner?: boolean;
     supportsAlgebra: boolean;
     supportsCamelotV2: boolean;
     camelotV3Adapter: string | null;
@@ -390,6 +421,7 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
   const [lastConfirmedTxHash, setLastConfirmedTxHash] = useState<string | null>(null);
   const [lastConfirmedBlock, setLastConfirmedBlock] = useState<number | null>(null);
   const [agentState, setAgentState] = useState<'IDLE' | 'SCANNING' | 'OPPORTUNITY_FOUND' | 'EXECUTING' | 'TRADE_CONFIRMED' | 'AWAITING_GAS_SIGNER'>('SCANNING');
+  const [agentLastExecutionNotice, setAgentLastExecutionNotice] = useState<string | null>(null);
   const [isInitializingSigner, setIsInitializingSigner] = useState<boolean>(false);
 
   // Dynamic Parameter Optimizer & Strict Profit Guard State
@@ -786,6 +818,11 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
             if (Array.isArray(data.opportunities)) setAgentOpportunities(data.opportunities);
           }
           if (data.agentState) setAgentState(data.agentState);
+          setAgentLastExecutionNotice(
+            typeof data.lastExecutionNotice === 'string' && data.lastExecutionNotice.trim()
+              ? data.lastExecutionNotice
+              : null
+          );
           if (typeof data.isSignerConfigured === 'boolean') setIsSignerKeyConfigured(data.isSignerConfigured);
           if (data.lastConfirmedTxHash) setLastConfirmedTxHash(data.lastConfirmedTxHash);
           if (data.lastConfirmedBlock) setLastConfirmedBlock(data.lastConfirmedBlock);
@@ -865,10 +902,13 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
       });
       const data = await res.json();
       if (data.success && data.config) {
+        if (typeof data.isRunning === 'boolean') setIsAgentRunning(data.isRunning);
+        if (data.agentState) setAgentState(data.agentState);
         if (typeof data.config.minProfitThresholdUsd === 'number') setMinProfitThresholdUsd(data.config.minProfitThresholdUsd);
         if (data.config.gasOptimizationMode) setGasOptimizationMode(data.config.gasOptimizationMode);
         if (typeof data.config.autoOptimizeSize === 'boolean') setAutoOptimizeSize(data.config.autoOptimizeSize);
         if (typeof data.config.isAutonomousExecutionEnabled === 'boolean') setIsAutonomousExecutionEnabled(data.config.isAutonomousExecutionEnabled);
+        void fetchAgentStatus();
       }
     } catch (e) {
       console.warn('Failed updating agent config:', e);
@@ -1249,13 +1289,43 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
       const data = await res.json();
       if (data.success) {
         setIsAgentRunning(Boolean(data.isRunning));
+        if (typeof data.isAutonomousExecutionEnabled === 'boolean') {
+          setIsAutonomousExecutionEnabled(data.isAutonomousExecutionEnabled);
+        }
+        if (data.agentState) {
+          setAgentState(data.agentState);
+        }
+        void fetchAgentStatus();
       }
+    } catch {}
+  };
+
+  const handleToggleContinuousAutomation = async () => {
+    const nextEnabled = !isAutonomousExecutionEnabled;
+    await handleUpdateAgentConfig({ isAutonomousExecutionEnabled: nextEnabled });
+    if (nextEnabled) {
+      setOptimizerFeedback(
+        isSignerKeyConfigured
+          ? 'Continuous Autonomous Auto-Trading is now RUNNING 24/7 across deployed chains whenever net profit clears Strict Profit Guard.'
+          : 'Continuous Autonomous Auto-Trading ARMED — initialize or configure your Server Signer Key to begin live on-chain broadcasts.'
+      );
+    } else {
+      setOptimizerFeedback('Continuous Autonomous Auto-Trading paused (pool monitoring & 1-click manual execution remain available).');
+    }
+  };
+
+  const handleToggleAutoSweep = () => {
+    const next = !autoSweepEndOfCycle;
+    setAutoSweepEndOfCycle(next);
+    try {
+      localStorage.setItem('flash_arb_auto_sweep_cycle', String(next));
     } catch {}
   };
 
   const handleTriggerAgentTrade = async (forceOverride?: boolean | React.MouseEvent, opportunityId?: string) => {
     setIsTriggeringAgentTrade(true);
     setLiveExecutionError(null);
+    setCamelotSetupPrompt(null);
     setLiveExecutionSuccess(null);
     const isForce = typeof forceOverride === 'boolean' ? forceOverride : forceTestExecution;
     try {
@@ -1270,6 +1340,16 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
       });
       const data = await res.json();
       if (!res.ok || !data.success) {
+        if (data.requiresContractUpgradeOrAdapter || data.camelotSetupRequired || /CamelotV3SwapAdapter|upgrading FlashArbOptimized/i.test(String(data.error || ''))) {
+          setCamelotSetupPrompt({
+            recommendUpgrade: Boolean(data.recommendUpgradeFlashArb ?? data.ownerMismatch),
+            canDeployAdapter: data.canDeployAdapter !== false && !data.ownerMismatch,
+            ownerMismatch: Boolean(data.ownerMismatch),
+            activeContract: data.activeContract || null,
+            activeContractOwner: data.activeContractOwner || null,
+            signerAddress: data.signerAddress || null,
+          });
+        }
         if (data.blockedByProfitGuard) {
           setLiveExecutionError(`🛡️ ${data.error}`);
           return;
@@ -1283,7 +1363,8 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
           setLiveExecutionError('Configure your Server Signer Key to broadcast on-chain arbitrage transactions.');
           return;
         }
-        throw new Error(data.error || 'Agent execution failed');
+        const suffix = data.txHash ? ` (Tx: ${data.txHash}${data.explorerUrl ? ` — ${data.explorerUrl}` : ''})` : '';
+        throw new Error(`${data.error || 'Agent execution failed'}${suffix}`);
       }
       if (data.txHash || data.trade?.txHash) {
         const txHash = data.txHash || data.trade.txHash;
@@ -1427,8 +1508,12 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
     }
   };
 
-  const handleDeployContractAgent = async () => {
-    const cfg = CHAIN_CONFIG_MAP[selectedChain];
+  const handleDeployContractAgent = async (chainOverride?: ChainKey) => {
+    const targetChainKey = chainOverride || selectedChain;
+    const cfg = CHAIN_CONFIG_MAP[targetChainKey];
+    if (chainOverride && chainOverride !== selectedChain) {
+      setSelectedChain(chainOverride);
+    }
     setIsDeployingAgent(true);
     setDeployAgentError(null);
     setDeployAgentSuccess(null);
@@ -1439,16 +1524,19 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
       const res = await fetch('/api/flash-arb/deploy-contract', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chain: selectedChain }),
+        body: JSON.stringify({ chain: targetChainKey }),
       });
       const data = await res.json();
       if (data.success && data.contractAddress) {
         setDeployAgentStep(`Contract deployed! Registering on-chain address ${formatShortAddress(data.contractAddress)}...`);
-        await registerDeployedContract(selectedChain, data.contractAddress);
+        await registerDeployedContract(targetChainKey, data.contractAddress);
+        await fetchAgentStatus(targetChainKey);
+        setCamelotSetupPrompt(null);
+        setLiveExecutionError(null);
         setDeployAgentSuccess({
           contractAddress: data.contractAddress,
           txHash: data.txHash,
-          chain: selectedChain,
+          chain: targetChainKey,
           chainName: cfg.name,
           explorerUrl: data.explorerUrl,
           txExplorerUrl: data.txExplorerUrl,
@@ -1461,6 +1549,7 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
       }
     } catch (err: any) {
       setDeployAgentError(err.message || 'Contract deployment failed');
+      setLiveExecutionError(err.message || 'Contract deployment failed');
     } finally {
       setIsDeployingAgent(false);
       setDeployAgentStep(null);
@@ -1490,6 +1579,8 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
     setIsDeployingCamelotAdapter(true);
     try {
       await registerCamelotAdapter(clean);
+      setCamelotSetupPrompt(null);
+      setLiveExecutionError(null);
       setCamelotAdapterNotice(clean ? `Camelot V3 Adapter registered: ${clean}` : 'Camelot V3 Adapter cleared.');
     } catch (err: any) {
       setCamelotAdapterError(err?.message || 'Failed saving adapter');
@@ -1512,7 +1603,15 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
       const data = await res.json();
       if (data.success && data.adapterAddress) {
         await registerCamelotAdapter(data.adapterAddress);
-        setCamelotAdapterNotice(`CamelotV3SwapAdapter deployed via Server Signer: ${data.adapterAddress}`);
+        setCamelotSetupPrompt(null);
+        if (data.ownerMismatch && data.activeContractOwner) {
+          setCamelotAdapterNotice(
+            `CamelotV3SwapAdapter deployed (${data.adapterAddress}), however active contract ${formatShortAddress(data.activeContract || '')} is owned by ${formatShortAddress(data.activeContractOwner)} — click Upgrade FlashArbOptimized so your active signer can execute.`
+          );
+        } else {
+          setLiveExecutionError(null);
+          setCamelotAdapterNotice(`CamelotV3SwapAdapter deployed via Server Signer: ${data.adapterAddress}`);
+        }
       } else if (data.requiresWallet) {
         throw new Error('Server Signer Key not configured. Configure it in Signer Key Config to deploy CamelotV3SwapAdapter.');
       } else {
@@ -1520,6 +1619,7 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
       }
     } catch (srvErr: any) {
       setCamelotAdapterError(srvErr?.message || 'Adapter deployment failed');
+      setLiveExecutionError(srvErr?.message || 'Adapter deployment failed');
     } finally {
       setIsDeployingCamelotAdapter(false);
     }
@@ -1681,13 +1781,19 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
       } catch {}
     };
     fetchEth();
-    const interval = setInterval(fetchEth, 20000);
+    const interval = setInterval(() => {
+      if (typeof document !== 'undefined' && document.hidden) return;
+      fetchEth();
+    }, 30000);
     return () => clearInterval(interval);
   }, [availableAssets, liveTokenPrices]);
 
   useEffect(() => {
     fetchLiveTokenPrices();
-    const priceInterval = setInterval(fetchLiveTokenPrices, 15000);
+    const priceInterval = setInterval(() => {
+      if (typeof document !== 'undefined' && document.hidden) return;
+      fetchLiveTokenPrices();
+    }, 30000);
     return () => clearInterval(priceInterval);
   }, []);
 
@@ -1716,19 +1822,21 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
     });
 
     const agentInterval = setInterval(() => {
+      if (typeof document !== 'undefined' && document.hidden) return;
       fetchAgentStatus();
-      fetchProfitWalletBalances();
-    }, 3500);
+    }, 6000);
 
     const contractMonitorInterval = setInterval(() => {
+      if (typeof document !== 'undefined' && document.hidden) return;
       void fetchCrossLayerOpportunities();
+      void fetchProfitWalletBalances();
       if (!isLoadingHoldingsOverviewRef.current) {
         void fetchContractBalances();
         void fetchHoldingsOverview();
       }
-    }, 10000);
+    }, 25000);
 
-    // Sync contracts from server registry (or push upgraded local contract to server)
+    // Sync contracts from server registry (server persists upgraded/newly deployed addresses across restarts)
     fetch('/api/flash-arb/deployed-contracts')
       .then((res) => res.json())
       .then((data) => {
@@ -1736,19 +1844,35 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
           setDeployedContracts((prev) => {
             const next = { ...prev };
             for (const item of CHAIN_CONFIG_CATALOG) {
-              const saved = localStorage.getItem(`flash_arb_contract_${item.key}`);
+              const saved = (localStorage.getItem(`flash_arb_contract_${item.key}`) || '').trim();
+              const serverAddr = String(data.contracts[item.key] || '').trim();
               if (item.key === 'arbitrum') {
-                next.arbitrum =
-                  saved && saved.toLowerCase() !== '0x19359c6c418669fcfc46196970814353b8766be0'
-                    ? saved
-                    : data.contracts.arbitrum || prev.arbitrum;
+                const legacyArbSet = new Set([
+                  '0xeee31ff9e69904b43c124095b6f33aa61505bcc2',
+                  '0x19359c6c418669fcfc46196970814353b8766be0',
+                ]);
+                if (serverAddr && !legacyArbSet.has(serverAddr.toLowerCase())) {
+                  next.arbitrum = serverAddr;
+                  localStorage.setItem('flash_arb_contract_arbitrum', serverAddr);
+                } else if (saved && !legacyArbSet.has(saved.toLowerCase())) {
+                  next.arbitrum = saved;
+                  fetch('/api/flash-arb/deployed-contracts', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ chain: 'arbitrum', address: saved }),
+                  }).catch(() => {});
+                } else {
+                  next.arbitrum = serverAddr || saved || prev.arbitrum;
+                }
               } else if (item.key === 'base') {
                 next.base =
-                  saved && saved.toLowerCase() !== '0x29b35c83955146ba8fd754b4b96956d245a5661e'
+                  serverAddr && serverAddr.toLowerCase() !== '0x29b35c83955146ba8fd754b4b96956d245a5661e'
+                    ? serverAddr
+                    : saved && saved.toLowerCase() !== '0x29b35c83955146ba8fd754b4b96956d245a5661e'
                     ? saved
-                    : data.contracts.base || prev.base;
+                    : prev.base;
               } else {
-                next[item.key] = saved || data.contracts[item.key] || prev[item.key];
+                next[item.key] = serverAddr || saved || prev[item.key];
               }
             }
             return next;
@@ -1757,15 +1881,26 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
       })
       .catch(() => {});
 
-    // Push locally saved Camelot V3 adapter to server if present
+    // Push locally saved Camelot V3 adapter to server if present and server lacks one
     try {
       const savedAdapter = localStorage.getItem('flash_arb_camelot_adapter_arbitrum');
       if (savedAdapter && isValidEvmAddress(savedAdapter)) {
-        fetch('/api/flash-arb/camelot-adapter', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ chain: 'arbitrum', address: savedAdapter }),
-        }).catch(() => {});
+        fetch('/api/flash-arb/camelot-adapter')
+          .then((r) => r.json())
+          .then((d) => {
+            if (d?.success && !d?.adapters?.arbitrum) {
+              return fetch('/api/flash-arb/camelot-adapter', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ chain: 'arbitrum', address: savedAdapter }),
+              });
+            }
+            if (d?.success && d?.adapters?.arbitrum) {
+              setCamelotAdapterInput(d.adapters.arbitrum);
+              localStorage.setItem('flash_arb_camelot_adapter_arbitrum', d.adapters.arbitrum);
+            }
+          })
+          .catch(() => {});
       }
     } catch {}
 
@@ -1784,14 +1919,6 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
     fetchProfitWalletBalances();
     fetchContractBalances();
     fetchHoldingsOverview();
-    const targetAddr = deployedContracts[selectedChain];
-    if (targetAddr && isValidEvmAddress(targetAddr)) {
-      fetch('/api/flash-arb/deployed-contracts', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chain: selectedChain, address: targetAddr }),
-      }).catch(() => {});
-    }
   }, [selectedChain, deployedContracts]);
 
   // Evaluate automatic USDT threshold sweep whenever contract holdings, threshold, or signer config updates
@@ -1848,15 +1975,22 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
       loadFlashArbSettings(firebaseUser.uid).then((settings) => {
         if (!isMounted || !settings) return;
         if (settings.profitRecipientAddress && isValidEvmAddress(settings.profitRecipientAddress)) {
-          setProfitWalletAddress(settings.profitRecipientAddress);
-          setProfitWalletInput(settings.profitRecipientAddress);
-          if (settings.label) {
-            setProfitWalletLabel(settings.label);
-            setLabelInput(settings.label);
-          }
-          localStorage.setItem('flash_arb_profit_wallet', settings.profitRecipientAddress);
-          if (settings.label) {
-            localStorage.setItem('flash_arb_profit_wallet_label', settings.label);
+          const isLegacyDefault = settings.profitRecipientAddress.trim().toLowerCase() === legacyDefaultProfitWallet;
+          const resolvedProfitAddress = isLegacyDefault ? defaultProfitWallet : settings.profitRecipientAddress.trim();
+          const resolvedProfitLabel = isLegacyDefault
+            ? defaultProfitWalletLabel
+            : settings.label || defaultProfitWalletLabel;
+          setProfitWalletAddress(resolvedProfitAddress);
+          setProfitWalletInput(resolvedProfitAddress);
+          setProfitWalletLabel(resolvedProfitLabel);
+          setLabelInput(resolvedProfitLabel);
+          localStorage.setItem('flash_arb_profit_wallet', resolvedProfitAddress);
+          localStorage.setItem('flash_arb_profit_wallet_label', resolvedProfitLabel);
+          if (isLegacyDefault) {
+            void persistFlashArbSettings(firebaseUser.uid, {
+              profitRecipientAddress: resolvedProfitAddress,
+              label: resolvedProfitLabel,
+            }).catch(() => {});
           }
         }
         if (settings.gasWalletAddress && isValidEvmAddress(settings.gasWalletAddress)) {
@@ -1930,10 +2064,10 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
     setWalletValidationError(null);
     setIsSavingWallet(true);
 
-    const isMetaMaskDefault = trimmed.toLowerCase() === defaultProfitWallet.toLowerCase();
+    const isDefaultVault = trimmed.toLowerCase() === defaultProfitWallet.toLowerCase();
     const finalLabel = customLabel?.trim() || (
-      isMetaMaskDefault
-        ? 'MetaMask Profit Vault (..cb9)'
+      isDefaultVault
+        ? defaultProfitWalletLabel
         : 'Arbitrage Recipient Wallet'
     );
 
@@ -2151,6 +2285,7 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
 
     setIsExecutingLiveTrade(true);
     setLiveExecutionError(null);
+    setCamelotSetupPrompt(null);
     setLiveExecutionSuccess(null);
 
     try {
@@ -2172,7 +2307,20 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
         if (srvData.requiresWallet) {
           setIsSignerModalOpen(true);
         }
-        setLiveExecutionError(srvData.error || 'Pre-flight eth_call halted broadcast (0 gas spent): no profitable arbitrage on-chain.');
+        if (srvData.requiresContractUpgradeOrAdapter || srvData.camelotSetupRequired || /CamelotV3SwapAdapter|upgrading FlashArbOptimized/i.test(String(srvData.error || ''))) {
+          setCamelotSetupPrompt({
+            recommendUpgrade: Boolean(srvData.recommendUpgradeFlashArb ?? srvData.ownerMismatch),
+            canDeployAdapter: srvData.canDeployAdapter !== false && !srvData.ownerMismatch,
+            ownerMismatch: Boolean(srvData.ownerMismatch),
+            activeContract: srvData.activeContract || null,
+            activeContractOwner: srvData.activeContractOwner || null,
+            signerAddress: srvData.signerAddress || null,
+          });
+        }
+        const suffix = srvData.txHash ? ` (Tx: ${srvData.txHash}${srvData.explorerUrl ? ` — ${srvData.explorerUrl}` : ''})` : '';
+        setLiveExecutionError(
+          `${srvData.error || 'Pre-flight eth_call halted broadcast (0 gas spent): no profitable arbitrage on-chain.'}${suffix}`
+        );
         setIsExecutingLiveTrade(false);
         return;
       }
@@ -2729,7 +2877,29 @@ RPC_BASE_WS=wss://base-mainnet.public.blastapi.io
                     : 'bg-amber-500/20 text-amber-300 border-amber-500/40'
                 }`}>
                   <span className={`h-2 w-2 rounded-full ${isAgentRunning ? 'bg-emerald-400 animate-ping' : 'bg-amber-400'}`} />
-                  {isAgentRunning ? 'AGENT ACTIVE & MONITORING' : 'AGENT PAUSED'}
+                  {isAgentRunning ? 'SCANNER ACTIVE' : 'SCANNER PAUSED'}
+                </span>
+                <span className={`px-2.5 py-0.5 rounded-full text-[10px] font-mono font-bold flex items-center gap-1.5 border ${
+                  isAutonomousExecutionEnabled
+                    ? isAgentRunning && isSignerKeyConfigured
+                      ? 'bg-cyan-500/20 text-cyan-200 border-cyan-400/50 shadow-sm'
+                      : 'bg-amber-500/20 text-amber-200 border-amber-400/50'
+                    : 'bg-slate-800/80 text-slate-300 border-slate-700'
+                }`}>
+                  <span className={`h-2 w-2 rounded-full ${
+                    isAutonomousExecutionEnabled && isAgentRunning && isSignerKeyConfigured
+                      ? 'bg-cyan-400 animate-pulse'
+                      : isAutonomousExecutionEnabled
+                      ? 'bg-amber-400'
+                      : 'bg-slate-500'
+                  }`} />
+                  {isAutonomousExecutionEnabled
+                    ? !isSignerKeyConfigured
+                      ? 'AUTO-TRADE ARMED · NEEDS SIGNER'
+                      : !isAgentRunning
+                      ? 'AUTO-TRADE ARMED · PAUSED'
+                      : 'AUTO-TRADE CONTINUOUSLY RUNNING'
+                    : 'AUTO-TRADE: MANUAL'}
                 </span>
                 <span className="text-[10px] px-2 py-0.5 rounded bg-cyan-500/10 text-cyan-300 border border-cyan-500/30 font-mono font-bold">
                   Zero Simulation • Real On-Chain RPC
@@ -2745,7 +2915,28 @@ RPC_BASE_WS=wss://base-mainnet.public.blastapi.io
             </div>
           </div>
 
-          <div className="flex items-center gap-2.5 flex-wrap">
+          <div className="flex items-center gap-2 flex-wrap">
+            <button
+              type="button"
+              disabled={isUpdatingAgentConfig}
+              onClick={handleToggleContinuousAutomation}
+              className={`px-3.5 py-2 rounded-xl text-xs font-mono font-bold transition-all flex items-center gap-1.5 cursor-pointer shadow-lg border disabled:opacity-50 ${
+                isAutonomousExecutionEnabled
+                  ? 'bg-emerald-500 hover:bg-emerald-400 text-slate-950 border-emerald-300 ring-1 ring-emerald-300/60'
+                  : 'bg-cyan-500/20 hover:bg-cyan-500/30 text-cyan-200 border-cyan-400/50'
+              }`}
+              title="Toggle continuous 24/7 autonomous on-chain arbitrage execution whenever Profit Guard clears"
+            >
+              {isUpdatingAgentConfig ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : isAutonomousExecutionEnabled ? (
+                <Pause className="h-3.5 w-3.5" />
+              ) : (
+                <Play className="h-3.5 w-3.5" />
+              )}
+              <span>{isAutonomousExecutionEnabled ? 'Stop Auto-Trading' : 'Start Auto-Trading'}</span>
+            </button>
+
             <button
               type="button"
               onClick={handleToggleAgent}
@@ -2754,9 +2945,24 @@ RPC_BASE_WS=wss://base-mainnet.public.blastapi.io
                   ? 'bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 border-amber-500/40'
                   : 'bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-200 border-emerald-500/40'
               }`}
+              title="Pause or resume continuous live RPC pool monitoring"
             >
               {isAgentRunning ? <Pause className="h-3.5 w-3.5" /> : <Play className="h-3.5 w-3.5" />}
-              <span>{isAgentRunning ? 'Pause Agent' : 'Resume Agent'}</span>
+              <span>{isAgentRunning ? 'Pause Scanner' : 'Resume Scanner'}</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={handleToggleAutoSweep}
+              className={`px-3 py-2 rounded-xl text-xs font-mono font-bold transition-all flex items-center gap-1.5 cursor-pointer shadow-lg border ${
+                autoSweepEndOfCycle
+                  ? 'bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-200 border-emerald-400/50'
+                  : 'bg-slate-800/80 hover:bg-slate-700 text-slate-300 border-slate-600'
+              }`}
+              title="Automatically sweep token dust & profits to Profit Vault at the end of each confirmed trade cycle"
+            >
+              <RefreshCw className={`h-3.5 w-3.5 ${autoSweepEndOfCycle ? 'text-emerald-300' : 'text-slate-400'}`} />
+              <span>Auto-Sweep: {autoSweepEndOfCycle ? 'ON' : 'OFF'}</span>
             </button>
 
             <button
@@ -2790,12 +2996,83 @@ RPC_BASE_WS=wss://base-mainnet.public.blastapi.io
           </div>
         </div>
 
-        {(liveExecutionError || liveExecutionSuccess || sweepAllNotice) && (
+        {(liveExecutionError || liveExecutionSuccess || sweepAllNotice || (isAutonomousExecutionEnabled && (!isSignerKeyConfigured || agentLastExecutionNotice))) && (
           <div className="space-y-2">
+            {isAutonomousExecutionEnabled && !isSignerKeyConfigured && (
+              <div className="p-2.5 rounded-xl bg-amber-950/60 border border-amber-500/50 text-amber-200 text-xs font-mono flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <Key className="h-4 w-4 text-amber-400 shrink-0" />
+                  <span>
+                    Continuous Auto-Trading is armed, waiting for an authorized Server Signer Key to broadcast transactions autonomously.
+                  </span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    disabled={isInitializingSigner}
+                    onClick={handleInitializeAutonomousSigner}
+                    className="px-2.5 py-1 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-[11px] cursor-pointer disabled:opacity-50 flex items-center gap-1"
+                  >
+                    {isInitializingSigner ? <Loader2 className="h-3 w-3 animate-spin" /> : <Key className="h-3 w-3" />}
+                    <span>1-Click Init Signer</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setIsSignerModalOpen(true)}
+                    className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-600 text-slate-200 font-bold text-[11px] cursor-pointer"
+                  >
+                    Enter Private Key
+                  </button>
+                </div>
+              </div>
+            )}
+            {isAutonomousExecutionEnabled && agentLastExecutionNotice && !liveExecutionError && (
+              <div className="p-2.5 rounded-xl bg-cyan-950/50 border border-cyan-500/40 text-cyan-200 text-xs font-mono flex items-center gap-2">
+                <Bot className="h-4 w-4 text-cyan-400 shrink-0" />
+                <span>Latest Autonomous Cycle: {agentLastExecutionNotice}</span>
+              </div>
+            )}
             {liveExecutionError && (
-              <div className="p-2.5 rounded-xl bg-rose-950/70 border border-rose-500/50 text-rose-200 text-xs font-mono flex items-center gap-2">
-                <AlertTriangle className="h-4 w-4 text-rose-400 shrink-0" />
-                <span>{liveExecutionError}</span>
+              <div className="p-2.5 rounded-xl bg-rose-950/70 border border-rose-500/50 text-rose-200 text-xs font-mono space-y-2">
+                <div className="flex items-center gap-2">
+                  <AlertTriangle className="h-4 w-4 text-rose-400 shrink-0" />
+                  <span>{liveExecutionError}</span>
+                </div>
+                {(camelotSetupPrompt || /CamelotV3SwapAdapter|upgrading FlashArbOptimized/i.test(liveExecutionError)) && (
+                  <div className="flex flex-wrap items-center gap-2 pl-6">
+                    <button
+                      type="button"
+                      disabled={isDeployingAgent || isDeployingCamelotAdapter}
+                      onClick={() => handleDeployContractAgent('arbitrum')}
+                      className="px-3 py-1 rounded-lg bg-cyan-500/20 hover:bg-cyan-500/30 border border-cyan-400/50 text-cyan-200 font-bold text-[11px] cursor-pointer disabled:opacity-50"
+                    >
+                      {isDeployingAgent ? 'Upgrading FlashArbOptimized...' : '⚡ Upgrade FlashArbOptimized (Native Camelot V3 & V2)'}
+                    </button>
+                    {!(camelotSetupPrompt?.ownerMismatch) && arbitrumCapabilities.ownerMatchesSigner !== false && (
+                      <button
+                        type="button"
+                        disabled={isDeployingAgent || isDeployingCamelotAdapter}
+                        onClick={() => handleDeployCamelotAdapter()}
+                        className="px-3 py-1 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 border border-amber-400/50 text-amber-200 font-bold text-[11px] cursor-pointer disabled:opacity-50"
+                      >
+                        {isDeployingCamelotAdapter ? 'Deploying Adapter...' : '🔌 Deploy CamelotV3SwapAdapter'}
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setSelectedChain('arbitrum');
+                        setDeployModalTab('AGENT');
+                        setDeployAgentError(null);
+                        setDeployAgentSuccess(null);
+                        setIsDeployModalOpen(true);
+                      }}
+                      className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-600 text-slate-200 font-bold text-[11px] cursor-pointer"
+                    >
+                      Open Contract Panel
+                    </button>
+                  </div>
+                )}
               </div>
             )}
             {liveExecutionSuccess && (
@@ -3341,7 +3618,7 @@ RPC_BASE_WS=wss://base-mainnet.public.blastapi.io
                   <h4 className="text-xs font-bold text-white font-mono uppercase tracking-wider flex items-center gap-1.5">
                     Profit Vault Destination
                     <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 font-bold">
-                      {profitWalletAddress.toLowerCase() === defaultProfitWallet.toLowerCase() ? 'MetaMask ..cb9' : profitWalletAddress.toLowerCase().endsWith('11') ? 'OKX ..11' : formatShortAddress(profitWalletAddress)}
+                      {profitWalletAddress.toLowerCase() === defaultProfitWallet.toLowerCase() ? 'Vault ..f5b' : profitWalletAddress.toLowerCase().endsWith('11') ? 'OKX ..11' : formatShortAddress(profitWalletAddress)}
                     </span>
                   </h4>
                   <span className="text-[10px] font-mono text-emerald-300/80">
@@ -3817,7 +4094,7 @@ RPC_BASE_WS=wss://base-mainnet.public.blastapi.io
                   </div>
                 </div>
 
-                {/* Quick Presets: MetaMask (..cb9, default) & Custom EVM Address */}
+                {/* Quick Presets: Primary Profit Vault (..f5b, default) & Custom EVM Address */}
                 <div className="pt-2 border-t border-slate-800/80 flex flex-wrap items-center justify-between gap-2 text-xs">
                   <span className="text-slate-400 font-bold text-[11px] flex items-center gap-1">
                     <span>Target Vault Presets:</span>
@@ -3826,16 +4103,16 @@ RPC_BASE_WS=wss://base-mainnet.public.blastapi.io
                     <div className="flex items-center gap-1.5">
                       <button
                         type="button"
-                        onClick={() => handleSaveProfitWallet(defaultProfitWallet, 'MetaMask Profit Vault (..cb9)')}
+                        onClick={() => handleSaveProfitWallet(defaultProfitWallet, defaultProfitWalletLabel)}
                         className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer border ${
                           profitWalletAddress.toLowerCase() === defaultProfitWallet.toLowerCase()
                             ? 'bg-emerald-500 text-slate-950 border-emerald-400 shadow-md ring-1 ring-emerald-300'
                             : 'bg-emerald-950/40 hover:bg-emerald-900/50 text-emerald-300 border-emerald-500/40'
                         }`}
-                        title="Route 100% of realized profits to MetaMask (0x6560...ccb9)"
+                        title={`Route 100% of realized profits to Primary Profit Vault (${defaultProfitWallet})`}
                       >
-                        <span className="text-xs">🦊</span>
-                        <span>MetaMask ({formatShortAddress(defaultProfitWallet)})</span>
+                        <span className="text-xs">🏦</span>
+                        <span>Primary Vault ({formatShortAddress(defaultProfitWallet)})</span>
                         {profitWalletAddress.toLowerCase() === defaultProfitWallet.toLowerCase() ? (
                           <Check className="h-3.5 w-3.5 stroke-[3] text-slate-950" />
                         ) : (
@@ -3882,7 +4159,7 @@ RPC_BASE_WS=wss://base-mainnet.public.blastapi.io
                       setProfitWalletInput(e.target.value);
                       if (walletValidationError) setWalletValidationError(null);
                     }}
-                    placeholder="0x65602EB9e09B07002872E074004400d37e27CCB9"
+                    placeholder="0xD5503C876a5DFeE057727cfacb6a59E8C7554f5b"
                     className="w-full bg-slate-900 border border-slate-700 focus:border-emerald-400 rounded-xl px-3 py-2 text-xs text-white font-mono placeholder:text-slate-600 focus:outline-none"
                   />
                 </div>
@@ -3912,7 +4189,7 @@ RPC_BASE_WS=wss://base-mainnet.public.blastapi.io
                     type="button"
                     onClick={() => {
                       setProfitWalletInput(defaultProfitWallet);
-                      setLabelInput('Main Arb Profit Vault');
+                      setLabelInput(defaultProfitWalletLabel);
                     }}
                     className="text-[11px] text-emerald-400 hover:underline cursor-pointer"
                   >
@@ -4298,7 +4575,13 @@ RPC_BASE_WS=wss://base-mainnet.public.blastapi.io
                         <div className="flex items-center justify-between mb-2">
                           <span className="text-xs font-bold text-cyan-300 flex items-center gap-1.5">
                             <Zap className="h-4 w-4 fill-current text-cyan-400" />
-                            <span>Deploy FlashArbOptimized via Server Agent</span>
+                            <span>
+                              {selectedChain === 'arbitrum' &&
+                              contractDeploymentStatus[selectedChain]?.isDeployed &&
+                              (!arbitrumCapabilities.supportsAlgebra || arbitrumCapabilities.ownerMatchesSigner === false)
+                                ? 'Upgrade FlashArbOptimized via Server Agent (Native Camelot V3 & V2)'
+                                : 'Deploy FlashArbOptimized via Server Agent'}
+                            </span>
                           </span>
                           <span className={`text-[10px] px-1.5 py-0.5 rounded font-bold ${isSignerKeyConfigured ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30' : 'bg-slate-800 text-slate-500'}`}>
                             {isSignerKeyConfigured ? 'Key Ready' : 'Key Needed'}
@@ -4331,9 +4614,20 @@ RPC_BASE_WS=wss://base-mainnet.public.blastapi.io
                             : 'Needs Upgrade or Adapter'}
                         </span>
                       </div>
+                      {arbitrumCapabilities.contractOwner &&
+                        arbitrumCapabilities.signerAddress &&
+                        !arbitrumCapabilities.ownerMatchesSigner && (
+                          <div className="p-2.5 rounded-lg bg-amber-950/50 border border-amber-500/40 text-[11px] text-amber-200 font-sans leading-relaxed">
+                            <strong>Signer / Owner Mismatch Detected:</strong> Active contract{' '}
+                            <code className="text-cyan-300 font-mono">{formatShortAddress(deployedContracts.arbitrum)}</code> is owned by{' '}
+                            <code className="text-amber-300 font-mono">{formatShortAddress(arbitrumCapabilities.contractOwner)}</code>, while active Server Signer is{' '}
+                            <code className="text-emerald-300 font-mono">{formatShortAddress(arbitrumCapabilities.signerAddress)}</code>. Use{' '}
+                            <strong>Option 1 (Upgrade FlashArbOptimized above)</strong> so your active signer owns the contract AND unlocks native Camelot V3 + V2 execution in one transaction.
+                          </div>
+                        )}
                       <p className="text-[11px] text-slate-300 font-sans leading-relaxed">
-                        <strong>Option 1:</strong> Deploying <em>FlashArbOptimized</em> above includes built-in native support for Camelot V3 (Algebra) &amp; Camelot V2.{' '}
-                        <strong>Option 2:</strong> Keep existing <code className="text-cyan-300">{formatShortAddress(deployedContracts.arbitrum)}</code> and deploy only the lightweight stateless <code className="text-amber-200">CamelotV3SwapAdapter</code>.
+                        <strong>Option 1:</strong> Deploying / upgrading <em>FlashArbOptimized</em> above includes built-in native support for Camelot V3 (Algebra) &amp; Camelot V2 and sets your active signer as owner.{' '}
+                        <strong>Option 2:</strong> Keep existing <code className="text-cyan-300">{formatShortAddress(deployedContracts.arbitrum)}</code> (requires matching owner signer) and deploy only the lightweight stateless <code className="text-amber-200">CamelotV3SwapAdapter</code>.
                       </p>
                       <div className="flex flex-wrap items-center gap-2">
                         <button
@@ -4641,6 +4935,46 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
               </div>
 
               <div className="flex items-center gap-2 flex-wrap">
+                <button
+                  type="button"
+                  disabled={isUpdatingAgentConfig}
+                  onClick={handleToggleContinuousAutomation}
+                  className={`px-3 py-1.5 rounded-xl font-bold text-xs transition-all flex items-center gap-1.5 cursor-pointer shadow-md border disabled:opacity-50 ${
+                    isAutonomousExecutionEnabled
+                      ? 'bg-emerald-500 hover:bg-emerald-400 text-slate-950 border-emerald-300'
+                      : 'bg-cyan-500/20 hover:bg-cyan-500/30 text-cyan-200 border-cyan-500/40'
+                  }`}
+                  title="Enable or pause continuous autonomous execution"
+                >
+                  {isAutonomousExecutionEnabled ? <Pause className="h-3.5 w-3.5" /> : <Play className="h-3.5 w-3.5" />}
+                  <span>{isAutonomousExecutionEnabled ? 'Auto-Trade Running' : 'Start Auto-Trade'}</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={handleToggleAgent}
+                  className={`px-3 py-1.5 rounded-xl font-bold text-xs transition-all flex items-center gap-1.5 cursor-pointer border ${
+                    isAgentRunning
+                      ? 'bg-amber-500/15 hover:bg-amber-500/25 text-amber-200 border-amber-500/40'
+                      : 'bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-200 border-emerald-500/40'
+                  }`}
+                  title="Pause or resume continuous background scanning"
+                >
+                  {isAgentRunning ? <Pause className="h-3.5 w-3.5" /> : <Play className="h-3.5 w-3.5" />}
+                  <span>{isAgentRunning ? 'Pause Monitor' : 'Resume Monitor'}</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => handleTriggerAgentTrade()}
+                  disabled={isTriggeringAgentTrade}
+                  className="px-3 py-1.5 rounded-xl bg-cyan-500/20 hover:bg-cyan-500/30 border border-cyan-400/50 text-cyan-200 font-bold text-xs transition-all flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                  title="Trigger an immediate live on-chain trade check"
+                >
+                  {isTriggeringAgentTrade ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Zap className="h-3.5 w-3.5" />}
+                  <span>{isTriggeringAgentTrade ? 'Executing...' : 'Trigger Now'}</span>
+                </button>
+
                 <button
                   type="button"
                   disabled={isUpdatingAgentConfig}
@@ -5559,6 +5893,7 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
                       gasSavingsPercent: opp.gasSavingsPercent,
                       priceImpactBps: opp.priceImpactBps,
                       dexFeeBps: opp.dexFeeBps,
+                      contractExecutable: opp.contractExecutable,
                     }))
                   : opportunities;
 
@@ -5667,7 +6002,26 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
                               </td>
                               <td className="py-3 px-3 whitespace-nowrap">
                                 <div className="flex items-center gap-1.5">
-                                  {opp.isProfitable ? (
+                                  {opp.isProfitable && opp.contractExecutable === false ? (
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        const oppChainKey = CHAIN_CONFIG_CATALOG.find(
+                                          (c) => c.shortName.toLowerCase() === opp.chain.toLowerCase() || c.key === opp.chain.toLowerCase()
+                                        )?.key;
+                                        if (oppChainKey) setSelectedChain(oppChainKey);
+                                        setDeployModalTab('AGENT');
+                                        setDeployAgentError(null);
+                                        setDeployAgentSuccess(null);
+                                        setIsDeployModalOpen(true);
+                                      }}
+                                      className="px-2.5 py-1 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 border border-amber-400/50 text-amber-200 text-[10px] font-bold flex items-center gap-1 cursor-pointer transition-all whitespace-nowrap"
+                                      title="This route requires upgrading FlashArbOptimized or deploying CamelotV3SwapAdapter in the Contract panel"
+                                    >
+                                      <AlertTriangle className="h-3 w-3 text-amber-300" />
+                                      <span>Enable Route</span>
+                                    </button>
+                                  ) : opp.isProfitable ? (
                                     <button
                                       type="button"
                                       disabled={isExecutingLiveTrade}
@@ -6151,8 +6505,25 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
                 {((simDexA.includes('Camelot V3') || simDexB.includes('Camelot V3')) && !arbitrumCapabilities.supportsAlgebra && !arbitrumCapabilities.camelotV3Adapter ||
                   (simDexA.includes('Camelot V2') || simDexB.includes('Camelot V2')) && !arbitrumCapabilities.supportsCamelotV2 ||
                   simDexA.includes('Slipstream') || simDexB.includes('Slipstream') || simDexA.includes('Curve') || simDexB.includes('Curve') || simDexA.includes('Balancer') || simDexB.includes('Balancer') || simDexA.includes('Trader Joe') || simDexB.includes('Trader Joe')) && (
-                  <div className="text-[10px] font-mono text-amber-300/90 bg-amber-950/30 border border-amber-500/20 rounded-lg px-2.5 py-1">
-                    Note: Selected monitor-only venue requires deploying the upgraded FlashArbOptimized or CamelotV3SwapAdapter (Deploy Contract modal) before atomic execution.
+                  <div className="text-[10px] font-mono text-amber-300/90 bg-amber-950/30 border border-amber-500/20 rounded-lg px-2.5 py-1.5 flex flex-wrap items-center justify-between gap-2">
+                    <span>
+                      Note: Selected route requires upgrading FlashArbOptimized or deploying CamelotV3SwapAdapter before atomic execution.
+                    </span>
+                    {(simDexA.includes('Camelot') || simDexB.includes('Camelot')) && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setSelectedChain('arbitrum');
+                          setDeployModalTab('AGENT');
+                          setDeployAgentError(null);
+                          setDeployAgentSuccess(null);
+                          setIsDeployModalOpen(true);
+                        }}
+                        className="px-2 py-0.5 rounded bg-amber-500/20 hover:bg-amber-500/30 border border-amber-400/40 text-amber-200 font-bold cursor-pointer shrink-0"
+                      >
+                        Open Contract Panel
+                      </button>
+                    )}
                   </div>
                 )}
               </div>
@@ -6631,9 +7002,46 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
                   </div>
 
                   {liveExecutionError && (
-                    <div className="p-2.5 rounded-lg bg-rose-950/60 border border-rose-500/50 text-rose-300 text-xs flex items-center gap-2">
-                      <AlertTriangle className="h-4 w-4 shrink-0" />
-                      <span>{liveExecutionError}</span>
+                    <div className="p-2.5 rounded-lg bg-rose-950/60 border border-rose-500/50 text-rose-300 text-xs space-y-2">
+                      <div className="flex items-center gap-2">
+                        <AlertTriangle className="h-4 w-4 shrink-0" />
+                        <span>{liveExecutionError}</span>
+                      </div>
+                      {(camelotSetupPrompt || /CamelotV3SwapAdapter|upgrading FlashArbOptimized/i.test(liveExecutionError)) && (
+                        <div className="flex flex-wrap items-center gap-2 pl-6 font-mono">
+                          <button
+                            type="button"
+                            disabled={isDeployingAgent || isDeployingCamelotAdapter}
+                            onClick={() => handleDeployContractAgent('arbitrum')}
+                            className="px-2.5 py-1 rounded-lg bg-cyan-500/20 hover:bg-cyan-500/30 border border-cyan-400/50 text-cyan-200 font-bold text-[11px] cursor-pointer disabled:opacity-50"
+                          >
+                            {isDeployingAgent ? 'Upgrading...' : '⚡ Upgrade FlashArbOptimized'}
+                          </button>
+                          {!(camelotSetupPrompt?.ownerMismatch) && arbitrumCapabilities.ownerMatchesSigner !== false && (
+                            <button
+                              type="button"
+                              disabled={isDeployingAgent || isDeployingCamelotAdapter}
+                              onClick={() => handleDeployCamelotAdapter()}
+                              className="px-2.5 py-1 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 border border-amber-400/50 text-amber-200 font-bold text-[11px] cursor-pointer disabled:opacity-50"
+                            >
+                              {isDeployingCamelotAdapter ? 'Deploying Adapter...' : '🔌 Deploy CamelotV3SwapAdapter'}
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setSelectedChain('arbitrum');
+                              setDeployModalTab('AGENT');
+                              setDeployAgentError(null);
+                              setDeployAgentSuccess(null);
+                              setIsDeployModalOpen(true);
+                            }}
+                            className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-600 text-slate-200 font-bold text-[11px] cursor-pointer"
+                          >
+                            Open Contract Panel
+                          </button>
+                        </div>
+                      )}
                     </div>
                   )}
 

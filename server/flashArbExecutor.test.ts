@@ -41,6 +41,9 @@ import {
   KNOWN_FLASH_ARB_CONTRACTS,
   normalizeValidContractAddress,
   resolveAndValidateSweepContracts,
+  getReceiptTimeoutMs,
+  getMinPriorityFeeFloorWei,
+  computeOptimalFeeParams,
 } from './flashArbExecutor.ts';
 import {
   DEFAULT_USDT_SWEEP_THRESHOLD,
@@ -1164,6 +1167,49 @@ test('normalizeValidContractAddress and resolveAndValidateSweepContracts validat
   });
   assert.equal(badExplicit.ok, false);
   assert.match(badExplicit.error || '', /Invalid contractAddress/i);
+});
+
+test('getReceiptTimeoutMs and computeOptimalFeeParams prevent stalled L1 txs from tiny RPC priority tips', () => {
+  // Ethereum L1 needs >= 180s (vs 60s on L2 rollups) due to 12s slot times
+  assert.equal(getReceiptTimeoutMs('ethereum', false), 180_000);
+  assert.equal(getReceiptTimeoutMs('ethereum', true), 240_000);
+  assert.equal(getReceiptTimeoutMs('arbitrum', false), 60_000);
+  assert.equal(getReceiptTimeoutMs('polygon', false), 90_000);
+
+  // Reproduce the exact Ethereum L1 condition from tx 0x1a903f... where eth_maxPriorityFeePerGas returned 7146 wei (0.000007 Gwei)
+  const ethFees = computeOptimalFeeParams({
+    chain: 'ethereum',
+    baseFeePerGasWei: 106_614_190n, // ~0.1066 Gwei
+    rpcMaxPriorityFeePerGasWei: 7_146n, // 0.000007 Gwei (caused stalled inclusion)
+    balanceWei: 635_745_656_581_395n, // ~0.0006357 ETH
+    gasLimit: 463_060n,
+  });
+  assert.equal(ethFees.minPriorityFloorWei, 150_000_000n);
+  assert.ok(ethFees.maxPriorityFeePerGas >= 150_000_000n, 'Ethereum L1 tip must meet >= 0.15 Gwei floor');
+  assert.ok(ethFees.maxFeePerGas >= 300_000_000n, 'Ethereum L1 maxFeePerGas includes baseFee headroom + tip');
+  assert.ok(ethFees.maxFeePerGas * 463_060n <= 635_745_656_581_395n, 'Must fit within wallet balance');
+
+  // High urgency multiplier (e.g. RBF speed-up) scales priority & maxFee monotonically
+  const bumpedEthFees = computeOptimalFeeParams({
+    chain: 'ethereum',
+    baseFeePerGasWei: 106_614_190n,
+    rpcMaxPriorityFeePerGasWei: 150_000_000n,
+    urgencyMultiplierPct: 140,
+  });
+  assert.ok(bumpedEthFees.maxPriorityFeePerGas >= 210_000_000n);
+  assert.ok(bumpedEthFees.maxFeePerGas > ethFees.maxFeePerGas);
+
+  // Tight wallet balance caps maxFeePerGas cleanly while staying >= baseFee
+  const tightFees = computeOptimalFeeParams({
+    chain: 'ethereum',
+    baseFeePerGasWei: 100_000_000n,
+    rpcMaxPriorityFeePerGasWei: 7_146n,
+    balanceWei: 100_000_000n * 500_000n + 20_000_000n * 500_000n, // enough for baseFee + 0.02 Gwei
+    gasLimit: 500_000n,
+  });
+  assert.equal(tightFees.maxFeePerGas, 120_000_000n);
+  assert.equal(tightFees.maxPriorityFeePerGas, 20_000_000n);
+  assert.equal(getMinPriorityFeeFloorWei('polygon'), 30_000_000_000n);
 });
 
 

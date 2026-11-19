@@ -94,7 +94,8 @@ const RSS_FEEDS: Array<{ url: string; source: SentimentFeedItem['source']; sourc
   { url: 'https://cointelegraph.com/rss', source: 'COINTELEGRAPH', sourceName: 'Cointelegraph' },
   { url: 'https://decrypt.co/feed', source: 'DECRYPT', sourceName: 'Decrypt' },
 ];
-const CACHE_TTL_MS = 5 * 60 * 1000;
+const CACHE_TTL_MS = 10 * 60 * 1000;
+const FAILURE_COOLDOWN_MS = 90 * 1000;
 const KNOWN_TICKERS = new Set(['BTC', 'ETH', 'SOL', 'XRP', 'ADA', 'DOGE', 'LINK', 'AVAX', 'DOT', 'LTC', 'BNB', 'USDT', 'USDC', 'PEPE', 'SHIB', 'XMR', 'TRX', 'ARB', 'OP', 'UNI', 'AAVE']);
 const TICKER_ALIASES: Array<[RegExp, string]> = [
   [/\bbitcoin\b|\bbtc\b/i, 'BTC'],
@@ -122,6 +123,9 @@ const TICKER_ALIASES: Array<[RegExp, string]> = [
 
 let lastReport: SentimentIntelligenceReport | null = null;
 let lastReportAt = 0;
+let inFlightReportPromise: Promise<SentimentIntelligenceReport> | null = null;
+let lastFailureAt = 0;
+let lastFailureError: Error | null = null;
 
 async function fetchText(url: string): Promise<string> {
   const ctl = new AbortController();
@@ -472,10 +476,43 @@ function computeSentimentReport(feed: SentimentFeedItem[], isAiAnalyzed = false,
 }
 
 async function getReport(force: boolean, asset?: string): Promise<SentimentIntelligenceReport> {
-  if (!force && !asset && lastReport && Date.now() - lastReportAt < CACHE_TTL_MS) return lastReport;
-  const report = await buildReport(asset);
-  if (!asset) { lastReport = report; lastReportAt = Date.now(); }
-  return report;
+  const now = Date.now();
+  if (!force && !asset && lastReport && now - lastReportAt < CACHE_TTL_MS) return lastReport;
+  if (!force && !asset && lastFailureAt > 0 && now - lastFailureAt < FAILURE_COOLDOWN_MS) {
+    if (lastReport && now - lastReportAt < 30 * 60 * 1000) return lastReport;
+    throw lastFailureError || new Error('Sentiment scoring in cooldown after upstream rate limit');
+  }
+  if (!asset && inFlightReportPromise) return inFlightReportPromise;
+
+  const run = async (): Promise<SentimentIntelligenceReport> => {
+    try {
+      const report = await buildReport(asset);
+      if (!asset) {
+        lastReport = report;
+        lastReportAt = Date.now();
+        lastFailureAt = 0;
+        lastFailureError = null;
+      }
+      return report;
+    } catch (err: any) {
+      if (!asset) {
+        lastFailureAt = Date.now();
+        lastFailureError = err instanceof Error ? err : new Error(String(err));
+        if (lastReport && Date.now() - lastReportAt < 30 * 60 * 1000) {
+          return lastReport;
+        }
+      }
+      throw err;
+    }
+  };
+
+  if (!asset) {
+    inFlightReportPromise = run().finally(() => {
+      inFlightReportPromise = null;
+    });
+    return inFlightReportPromise;
+  }
+  return run();
 }
 
 // GET /api/sentiment/live - real headlines + published Fear & Greed, scored by Gemini (cached 5 min)

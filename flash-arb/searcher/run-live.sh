@@ -3,8 +3,8 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 if [ -f ../../.env ]; then set -a; . ../../.env; set +a; fi
-# Default payment wallet: MetaMask. Profits are paid out in the borrowed token (USDC, WETH, ...); a normal wallet accepts any ERC-20.
-export FLASH_ARB_PROFIT_WALLET="${FLASH_ARB_PROFIT_WALLET:-0x65602EB9e09B07002872E074004400d37e27CCB9}"
+# Default payment wallet: Primary Profit Vault. Profits are paid out in the borrowed token (USDC, WETH, ...); a normal wallet accepts any ERC-20.
+export FLASH_ARB_PROFIT_WALLET="${FLASH_ARB_PROFIT_WALLET:-0xD5503C876a5DFeE057727cfacb6a59E8C7554f5b}"
 : "${FLASH_ARB_SIGNER_KEY:?set FLASH_ARB_SIGNER_KEY in .env (gas wallet key; keep only a little ETH in it)}"
 echo "profit wallet: $FLASH_ARB_PROFIT_WALLET"
 exec cargo run --release -- "$@"

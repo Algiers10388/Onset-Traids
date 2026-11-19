@@ -11,6 +11,7 @@ export const MAX_DEPTH_FRACTION = 0.05;
 
 export function computeAdaptiveDepthFraction(netEdgeBps: number): number {
   if (!Number.isFinite(netEdgeBps) || netEdgeBps < 12) return MAX_DEPTH_FRACTION;
+  if (netEdgeBps >= 50) return 0.11;
   if (netEdgeBps >= 25) return 0.08;
   return 0.065;
 }

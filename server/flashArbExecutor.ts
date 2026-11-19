@@ -618,9 +618,10 @@ export const CHAIN_DEX_ROUTERS: Record<SupportedArbChain, Record<string, DexRout
       supported: true,
     },
     'SushiSwap V3': {
-      router: '0x734583f62Bb6ACe3c9bA9bd5A53143CA2Ce8C55A',
+      // 0x734583... on Scroll is Sushi RouteProcessor, incompatible with FlashArbOptimized._swapV3; monitor-only.
+      router: null,
       isV3: true,
-      supported: true,
+      supported: false,
     },
     'Nuri V3': {
       router: '0xAAAE99091Fbb28D400029052821653C1C752483B',
@@ -640,6 +641,8 @@ export const CHAIN_DEX_ROUTERS: Record<SupportedArbChain, Record<string, DexRout
 
 export const CAMELOT_V3_ROUTER_ADDRESS = '0x1F721E2E82F6676FCE4eA07A5958cF098D339e18';
 export const CAMELOT_V2_ROUTER_ADDRESS = '0xc873fEcbd354f5A56E00E710B90EF4201db2448d';
+export const QUICKSWAP_V3_ROUTER_ADDRESS = '0xf5b509bB0909a69B1c207E495f687a596C168E12';
+export const LYNEX_V3_ROUTER_ADDRESS = '0x3921e8cb45B17fC029A0a6dE958330ca4e583390';
 
 export interface RouterCapabilityOptions {
   supportsAlgebra?: boolean;
@@ -655,8 +658,8 @@ export function getChainDexRouters(chain?: string): Record<string, DexRouterSpec
 
 /**
  * Resolves effective DEX router specs for a chain given runtime capabilities:
- * - If deployed FlashArbOptimized exposes Algebra/Camelot V2 support (`routerCapabilities()`), enables native routers.
- * - Else if a deployed CamelotV3SwapAdapter address is configured, enables Camelot V3 via the ISwapRouter shim.
+ * - If deployed FlashArbOptimized exposes Algebra/Camelot V2 support (`routerCapabilities()`), enables native Algebra routers (Camelot V3 on Arbitrum, QuickSwap V3 on Polygon, Lynex V3 on Linea) & Camelot V2.
+ * - Else if a deployed CamelotV3SwapAdapter address is configured on Arbitrum, enables Camelot V3 via the ISwapRouter shim.
  */
 export function getEffectiveChainDexRouters(
   chain?: string,
@@ -664,27 +667,41 @@ export function getEffectiveChainDexRouters(
 ): Record<string, DexRouterSpec> {
   const base = getChainDexRouters(chain);
   const key = (chain || 'arbitrum').toLowerCase() as SupportedArbChain;
-  if (key !== 'arbitrum' || (!caps?.supportsAlgebra && !caps?.supportsCamelotV2 && !caps?.camelotV3Adapter)) {
+  if (!caps?.supportsAlgebra && !caps?.supportsCamelotV2 && !caps?.camelotV3Adapter) {
     return base;
   }
   const out: Record<string, DexRouterSpec> = { ...base };
-  if (caps.supportsAlgebra) {
-    out['Camelot V3'] = {
-      router: CAMELOT_V3_ROUTER_ADDRESS,
+  if (key === 'arbitrum') {
+    if (caps.supportsAlgebra) {
+      out['Camelot V3'] = {
+        router: CAMELOT_V3_ROUTER_ADDRESS,
+        isV3: true,
+        supported: true,
+      };
+    } else if (caps.camelotV3Adapter && /^0x[a-fA-F0-9]{40}$/.test(caps.camelotV3Adapter)) {
+      out['Camelot V3'] = {
+        router: caps.camelotV3Adapter,
+        isV3: true,
+        supported: true,
+      };
+    }
+    if (caps.supportsCamelotV2) {
+      out['Camelot V2'] = {
+        router: CAMELOT_V2_ROUTER_ADDRESS,
+        isV3: false,
+        supported: true,
+      };
+    }
+  } else if (key === 'polygon' && caps.supportsAlgebra) {
+    out['QuickSwap V3'] = {
+      router: QUICKSWAP_V3_ROUTER_ADDRESS,
       isV3: true,
       supported: true,
     };
-  } else if (caps.camelotV3Adapter && /^0x[a-fA-F0-9]{40}$/.test(caps.camelotV3Adapter)) {
-    out['Camelot V3'] = {
-      router: caps.camelotV3Adapter,
+  } else if (key === 'linea' && caps.supportsAlgebra) {
+    out['Lynex V3'] = {
+      router: LYNEX_V3_ROUTER_ADDRESS,
       isV3: true,
-      supported: true,
-    };
-  }
-  if (caps.supportsCamelotV2) {
-    out['Camelot V2'] = {
-      router: CAMELOT_V2_ROUTER_ADDRESS,
-      isV3: false,
       supported: true,
     };
   }
@@ -822,7 +839,6 @@ export const V3_QUOTER_V2_ADDRESSES: Record<SupportedArbChain, Partial<Record<st
     'Uniswap V3': '0x61fFE014bA17989E743c5F6cB21bF9697530B21e',
   },
   linea: {
-    'Uniswap V3': '0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a',
     'PancakeSwap V3': '0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997',
   },
   scroll: {
@@ -918,7 +934,7 @@ export function resolveArbitrageCandidates(
     return [];
   }
 
-  const safeScale = Number.isFinite(scaleFactor) && scaleFactor > 0 ? Math.min(5, scaleFactor) : 1;
+  const safeScale = Number.isFinite(scaleFactor) && scaleFactor > 0 ? Math.min(10, scaleFactor) : 1;
   const pctScale = Math.round(safeScale * 100);
   const scaleSuffix = pctScale !== 100 ? ` (${pctScale}% clip)` : '';
   const buyFeePpm = Math.round(input.buyFeePercent * 10000);
@@ -1055,7 +1071,7 @@ export function buildScaledArbitrageCandidates(
     const baseMinProfit = dir.baseCand.minProfitUnits;
 
     for (const scale of scaleFactors) {
-      if (!(Number.isFinite(scale) && scale > 0 && scale <= 5)) continue;
+      if (!(Number.isFinite(scale) && scale > 0 && scale <= 10)) continue;
       const scaleBps = BigInt(Math.max(1, Math.round(scale * 10000)));
       let scaledAmount = (baseAmount * scaleBps) / 10000n;
       if (dir.maxSafe !== undefined && scaledAmount > dir.maxSafe) {
@@ -1763,6 +1779,128 @@ export function resolveAndValidateSweepContracts(
     primaryContract: contracts[0] ?? null,
     invalidExtraContracts,
     usedFallbackKnownContracts,
+  };
+}
+
+export function getReceiptTimeoutMs(chain: SupportedArbChain, isDeployment = false): number {
+  if (chain === 'ethereum') {
+    return isDeployment ? 240_000 : 180_000;
+  }
+  if (chain === 'polygon' || chain === 'bsc' || chain === 'avalanche' || chain === 'linea' || chain === 'scroll') {
+    return isDeployment ? 150_000 : 90_000;
+  }
+  return isDeployment ? 90_000 : 60_000;
+}
+
+export interface ComputeOptimalFeeParamsInput {
+  chain: SupportedArbChain;
+  baseFeePerGasWei?: bigint | null;
+  rpcMaxFeePerGasWei?: bigint | null;
+  rpcMaxPriorityFeePerGasWei?: bigint | null;
+  rpcGasPriceWei?: bigint | null;
+  balanceWei?: bigint | null;
+  gasLimit?: bigint | null;
+  valueWei?: bigint | null;
+  urgencyMultiplierPct?: number;
+}
+
+export interface ComputedOptimalFeeParams {
+  maxFeePerGas: bigint;
+  maxPriorityFeePerGas: bigint;
+  gasPrice: bigint;
+  minPriorityFloorWei: bigint;
+}
+
+export function getMinPriorityFeeFloorWei(chain: SupportedArbChain): bigint {
+  switch (chain) {
+    case 'ethereum':
+      return 150_000_000n; // 0.15 Gwei minimum L1 builder tip (prevents 0.000007 Gwei stalled mempool txs)
+    case 'polygon':
+      return 30_000_000_000n; // 30 Gwei (Polygon PoS minimum validator tip)
+    case 'avalanche':
+      return 1_000_000_000n; // 1 Gwei
+    case 'bsc':
+      return 100_000_000n; // 0.1 Gwei
+    default:
+      return 2_000_000n; // 0.002 Gwei for L2/L3 rollups (Arbitrum, Base, Optimism, Linea, Scroll, ApeChain)
+  }
+}
+
+export function computeOptimalFeeParams(
+  params: ComputeOptimalFeeParamsInput
+): ComputedOptimalFeeParams {
+  const multPct = BigInt(
+    Math.max(100, Math.round(Number.isFinite(params.urgencyMultiplierPct) ? Number(params.urgencyMultiplierPct) : 100))
+  );
+  const floorBase = getMinPriorityFeeFloorWei(params.chain);
+  const rpcPriority =
+    params.rpcMaxPriorityFeePerGasWei && params.rpcMaxPriorityFeePerGasWei > 0n
+      ? params.rpcMaxPriorityFeePerGasWei
+      : 0n;
+  const scaledRpcPriority = (rpcPriority * multPct) / 100n;
+  const scaledFloor = (floorBase * multPct) / 100n;
+
+  let maxPriorityFeePerGas = scaledRpcPriority > scaledFloor ? scaledRpcPriority : scaledFloor;
+
+  const baseFee = params.baseFeePerGasWei && params.baseFeePerGasWei > 0n ? params.baseFeePerGasWei : 0n;
+  const baseHeadroomPct = params.chain === 'ethereum' ? 150n : 135n;
+  const effectiveHeadroomPct = (baseHeadroomPct * multPct) / 100n;
+
+  const rpcMaxFee =
+    params.rpcMaxFeePerGasWei && params.rpcMaxFeePerGasWei > 0n
+      ? (params.rpcMaxFeePerGasWei * multPct) / 100n
+      : 0n;
+  const rpcGasPrice =
+    params.rpcGasPriceWei && params.rpcGasPriceWei > 0n
+      ? (params.rpcGasPriceWei * multPct) / 100n
+      : 0n;
+
+  let maxFeePerGas =
+    baseFee > 0n
+      ? (baseFee * effectiveHeadroomPct) / 100n + maxPriorityFeePerGas
+      : rpcGasPrice > 0n
+      ? rpcGasPrice + maxPriorityFeePerGas
+      : maxPriorityFeePerGas * 2n;
+
+  if (rpcMaxFee > maxFeePerGas) {
+    maxFeePerGas = rpcMaxFee;
+  }
+  if (rpcGasPrice > maxFeePerGas) {
+    maxFeePerGas = rpcGasPrice;
+  }
+  if (maxFeePerGas < maxPriorityFeePerGas) {
+    maxFeePerGas = maxPriorityFeePerGas;
+  }
+
+  // If wallet balance is tight for maxFeePerGas * gasLimit, cap headroom cleanly while keeping >= baseFee + small tip
+  if (
+    params.balanceWei !== undefined &&
+    params.balanceWei !== null &&
+    params.gasLimit !== undefined &&
+    params.gasLimit !== null &&
+    params.gasLimit > 0n
+  ) {
+    const valueWei = params.valueWei && params.valueWei > 0n ? params.valueWei : 0n;
+    const availableForGas = params.balanceWei > valueWei ? params.balanceWei - valueWei : 0n;
+    const maxAffordableFeePerGas = availableForGas / params.gasLimit;
+    if (maxAffordableFeePerGas > 0n && maxFeePerGas > maxAffordableFeePerGas) {
+      const minViableBase = baseFee > 0n ? baseFee + 1_000_000n : maxPriorityFeePerGas;
+      if (maxAffordableFeePerGas >= minViableBase) {
+        maxFeePerGas = maxAffordableFeePerGas;
+        const maxTipWithinCap = maxFeePerGas > baseFee ? maxFeePerGas - baseFee : maxFeePerGas;
+        if (maxPriorityFeePerGas > maxTipWithinCap) {
+          maxPriorityFeePerGas = maxTipWithinCap;
+        }
+      }
+    }
+  }
+
+  const gasPrice = maxFeePerGas > rpcGasPrice ? maxFeePerGas : rpcGasPrice;
+  return {
+    maxFeePerGas,
+    maxPriorityFeePerGas,
+    gasPrice,
+    minPriorityFloorWei: floorBase,
   };
 }
 
