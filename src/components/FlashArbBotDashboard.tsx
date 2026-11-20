@@ -368,7 +368,9 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
   });
 
   // On-Chain Contract Deployment Verification State
-  const [contractDeploymentStatus, setContractDeploymentStatus] = useState<Record<string, { isDeployed: boolean; bytecodeLength: number }>>({});
+  const [contractDeploymentStatus, setContractDeploymentStatus] = useState<
+    Record<string, { isDeployed: boolean; bytecodeLength: number; checked?: boolean }>
+  >({});
   const [isDeployModalOpen, setIsDeployModalOpen] = useState<boolean>(false);
   const [deployModalTab, setDeployModalTab] = useState<'AGENT' | 'MANUAL' | 'CLI'>('AGENT');
 
@@ -1438,7 +1440,7 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
       if (!targetAddr || !isValidEvmAddress(targetAddr)) {
         setContractDeploymentStatus((prev) => ({
           ...prev,
-          [chainKey]: { isDeployed: false, bytecodeLength: 0 },
+          [chainKey]: { isDeployed: false, bytecodeLength: 0, checked: true },
         }));
         return;
       }
@@ -1447,7 +1449,7 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
       if (data.success) {
         setContractDeploymentStatus((prev) => ({
           ...prev,
-          [chainKey]: { isDeployed: data.isDeployed, bytecodeLength: data.bytecodeLength },
+          [chainKey]: { isDeployed: Boolean(data.isDeployed), bytecodeLength: data.bytecodeLength || 0, checked: true },
         }));
       }
     } catch (e) {
@@ -1841,42 +1843,51 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
       .then((res) => res.json())
       .then((data) => {
         if (data.success && data.contracts) {
+          const syncedToCheck: Array<{ key: ChainKey; addr: string }> = [];
           setDeployedContracts((prev) => {
             const next = { ...prev };
             for (const item of CHAIN_CONFIG_CATALOG) {
               const saved = (localStorage.getItem(`flash_arb_contract_${item.key}`) || '').trim();
               const serverAddr = String(data.contracts[item.key] || '').trim();
+              let resolved = prev[item.key];
               if (item.key === 'arbitrum') {
                 const legacyArbSet = new Set([
                   '0xeee31ff9e69904b43c124095b6f33aa61505bcc2',
                   '0x19359c6c418669fcfc46196970814353b8766be0',
                 ]);
                 if (serverAddr && !legacyArbSet.has(serverAddr.toLowerCase())) {
-                  next.arbitrum = serverAddr;
+                  resolved = serverAddr;
                   localStorage.setItem('flash_arb_contract_arbitrum', serverAddr);
                 } else if (saved && !legacyArbSet.has(saved.toLowerCase())) {
-                  next.arbitrum = saved;
+                  resolved = saved;
                   fetch('/api/flash-arb/deployed-contracts', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ chain: 'arbitrum', address: saved }),
                   }).catch(() => {});
                 } else {
-                  next.arbitrum = serverAddr || saved || prev.arbitrum;
+                  resolved = serverAddr || saved || prev.arbitrum;
                 }
               } else if (item.key === 'base') {
-                next.base =
+                resolved =
                   serverAddr && serverAddr.toLowerCase() !== '0x29b35c83955146ba8fd754b4b96956d245a5661e'
                     ? serverAddr
                     : saved && saved.toLowerCase() !== '0x29b35c83955146ba8fd754b4b96956d245a5661e'
                     ? saved
                     : prev.base;
               } else {
-                next[item.key] = serverAddr || saved || prev[item.key];
+                resolved = serverAddr || saved || prev[item.key];
+              }
+              next[item.key] = resolved;
+              if (resolved && resolved !== prev[item.key]) {
+                syncedToCheck.push({ key: item.key, addr: resolved });
               }
             }
             return next;
           });
+          for (const entry of syncedToCheck) {
+            void checkContractDeployment(entry.key, entry.addr);
+          }
         }
       })
       .catch(() => {});
@@ -3322,7 +3333,7 @@ RPC_BASE_WS=wss://base-mainnet.public.blastapi.io
                 </span>
               </div>
               <p className="text-xs text-slate-300 mt-1 leading-relaxed">
-                <strong className="text-amber-300 font-mono">{formatShortAddress(gasWalletAddress)}</strong> pays execution gas &amp; sequencer tips across Arbitrum, Base &amp; Optimism. <strong className="text-emerald-300 font-mono">{formatShortAddress(profitWalletAddress)}</strong> ({profitWalletLabel}) directly receives 100% of realized arbitrage profit upon loan repayment.
+                <strong className="text-amber-300 font-mono">{formatShortAddress(gasWalletAddress)}</strong> pays execution gas &amp; sequencer tips across Ethereum, Polygon, BSC, Arbitrum, Base &amp; Optimism. <strong className="text-emerald-300 font-mono">{formatShortAddress(profitWalletAddress)}</strong> ({profitWalletLabel}) directly receives 100% of realized arbitrage profit upon loan repayment.
               </p>
             </div>
           </div>
@@ -4980,7 +4991,7 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
                   disabled={isUpdatingAgentConfig}
                   onClick={handleOptimizeAgentParameters}
                   className="px-3 py-1.5 rounded-xl bg-gradient-to-r from-emerald-500 to-cyan-500 hover:from-emerald-400 hover:to-cyan-400 text-slate-950 font-bold text-xs transition-all flex items-center gap-1.5 cursor-pointer shadow-md disabled:opacity-50"
-                  title="Auto-tune ECO L2 zero-tip gas, $1-100 ETH S* liquidity scaling, and $0.01 Profit Guard, then re-scan live pools"
+                  title="Auto-tune ECO L2 zero-tip gas, $1-150 ETH eq S* depth scaling, and $0.01 Profit Guard, then re-scan live pools"
                 >
                   {isUpdatingAgentConfig ? (
                     <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -5219,7 +5230,7 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
                     {agentScanError
                       ? `RPC scan warning on ${targetChainConfig.name}: ${agentScanError}`
                       : agentOpportunities[0]?.profitGuardReason ||
-                        `Monitoring ${targetChainConfig.name} pools every 6.5s via Multicall3. Trades are guaranteed to execute ONLY if net profit after fees and gas is positive.`}
+                        `Monitoring ${targetChainConfig.name} pools every 4.5–5s via Multicall3. Trades are guaranteed to execute ONLY if net profit after fees and gas is positive.`}
                   </p>
                 </div>
               </div>
@@ -5296,9 +5307,9 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
                   1. Price Monitor
                 </div>
                 <p className="text-[11px] text-slate-300">
-                  Node WebSocket streaming sync events across 86+ pools in Arbitrum, Base, & Optimism.
+                  Live Multicall3 pool &amp; slot0 polling across 360+ pools on 10 L1/L2/L3 chains.
                 </p>
-                <div className="text-[10px] text-slate-500 font-mono">UniV3, Camelot, Curve, Balancer</div>
+                <div className="text-[10px] text-slate-500 font-mono">UniV3, PancakeV3, SushiV3, Camelot, QuickSwap, Aerodrome</div>
               </div>
 
               <div className="p-3.5 rounded-xl bg-slate-950/80 border border-slate-800/80 space-y-1.5">
@@ -5315,10 +5326,10 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
               <div className="p-3.5 rounded-xl bg-slate-950/80 border border-purple-500/40 bg-purple-950/10 space-y-1.5">
                 <div className="text-[11px] font-mono text-purple-400 font-bold flex items-center gap-1.5">
                   <Cpu className="h-3.5 w-3.5" />
-                  3. revm Simulator
+                  3. Pre-Flight eth_call
                 </div>
                 <p className="text-[11px] text-slate-300">
-                  Local fork verification. Confirms gas consumption: ~148,000 gas with assembly bypass.
+                  On-chain fork verification before broadcast. Confirms ~122k–149k gas &amp; Profit Guard safety.
                 </p>
                 <div className="text-[10px] text-purple-300 font-mono">Proves non-revert before signing</div>
               </div>
@@ -5356,7 +5367,8 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
             ).map((cfg) => {
               const isActiveWorker = selectedChain === cfg.key;
               const workerContract = deployedContracts[cfg.key] || cfg.defaultContract;
-              const isWorkerDeployed = Boolean(contractDeploymentStatus[cfg.key]?.isDeployed);
+              const workerStatus = contractDeploymentStatus[cfg.key];
+              const isWorkerDeployed = Boolean(workerStatus?.isDeployed);
               const tokenCount = getChainTokenConfigs(cfg.key).length;
               const poolCount = agentCountsByChain?.[cfg.key] ?? cfg.defaultPoolCountEstimate;
               const dexList = Array.from(
@@ -5371,9 +5383,13 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
                 ? 'Live Scan Only (No Balancer Vault)'
                 : isWorkerDeployed
                   ? 'Full On-Chain Execution'
-                  : workerContract
-                    ? 'Live Scan Ready (Checking Contract)'
-                    : 'Live Scan Ready (Deploy Contract to Exec)';
+                  : workerStatus?.checked
+                    ? workerContract
+                      ? 'Contract Undeployed (Deploy Needed)'
+                      : 'Live Scan Ready (Deploy Contract to Exec)'
+                    : workerContract
+                      ? 'Live Scan Ready (Checking Contract)'
+                      : 'Live Scan Ready (Deploy Contract to Exec)';
               return (
                 <button
                   key={cfg.key}
@@ -5472,7 +5488,17 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
                   className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-cyan-500/40 text-cyan-300 font-mono font-bold text-xs flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
                 >
                   {isProbingV3 ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Zap className="h-3.5 w-3.5" />}
-                  <span>{isProbingV3 ? 'Probing V3...' : `Probe V3 eth_call (${targetChainConfig.shortName})`}</span>
+                  <span>{isProbingV3 ? 'Probing V3...' : `Probe Routes (${targetChainConfig.shortName})`}</span>
+                </button>
+                <button
+                  type="button"
+                  disabled={isProbingV3}
+                  onClick={() => void handleProbeV3Routes('deployed')}
+                  className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-emerald-500/40 text-emerald-300 font-mono font-bold text-xs flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                  title="Run zero-gas eth_call route verification across all deployed chains"
+                >
+                  <CheckCircle2 className="h-3.5 w-3.5" />
+                  <span>Verify All Deployed</span>
                 </button>
                 <button
                   type="button"
@@ -5700,32 +5726,67 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
               </div>
             )}
 
-            {/* V3 eth_call Probe Summary if run */}
+            {/* V3/V2 eth_call Probe Summary if run */}
             {v3ProbeReport && v3ProbeReport.length > 0 && (
-              <div className="p-3 rounded-xl bg-slate-950/80 border border-cyan-500/30 space-y-2 font-mono text-xs">
-                <div className="text-cyan-300 font-bold">Live V3 eth_call Execution Probe Report (0 Gas Spent):</div>
-                {v3ProbeReport.map((rep: any) => (
-                  <div key={rep.chain} className="space-y-1">
-                    <div className="text-slate-300 font-bold">
-                      {rep.chain.toUpperCase()} · Contract {rep.contractAddress ? formatShortAddress(rep.contractAddress) : 'Undeployed'} ·{' '}
-                      {rep.contractDeployed ? `${rep.testedRoutes?.length || 0} routes probed` : 'Deploy FlashArbOptimized first'}
-                    </div>
-                    {Array.isArray(rep.testedRoutes) && rep.testedRoutes.length > 0 && (
-                      <div className="grid grid-cols-1 md:grid-cols-2 gap-1.5 text-[11px]">
-                        {rep.testedRoutes.map((tr: any, i: number) => (
-                          <div key={i} className="p-2 rounded bg-slate-900 border border-slate-800 flex justify-between gap-2">
-                            <span className="text-slate-300 truncate">
-                              T{tr.routeType} · {tr.pair} ({tr.buyDex} → {tr.sellDex})
-                            </span>
-                            <span className={tr.status === 'PROFITABLE' ? 'text-emerald-400 font-bold' : 'text-amber-300'}>
-                              {tr.status}
-                            </span>
-                          </div>
-                        ))}
+              <div className="p-3 rounded-xl bg-slate-950/80 border border-cyan-500/30 space-y-2.5 font-mono text-xs">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="text-cyan-300 font-bold">
+                    Live On-Chain eth_call Execution Probe Report (0 Gas Spent):
+                  </span>
+                  <span className="text-[10px] text-slate-400">
+                    {v3ProbeReport.filter((r: any) => r.contractDeployed).length} Deployed Contracts Checked
+                  </span>
+                </div>
+                {v3ProbeReport.map((rep: any) => {
+                  const passedCount = Array.isArray(rep.testedRoutes)
+                    ? rep.testedRoutes.filter((tr: any) => tr.onChainSwapsExecuted).length
+                    : 0;
+                  return (
+                    <div key={rep.chain} className="space-y-1.5">
+                      <div className="flex flex-wrap items-center justify-between gap-2 text-slate-300 font-bold">
+                        <span>
+                          {rep.chain.toUpperCase()} · Contract {rep.contractAddress ? formatShortAddress(rep.contractAddress) : 'Undeployed'}
+                        </span>
+                        <span className={`text-[11px] ${rep.contractDeployed ? 'text-emerald-400' : 'text-amber-300'}`}>
+                          {rep.contractDeployed
+                            ? `${passedCount}/${rep.testedRoutes?.length || 0} Routes Verified Executable`
+                            : 'Deploy FlashArbOptimized first (0x bytecode)'}
+                        </span>
                       </div>
-                    )}
-                  </div>
-                ))}
+                      {Array.isArray(rep.testedRoutes) && rep.testedRoutes.length > 0 && (
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-1.5 text-[11px]">
+                          {rep.testedRoutes.map((tr: any, i: number) => (
+                            <div key={i} className="p-2 rounded bg-slate-900 border border-slate-800 space-y-0.5">
+                              <div className="flex items-center justify-between gap-2">
+                                <span className="text-white font-bold truncate">
+                                  T{tr.routeType} · {tr.pair} ({tr.amountFormatted} {tr.borrowedToken})
+                                </span>
+                                <span
+                                  className={`shrink-0 px-1.5 py-0.5 rounded text-[9px] font-bold ${
+                                    tr.status === 'PROFITABLE'
+                                      ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
+                                      : tr.onChainSwapsExecuted
+                                      ? 'bg-cyan-500/15 text-cyan-300 border border-cyan-500/30'
+                                      : 'bg-rose-500/20 text-rose-300 border border-rose-500/30'
+                                  }`}
+                                >
+                                  {tr.status === 'PROFITABLE'
+                                    ? `+${tr.actualProfitFormatted} ${tr.borrowedToken}`
+                                    : tr.onChainSwapsExecuted
+                                    ? 'VERIFIED OK'
+                                    : 'REVERTED'}
+                                </span>
+                              </div>
+                              <div className="text-[10px] text-slate-400 truncate">
+                                {tr.candidateLabel || `${tr.buyDex} → ${tr.sellDex}`}
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
               </div>
             )}
 

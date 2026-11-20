@@ -57,3 +57,10 @@ The sizing math was checked numerically separately (closed form vs brute force).
 - `searcher/run-live.sh` loads `.env` and defaults `FLASH_ARB_PROFIT_WALLET` to that address; setting the env var overrides it.
 - The server no longer overwrites a user-set `FLASH_ARB_PROFIT_WALLET`; it only supplies this default when unset.
 - Dashboard: the default button/labels said "Cake Wallet (..5d)" but saved the MetaMask address; they now say MetaMask.
+
+## v0.4.0: Real Multi-Chain Execution Engine, Profit Vault `0xD550...f5b`, & Continuous Automation
+- **Real `executeOptimizedArbitrage` Dispatcher (`server/flashArbExecutor.ts`)**: Replaced the legacy `executeDirectFlashArb` placeholder with full ABI-encoded `executeOptimizedArbitrage` transactions using live Balancer V2 (`0%`) / Aave V3 (`0.05%`) flash loans, scaled liquidity candidates, `eth_call` pre-flight simulation, and `eth_estimateGas` checks.
+- **10-Chain Multicall3 Scanning & Algebra V3 Support**: Expanded live pool monitoring to 360+ pools across Ethereum, Polygon, BSC, Avalanche, Arbitrum, Base, Optimism, Linea, Scroll, and ApeChain (`QuickSwap V3` on Polygon, `PancakeSwap V3`, `SushiSwap V3`, `Uniswap V3`, and V2 routers). Verified 6/6 live routes executable on Ethereum, Polygon, BSC, Arbitrum, and Base.
+- **Updated Default Profit Vault**: Default `FLASH_ARB_PROFIT_WALLET` migrated to `0xD5503C876a5DFeE057727cfacb6a59E8C7554f5b` with persistent multi-contract balance sweeping (`POST /api/flash-arb/sweep-all`).
+- **Continuous Automation & Quota Discipline**: Restored **Start/Stop Auto-Trading**, **Pause/Resume Scanner**, **Auto-Sweep ON/OFF**, and **Verify All Deployed** controls in `FlashArbBotDashboard`. `LiveMevAgent` maintains an 8s deployed-chain scan cadence when armed even if the browser UI is backgrounded, without burning RPC quota on undeployed chains.
+

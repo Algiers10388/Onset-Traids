@@ -2241,7 +2241,7 @@ class LiveMevAgent {
   public latestBlockByChain: Record<SupportedArbChain, number> = initChainRecord<number>(() => 0);
   public lastErrorByChain: Record<SupportedArbChain, string | null> = initChainRecord<string | null>(() => null);
   public lastSuccessfulScanByChain: Record<SupportedArbChain, number> = initChainRecord<number>(() => 0);
-  private lastAttemptedScanByChain: Record<SupportedArbChain, number> = initChainRecord<number>(() => 0);
+  public lastAttemptedScanByChain: Record<SupportedArbChain, number> = initChainRecord<number>(() => 0);
   private activeUiChain: SupportedArbChain = 'arbitrum';
   private activeUiAllMode: boolean = false;
   private lastStatusRequestAt: number = 0;
@@ -4696,11 +4696,22 @@ flashArbRouter.post('/agent/optimize', async (_req: Request, res: Response) => {
  */
 flashArbRouter.post('/agent/verify-v3', async (req: Request, res: Response) => {
   try {
-    const rawChain = String(req.body?.chain || req.query?.chain || 'all').toLowerCase();
-    const chainsToCheck: SupportedArbChain[] =
-      isSupportedArbChain(rawChain) ? [rawChain] : SUPPORTED_SCAN_CHAINS;
+    const rawChain = String(req.body?.chain || req.query?.chain || 'deployed').toLowerCase();
+    const chainsToCheck: SupportedArbChain[] = isSupportedArbChain(rawChain)
+      ? [rawChain]
+      : rawChain === 'deployed'
+      ? SUPPORTED_SCAN_CHAINS.filter((c) => Boolean(DEPLOYED_CONTRACTS[c]))
+      : SUPPORTED_SCAN_CHAINS;
 
-    await Promise.allSettled(chainsToCheck.map((c) => liveAgent.scan(c)));
+    const now = Date.now();
+    const staleChains = chainsToCheck.filter(
+      (c) =>
+        (liveAgent.poolsByChain[c] || []).length === 0 ||
+        now - (liveAgent.lastAttemptedScanByChain[c] || 0) > 8_000
+    );
+    if (staleChains.length > 0) {
+      await liveAgent.scan(staleChains);
+    }
 
     const report: Array<{
       chain: SupportedArbChain;

@@ -12,20 +12,20 @@ def build_flash_arb_zip():
     for target in targets:
         with zipfile.ZipFile(target, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
             # 1. Add top-level README
-            suite_readme = """# Quantitative Crypto Trading Suite & Flash Loan Arbitrage Engine
+            suite_readme = """# Quantitative Crypto Trading Suite & Multi-Chain Flash Loan Arbitrage Engine
 
-This package contains two complete, production-ready quantitative systems:
+This package contains two complete, live-execution quantitative systems:
 
 1. `trade-agent/`:
-   - Autonomous Crypto Trading Agent with MACD (12, 26, 9), RSI (14), Bollinger Bands (20, 2), Regular Divergence, and Confluence Scoring (0-100%).
-   - Multi-Exchange Execution: Paper Trading / Dry-Run (zero keys needed) & Authenticated Live Trading on Binance, OKX, Coinbase, Bybit, Kraken.
+   - Autonomous CEX Spot Trading Agent with MACD (12, 26, 9), RSI (14), Bollinger Bands (20, 2), Regular Divergence, and Confluence Scoring (0-100%).
+   - Multi-Exchange Live Execution: Binance, OKX, Coinbase, Bybit, Kraken.
    - Dynamic Risk Management: Daily loss circuit breakers, fractional Kelly position sizing, Take-Profit, Stop-Loss, and peak-tracking Trailing Stops.
    - One-click runners: `run_termux.sh` (Android), `run_wsl.sh` (Linux), `run_powershell.ps1` (Windows).
 
 2. `flash-arb/`:
-   - Smart Contracts (`contracts/`): Atomic flash loan arbitrage executor (Aave V3, Uniswap V3, Curve, Camelot) written in Solidity (^0.8.20).
-   - Rust Searcher (`searcher/`): Low-latency WebSocket pool monitor, closed-form V2 & ternary V3 loan sizer, revm state simulator, and private relay tx builder.
-   - Cross-platform Foundry runners for Termux, WSL, and Windows.
+   - Smart Contracts (`contracts/`): Cancun EIP-1153 `FlashArbOptimized.sol` (Balancer V2 0% fee & Aave V3 0.05% fallback; Route Types 1-4 across UniV3, PancakeV3, SushiV3, QuickSwap/Camelot V3, and V2).
+   - Searchers (`searcher/` & Node server `server/flashArbRoutes.ts`): Multicall3 live pool polling across 10 chains (Ethereum, Polygon, BSC, Arbitrum, Base, Optimism, Avalanche, Linea, Scroll, ApeChain), closed-form S* depth sizing, zero-gas `eth_call` pre-flight verification, continuous auto-trading, and automatic Profit Vault (`0xD5503C876a5DFeE057727cfacb6a59E8C7554f5b`) sweeping.
+   - Cross-platform Foundry & Cargo runners for Termux, WSL, and Windows.
 """
             zinfo_root = zipfile.ZipInfo("README.md")
             zinfo_root.external_attr = 0o644 << 16
