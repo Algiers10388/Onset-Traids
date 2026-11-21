@@ -1647,7 +1647,9 @@ export function verifyChainRouteTypesReadiness(
 }
 
 export const KNOWN_FLASH_ARB_CONTRACTS: Record<SupportedArbChain, string[]> = {
-  ethereum: [],
+  ethereum: [
+    '0x5901B4B159Ea0Cab54effcbF00F0076c96AD898D',
+  ],
   polygon: [],
   bsc: [],
   avalanche: [],

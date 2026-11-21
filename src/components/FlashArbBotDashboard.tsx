@@ -159,6 +159,8 @@ interface SimulatedOpp {
   gasSavingsPercent?: number;
   priceImpactBps?: number;
   dexFeeBps?: number;
+  dexFeeUsd?: number;
+  slippageCostUsd?: number;
   contractExecutable?: boolean;
 }
 
@@ -247,6 +249,15 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
   };
 
   const getKnownContractsForChain = (chainKey: ChainKey): string[] => {
+    if (chainKey === 'ethereum') {
+      return ['0x5901B4B159Ea0Cab54effcbF00F0076c96AD898D'];
+    }
+    if (chainKey === 'polygon') {
+      return ['0xBBA273E057cDa31bB359d8AA8749256246B6d0cC'];
+    }
+    if (chainKey === 'bsc') {
+      return ['0xBBA273E057cDa31bB359d8AA8749256246B6d0cC'];
+    }
     if (chainKey === 'arbitrum') {
       return ['0xeee31ff9e69904b43c124095b6f33aa61505bcc2', '0x19359c6C418669FCfC46196970814353b8766BE0'];
     }
@@ -361,7 +372,7 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
             ? saved
             : item.defaultContract;
       } else {
-        initial[item.key] = saved || item.defaultContract;
+        initial[item.key] = saved && isValidEvmAddress(saved) ? saved.trim() : item.defaultContract;
       }
     }
     return initial;
@@ -581,7 +592,16 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
     };
   } | null>(null);
   const [isLoadingHoldingsOverview, setIsLoadingHoldingsOverview] = useState<boolean>(false);
-  const [extraTokensInput, setExtraTokensInput] = useState<string>('');
+  const [extraTokensInput, setExtraTokensInput] = useState<string>(() => {
+    try {
+      return localStorage.getItem('flash_arb_extra_tokens') || '';
+    } catch {
+      return '';
+    }
+  });
+  const [erc1155ContractInput, setErc1155ContractInput] = useState<string>('');
+  const [erc1155TokenIdInput, setErc1155TokenIdInput] = useState<string>('');
+  const [erc1155TrackError, setErc1155TrackError] = useState<string | null>(null);
   const [isSweepingAll, setIsSweepingAll] = useState<boolean>(false);
   const [includeGasWalletTokensInSweep, setIncludeGasWalletTokensInSweep] = useState<boolean>(false);
   const [includeGasWalletEthSurplusInSweep, setIncludeGasWalletEthSurplusInSweep] = useState<boolean>(() => {
@@ -1067,7 +1087,7 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
       setLiveExecutionError(null);
     }
     try {
-      const extraTokenAddresses = parseExtraTokenAddresses(extraTokensInput);
+      const extraTokenAddresses = parseExtraTokenAddresses(rt.extraTokensInput);
       const overviewContracts =
         holdingsOverview?.chain === targetChain && Array.isArray(holdingsOverview.contracts)
           ? holdingsOverview.contracts.map((c) => c.address)
@@ -1166,9 +1186,9 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
         skippedIncompatible: walletFailures,
       });
       await Promise.all([
-        fetchProfitWalletBalances(),
-        fetchContractBalances(),
-        fetchHoldingsOverview(),
+        fetchProfitWalletBalances(rt.extraTokensInput),
+        fetchContractBalances(rt.extraTokensInput),
+        fetchHoldingsOverview(rt.extraTokensInput),
         fetchGasStatus(),
       ]);
     } catch (err: any) {
@@ -1244,6 +1264,11 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
       const gasDustCount = rt.isSignerKeyConfigured
         ? overview.summary.sweepableGasWalletTokensCount || 0
         : 0;
+      const gasErc1155Count = rt.isSignerKeyConfigured && Array.isArray(overview.gasWallet?.nonZeroTokens)
+        ? overview.gasWallet.nonZeroTokens.filter(
+            (t: any) => t.ercStandard === 'ERC-1155' && (t.walletSweepCompatible ?? t.sweepCompatible)
+          ).length
+        : 0;
       const gasEthDustCount =
         rt.isSignerKeyConfigured && rt.includeGasWalletEthSurplusInSweep
           ? overview.summary.sweepableGasWalletEthCount || 0
@@ -1254,7 +1279,7 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
       if (totalSweepableDust <= 0) {
         setSweepAllNotice({
           success: true,
-          message: `End-of-cycle scan (${cycleLabel}): 0 compatible dust tokens or excess Gas ETH (> 0.002 ETH reserve) detected — Profit Vault ${formatShortAddress(profitWalletAddress)} is clean.`,
+          message: `End-of-cycle scan (${cycleLabel}): 0 compatible ERC-20/ERC-1155 dust tokens or excess Gas ETH (> 0.002 ETH reserve) detected — Profit Vault ${formatShortAddress(profitWalletAddress)} is clean.`,
         });
         return;
       }
@@ -1275,7 +1300,7 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
       await executeSweepAllBalances({
         autoTriggered: true,
         autoReason: 'CYCLE',
-        cycleLabel,
+        cycleLabel: gasErc1155Count > 0 ? `${cycleLabel} · ${gasErc1155Count} ERC-1155` : cycleLabel,
         includeGasOverride: gasDustCount > 0 || rt.includeGasWalletTokensInSweep,
         includeGasEthOverride: gasEthDustCount > 0 || rt.includeGasWalletEthSurplusInSweep,
       });
@@ -1876,7 +1901,9 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
                     ? saved
                     : prev.base;
               } else {
-                resolved = serverAddr || saved || prev[item.key];
+                const validServer = isValidEvmAddress(serverAddr) ? serverAddr : '';
+                const validSaved = isValidEvmAddress(saved) ? saved : '';
+                resolved = validServer || validSaved || prev[item.key];
               }
               next[item.key] = resolved;
               if (resolved && resolved !== prev[item.key]) {
@@ -3822,20 +3849,30 @@ RPC_BASE_WS=wss://base-mainnet.public.blastapi.io
                           </div>
                           {c.nonZeroTokens.length > 0 && (
                             <div className="flex flex-wrap gap-1.5 pt-0.5">
-                              {c.nonZeroTokens.map((tok) => (
-                                <span
-                                  key={`${c.address}-${tok.address}-${tok.tokenId || ''}`}
-                                  title={tok.compatibilityNote}
-                                  className={`px-1.5 py-0.5 rounded border text-[10px] ${
-                                    tok.sweepCompatible
-                                      ? 'bg-emerald-950/60 border-emerald-500/40 text-emerald-200'
-                                      : 'bg-rose-950/60 border-rose-500/40 text-rose-200'
-                                  }`}
-                                >
-                                  {tok.balance} {tok.symbol} ({tok.ercStandard || 'ERC-20'}) ·{' '}
-                                  {tok.arbCompatible ? 'Arb+Sweep' : tok.sweepCompatible ? 'Sweep Only' : 'Contract Incompatible'}
-                                </span>
-                              ))}
+                              {c.nonZeroTokens.map((tok) => {
+                                const isNft = tok.ercStandard === 'ERC-721' || tok.ercStandard === 'ERC-1155';
+                                return (
+                                  <span
+                                    key={`${c.address}-${tok.address}-${tok.tokenId || ''}`}
+                                    title={tok.compatibilityNote}
+                                    className={`px-1.5 py-0.5 rounded border text-[10px] ${
+                                      tok.sweepCompatible
+                                        ? 'bg-emerald-950/60 border-emerald-500/40 text-emerald-200'
+                                        : 'bg-rose-950/60 border-rose-500/40 text-rose-200'
+                                    }`}
+                                  >
+                                    {isNft ? tok.balance : tok.balance} {tok.symbol} ({tok.ercStandard || 'ERC-20'}
+                                    {tok.tokenId ? ` #${tok.tokenId}` : ''}) ·{' '}
+                                    {tok.arbCompatible
+                                      ? 'Arb+Sweep'
+                                      : tok.sweepCompatible
+                                      ? 'Sweep Only'
+                                      : tok.ercStandard === 'ERC-1155'
+                                      ? 'Wallet-Only ERC-1155'
+                                      : 'Contract Incompatible'}
+                                  </span>
+                                );
+                              })}
                             </div>
                           )}
                         </div>
@@ -3852,19 +3889,24 @@ RPC_BASE_WS=wss://base-mainnet.public.blastapi.io
                             Gas Wallet ({formatShortAddress(holdingsOverview.gasWallet.address)}) Tokens
                           </div>
                           <div className="flex flex-wrap gap-1">
-                            {holdingsOverview.gasWallet.nonZeroTokens.map((tok) => (
-                              <span
-                                key={`gas-${tok.address}-${tok.tokenId || ''}`}
-                                title={tok.compatibilityNote}
-                                className={`px-1.5 py-0.5 rounded border ${
-                                  tok.sweepCompatible
-                                    ? 'bg-emerald-950/50 border-emerald-500/40 text-emerald-200'
-                                    : 'bg-rose-950/50 border-rose-500/40 text-rose-200'
-                                }`}
-                              >
-                                {Number(tok.balance).toFixed(4)} {tok.symbol} · {tok.ercStandard || 'ERC-20'}
-                              </span>
-                            ))}
+                            {holdingsOverview.gasWallet.nonZeroTokens.map((tok) => {
+                              const canSweepFromGasWallet = tok.walletSweepCompatible ?? tok.sweepCompatible;
+                              const isNft = tok.ercStandard === 'ERC-721' || tok.ercStandard === 'ERC-1155';
+                              return (
+                                <span
+                                  key={`gas-${tok.address}-${tok.tokenId || ''}`}
+                                  title={tok.compatibilityNote}
+                                  className={`px-1.5 py-0.5 rounded border ${
+                                    canSweepFromGasWallet
+                                      ? 'bg-emerald-950/50 border-emerald-500/40 text-emerald-200'
+                                      : 'bg-rose-950/50 border-rose-500/40 text-rose-200'
+                                  }`}
+                                >
+                                  {isNft ? tok.balance : Number(tok.balance).toFixed(4)} {tok.symbol} · {tok.ercStandard || 'ERC-20'}
+                                  {tok.ercStandard === 'ERC-1155' && canSweepFromGasWallet ? ' · Dust Sweep Ready' : ''}
+                                </span>
+                              );
+                            })}
                           </div>
                         </div>
                       )}
@@ -3897,12 +3939,298 @@ RPC_BASE_WS=wss://base-mainnet.public.blastapi.io
                     </div>
                   ) : null}
 
+                  {/* Explicit ERC-1155 Multi-Token Balance Tracker & Dust Sweep Monitor */}
+                  {(() => {
+                    type Erc1155MonitorRow = {
+                      key: string;
+                      holderLabel: string;
+                      holderType: 'PROFIT_VAULT' | 'GAS_WALLET' | 'CONNECTED_WALLET' | 'CONTRACT' | 'TRACKED';
+                      symbol: string;
+                      address: string;
+                      tokenId?: string;
+                      balance: string;
+                      hasBalance: boolean;
+                      sweepReady: boolean;
+                      statusLabel: string;
+                    };
+                    const erc1155Rows: Erc1155MonitorRow[] = [];
+                    const seenKeys = new Set<string>();
+
+                    if (holdingsOverview?.gasWallet?.nonZeroTokens) {
+                      for (const tok of holdingsOverview.gasWallet.nonZeroTokens) {
+                        if (tok.ercStandard === 'ERC-1155') {
+                          const rowKey = `gas-${tok.address.toLowerCase()}-${tok.tokenId || ''}`;
+                          seenKeys.add(rowKey);
+                          const sweepReady = Boolean(tok.tokenId && (tok.walletSweepCompatible ?? tok.sweepCompatible));
+                          erc1155Rows.push({
+                            key: rowKey,
+                            holderLabel: `Gas Wallet (${formatShortAddress(holdingsOverview.gasWallet.address)})`,
+                            holderType: 'GAS_WALLET',
+                            symbol: tok.symbol,
+                            address: tok.address,
+                            tokenId: tok.tokenId,
+                            balance: tok.balance,
+                            hasBalance: true,
+                            sweepReady,
+                            statusLabel: sweepReady ? 'ERC1155.safeTransferFrom Ready' : 'Needs :tokenId to sweep',
+                          });
+                        }
+                      }
+                    }
+
+                    if (holdingsOverview?.connectedWallet?.nonZeroTokens) {
+                      for (const tok of holdingsOverview.connectedWallet.nonZeroTokens) {
+                        if (tok.ercStandard === 'ERC-1155') {
+                          const rowKey = `conn-${tok.address.toLowerCase()}-${tok.tokenId || ''}`;
+                          seenKeys.add(rowKey);
+                          const sweepReady = Boolean(tok.tokenId && (tok.walletSweepCompatible ?? tok.sweepCompatible));
+                          erc1155Rows.push({
+                            key: rowKey,
+                            holderLabel: `Connected Wallet (${formatShortAddress(holdingsOverview.connectedWallet.address)})`,
+                            holderType: 'CONNECTED_WALLET',
+                            symbol: tok.symbol,
+                            address: tok.address,
+                            tokenId: tok.tokenId,
+                            balance: tok.balance,
+                            hasBalance: true,
+                            sweepReady,
+                            statusLabel: sweepReady ? 'Wallet safeTransferFrom Ready' : 'Needs :tokenId to sweep',
+                          });
+                        }
+                      }
+                    }
+
+                    if (holdingsOverview?.profitWallet?.nonZeroTokens) {
+                      for (const tok of holdingsOverview.profitWallet.nonZeroTokens) {
+                        if (tok.ercStandard === 'ERC-1155') {
+                          const rowKey = `vault-${tok.address.toLowerCase()}-${tok.tokenId || ''}`;
+                          seenKeys.add(rowKey);
+                          erc1155Rows.push({
+                            key: rowKey,
+                            holderLabel: `Profit Vault (${formatShortAddress(holdingsOverview.profitWallet.address)})`,
+                            holderType: 'PROFIT_VAULT',
+                            symbol: tok.symbol,
+                            address: tok.address,
+                            tokenId: tok.tokenId,
+                            balance: tok.balance,
+                            hasBalance: true,
+                            sweepReady: false,
+                            statusLabel: 'Secured in Profit Vault',
+                          });
+                        }
+                      }
+                    }
+
+                    if (holdingsOverview?.contracts) {
+                      for (const c of holdingsOverview.contracts) {
+                        for (const tok of c.nonZeroTokens || []) {
+                          if (tok.ercStandard === 'ERC-1155') {
+                            const rowKey = `contract-${c.address.toLowerCase()}-${tok.address.toLowerCase()}-${tok.tokenId || ''}`;
+                            seenKeys.add(rowKey);
+                            erc1155Rows.push({
+                              key: rowKey,
+                              holderLabel: `Contract (${formatShortAddress(c.address)})`,
+                              holderType: 'CONTRACT',
+                              symbol: tok.symbol,
+                              address: tok.address,
+                              tokenId: tok.tokenId,
+                              balance: tok.balance,
+                              hasBalance: true,
+                              sweepReady: false,
+                              statusLabel: 'Held on contract (ERC-20 rescue only)',
+                            });
+                          }
+                        }
+                      }
+                    }
+
+                    if (holdingsOverview?.customCheckedTokens) {
+                      for (const ct of holdingsOverview.customCheckedTokens) {
+                        if (ct.ercStandard === 'ERC-1155') {
+                          const hasNonZeroEntry = erc1155Rows.some(
+                            (r) =>
+                              r.address.toLowerCase() === ct.address.toLowerCase() &&
+                              String(r.tokenId || '') === String(ct.tokenId || '')
+                          );
+                          if (!hasNonZeroEntry) {
+                            erc1155Rows.push({
+                              key: `tracked-${ct.address.toLowerCase()}-${ct.tokenId || ''}`,
+                              holderLabel: `Tracked (${CHAIN_CONFIG_MAP[selectedChain].shortName})`,
+                              holderType: 'TRACKED',
+                              symbol: ct.symbol,
+                              address: ct.address,
+                              tokenId: ct.tokenId,
+                              balance: '0',
+                              hasBalance: false,
+                              sweepReady: Boolean(ct.tokenId),
+                              statusLabel: ct.tokenId ? '0 Balance · Monitored in Sweep' : 'Missing :tokenId',
+                            });
+                          }
+                        }
+                      }
+                    }
+
+                    const sweepableErc1155GasCount = erc1155Rows.filter(
+                      (r) => r.holderType === 'GAS_WALLET' && r.hasBalance && r.sweepReady
+                    ).length;
+
+                    const handleAddTrackedErc1155 = () => {
+                      const cleanAddr = erc1155ContractInput.trim();
+                      const cleanId = erc1155TokenIdInput.trim();
+                      if (!isValidEvmAddress(cleanAddr)) {
+                        setErc1155TrackError('Enter a valid 42-char ERC-1155 contract address (0x...).');
+                        return;
+                      }
+                      if (!/^\d+$/.test(cleanId)) {
+                        setErc1155TrackError('Enter a numeric ERC-1155 Token ID (e.g. 1).');
+                        return;
+                      }
+                      setErc1155TrackError(null);
+                      const spec = `${cleanAddr}:${cleanId}`;
+                      const existing = parseExtraTokenAddresses(extraTokensInput);
+                      const merged = Array.from(new Set([...existing, spec])).join(', ');
+                      setExtraTokensInput(merged);
+                      try {
+                        localStorage.setItem('flash_arb_extra_tokens', merged);
+                      } catch {}
+                      setErc1155ContractInput('');
+                      setErc1155TokenIdInput('');
+                      void fetchHoldingsOverview(merged);
+                      void fetchContractBalances(merged);
+                      void fetchProfitWalletBalances(merged);
+                    };
+
+                    return (
+                      <div
+                        data-testid="erc1155-monitoring-panel"
+                        className="p-2.5 rounded-lg bg-slate-950/85 border border-indigo-500/30 space-y-2 font-mono text-[11px]"
+                      >
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <div className="flex items-center gap-1.5 text-indigo-300 font-bold">
+                            <Layers className="h-3.5 w-3.5 text-indigo-400 shrink-0" />
+                            <span>ERC-1155 Token Balances &amp; Dust Sweep Tracker</span>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <span
+                              data-testid="erc1155-sweep-badge"
+                              className={`text-[10px] px-2 py-0.5 rounded border ${
+                                sweepableErc1155GasCount > 0
+                                  ? 'bg-emerald-950/60 border-emerald-500/40 text-emerald-300'
+                                  : 'bg-slate-900 border-slate-700 text-slate-400'
+                              }`}
+                            >
+                              {sweepableErc1155GasCount > 0
+                                ? `${sweepableErc1155GasCount} Sweep-Ready ERC-1155`
+                                : `${erc1155Rows.length} Tracked ERC-1155`}
+                            </span>
+                            {sweepableErc1155GasCount > 0 && (
+                              <button
+                                type="button"
+                                disabled={isSweepingAll}
+                                onClick={() =>
+                                  executeSweepAllBalances({
+                                    includeGasOverride: true,
+                                    skipContractEth: true,
+                                    cycleLabel: 'ERC-1155 Dust Sweep',
+                                  })
+                                }
+                                className="px-2 py-0.5 rounded bg-indigo-500/20 hover:bg-indigo-500/30 border border-indigo-400/50 text-indigo-200 text-[10px] font-bold cursor-pointer disabled:opacity-50"
+                              >
+                                Sweep ERC-1155 Dust
+                              </button>
+                            )}
+                          </div>
+                        </div>
+
+                        {erc1155Rows.length > 0 ? (
+                          <div className="space-y-1">
+                            {erc1155Rows.map((row) => (
+                              <div
+                                key={row.key}
+                                className="px-2 py-1.5 rounded bg-slate-900/90 border border-slate-800 flex flex-wrap items-center justify-between gap-2 text-[10px]"
+                              >
+                                <div className="flex items-center gap-1.5">
+                                  <span className="px-1.5 py-0.5 rounded bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 font-bold">
+                                    ERC-1155
+                                  </span>
+                                  <span className="text-white font-bold">
+                                    {row.balance} &times; {row.symbol}
+                                    {row.tokenId ? ` (#${row.tokenId})` : ''}
+                                  </span>
+                                  <span className="text-slate-500">· {formatShortAddress(row.address)}</span>
+                                </div>
+                                <div className="flex items-center gap-2">
+                                  <span className="text-slate-400">{row.holderLabel}</span>
+                                  <span
+                                    className={`px-1.5 py-0.5 rounded border ${
+                                      row.holderType === 'PROFIT_VAULT' || row.sweepReady
+                                        ? 'bg-emerald-950/60 border-emerald-500/40 text-emerald-300'
+                                        : 'bg-slate-800 border-slate-700 text-slate-300'
+                                    }`}
+                                  >
+                                    {row.statusLabel}
+                                  </span>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        ) : (
+                          <div className="text-[10px] text-slate-400 font-sans">
+                            No tracked ERC-1155 token IDs yet on {CHAIN_CONFIG_MAP[selectedChain].name}. Add an ERC-1155 contract + Token ID below to monitor its live balance and include it automatically in dust sweeps via <code className="text-indigo-300 font-mono">safeTransferFrom</code>.
+                          </div>
+                        )}
+
+                        <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
+                          <input
+                            type="text"
+                            value={erc1155ContractInput}
+                            onChange={(e) => {
+                              setErc1155ContractInput(e.target.value);
+                              if (erc1155TrackError) setErc1155TrackError(null);
+                            }}
+                            placeholder="ERC-1155 Contract (0x...)"
+                            aria-label="ERC-1155 contract address"
+                            className="flex-1 min-w-[160px] px-2 py-1 rounded bg-slate-900 border border-slate-700 text-[10px] font-mono text-white placeholder-slate-500 focus:outline-none focus:border-indigo-400"
+                          />
+                          <input
+                            type="text"
+                            value={erc1155TokenIdInput}
+                            onChange={(e) => {
+                              setErc1155TokenIdInput(e.target.value);
+                              if (erc1155TrackError) setErc1155TrackError(null);
+                            }}
+                            placeholder="Token ID (e.g. 1)"
+                            aria-label="ERC-1155 token ID"
+                            className="w-28 px-2 py-1 rounded bg-slate-900 border border-slate-700 text-[10px] font-mono text-white placeholder-slate-500 focus:outline-none focus:border-indigo-400"
+                          />
+                          <button
+                            type="button"
+                            disabled={isLoadingHoldingsOverview}
+                            onClick={handleAddTrackedErc1155}
+                            className="px-2.5 py-1 rounded bg-indigo-500/20 hover:bg-indigo-500/30 border border-indigo-400/40 text-indigo-200 text-[10px] font-bold cursor-pointer disabled:opacity-50"
+                          >
+                            + Track ERC-1155
+                          </button>
+                        </div>
+                        {erc1155TrackError && (
+                          <div className="text-[10px] text-rose-300 font-sans">{erc1155TrackError}</div>
+                        )}
+                      </div>
+                    );
+                  })()}
+
                   {/* Custom Token Contract Address Inspector */}
                   <div className="flex flex-wrap items-center gap-1.5">
                     <input
                       type="text"
                       value={extraTokensInput}
-                      onChange={(e) => setExtraTokensInput(e.target.value)}
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        setExtraTokensInput(val);
+                        try {
+                          localStorage.setItem('flash_arb_extra_tokens', val);
+                        } catch {}
+                      }}
                       placeholder="Extra ERC-20/4626/2612 (0x...) or ERC-721/1155 (0x...:tokenId)"
                       className="flex-1 min-w-[200px] px-2.5 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-[11px] font-mono text-white placeholder-slate-500 focus:outline-none focus:border-emerald-400"
                     />
@@ -3956,7 +4284,7 @@ RPC_BASE_WS=wss://base-mainnet.public.blastapi.io
                   )}
 
                   <p className="text-[11px] text-slate-400 font-sans leading-relaxed">
-                    Detects ERC-20, ERC-2612, ERC-4626, ERC-777, ERC-721, and ERC-1155 on-chain + <code className="text-emerald-300 font-mono">eth_estimateGas</code>. FlashArb contracts sweep fungible ERC-20/2612/4626/777 tokens only; Connected Wallet can also sweep ERC-721/1155 using <code className="text-cyan-300 font-mono">0xAddress:tokenId</code> to <code className="text-emerald-300 font-mono">{formatShortAddress(profitWalletAddress)}</code>.
+                    Detects ERC-20, ERC-2612, ERC-4626, ERC-777, ERC-721, and ERC-1155 on-chain + <code className="text-emerald-300 font-mono">eth_estimateGas</code>. FlashArb contracts sweep fungible ERC-20/2612/4626/777 tokens; Gas Wallet &amp; Connected Wallet also sweep tracked ERC-721/ERC-1155 (<code className="text-cyan-300 font-mono">0xAddress:tokenId</code>) via <code className="text-indigo-300 font-mono">safeTransferFrom</code> to <code className="text-emerald-300 font-mono">{formatShortAddress(profitWalletAddress)}</code>.
                   </p>
 
                   {/* Contract USDT Threshold Auto-Sweep Controls */}
@@ -5954,6 +6282,8 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
                       gasSavingsPercent: opp.gasSavingsPercent,
                       priceImpactBps: opp.priceImpactBps,
                       dexFeeBps: opp.dexFeeBps,
+                      dexFeeUsd: opp.dexFeeUsd,
+                      slippageCostUsd: opp.slippageCostUsd,
                       contractExecutable: opp.contractExecutable,
                     }))
                   : opportunities;
@@ -5975,9 +6305,9 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
                           <th className="py-2.5 px-3">Time / Chain</th>
                           <th className="py-2.5 px-3">Token &amp; Category</th>
                           <th className="py-2.5 px-3">Loan Size &amp; Protocol</th>
-                          <th className="py-2.5 px-3">Spread</th>
+                          <th className="py-2.5 px-3">Spread &amp; DEX Fees</th>
                           <th className="py-2.5 px-3">Route (DEX A → B)</th>
-                          <th className="py-2.5 px-3">Gas &amp; Loan Fee</th>
+                          <th className="py-2.5 px-3">Gas &amp; Market Costs</th>
                           <th className="py-2.5 px-3">Net Profit</th>
                           <th className="py-2.5 px-3">Action</th>
                         </tr>
@@ -6028,7 +6358,10 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
                               </td>
                               <td className="py-3 px-3 whitespace-nowrap">
                                 <div className="text-emerald-400 font-bold">+{opp.spreadBps.toFixed(1)} bps</div>
-                                <div className="text-[9px] text-slate-500">Pool Fee: {(opp.dexFeeBps ?? 35).toFixed(1)} bps</div>
+                                <div className="text-[9px] text-amber-300/90">
+                                  DEX Fee: {(opp.dexFeeBps ?? 35).toFixed(1)} bps
+                                  {typeof opp.dexFeeUsd === 'number' ? ` (-$${opp.dexFeeUsd.toFixed(2)})` : ''}
+                                </div>
                               </td>
                               <td className="py-3 px-3">
                                 <div className="flex items-center gap-1 text-slate-300">
@@ -6039,8 +6372,15 @@ forge create src/FlashArbOptimized.sol:FlashArbOptimized \\
                               </td>
                               <td className="py-3 px-3 whitespace-nowrap">
                                 <div className="text-slate-300 font-bold">{opp.revmGas.toLocaleString()} gas</div>
-                                <div className="text-[10px] text-cyan-400">-{opp.gasSavingsPercent}% Least Gas</div>
-                                <div className="text-[9px] text-slate-500">${opp.gasCostUsd.toFixed(3)} L2 fee</div>
+                                <div className="text-[10px] text-cyan-400">
+                                  -${opp.gasCostUsd.toFixed(3)}{' '}
+                                  {['Ethereum', 'Polygon', 'BSC', 'Avalanche'].includes(opp.chain) ? 'L1' : 'L2'} gas
+                                </div>
+                                <div className="text-[9px] text-slate-400">
+                                  {typeof opp.dexFeeUsd === 'number' || typeof opp.slippageCostUsd === 'number'
+                                    ? `Mkt -$${((opp.dexFeeUsd ?? 0) + (opp.slippageCostUsd ?? 0)).toFixed(2)} · 0% Loan`
+                                    : `-${opp.gasSavingsPercent}% Least Gas`}
+                                </div>
                               </td>
                               <td className="py-3 px-3 whitespace-nowrap">
                                 {opp.isProfitable ? (

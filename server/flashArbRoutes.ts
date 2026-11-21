@@ -1156,7 +1156,13 @@ flashArbRouter.get('/contract-status', async (req: Request, res: Response) => {
 
     const { result: codeRaw } = await fetchRpcSingleWithFailover(chain, 'eth_getCode', [address, 'latest'], true);
     const code = codeRaw || '0x';
-    const isDeployed = code !== '0x' && code.length > 2;
+    const lowerCode = code.toLowerCase();
+    const isEip7702Eoa = lowerCode.startsWith('0xef0100') && lowerCode.length === 48;
+    const isDeployed = code !== '0x' && code.length > 2 && !isEip7702Eoa;
+    const supportsOptimizedArbitrage = isDeployed && lowerCode.includes('23b3aa6b');
+    const supportsRescueTokensTo = isDeployed && lowerCode.includes('a7070692');
+    const isFlashArbContract = supportsOptimizedArbitrage || supportsRescueTokensTo || (isDeployed && lowerCode.includes('ae3bf8'));
+    const isProfitVaultAddress = address.toLowerCase() === profitWalletEnv().toLowerCase();
 
     let contractOwner: string | null = null;
     let supportsAlgebra = false;
@@ -1197,7 +1203,12 @@ flashArbRouter.get('/contract-status', async (req: Request, res: Response) => {
       chain,
       address,
       isDeployed,
-      bytecodeLength: isDeployed ? (code.length - 2) / 2 : 0,
+      isEip7702Eoa,
+      isFlashArbContract,
+      isProfitVaultAddress,
+      supportsOptimizedArbitrage,
+      supportsRescueTokensTo,
+      bytecodeLength: code !== '0x' && code.length > 2 ? (code.length - 2) / 2 : 0,
       owner: contractOwner,
       signerAddress,
       ownerMatchesSigner,
@@ -1408,9 +1419,9 @@ const RUNTIME_DEPLOYMENTS_FILE = path.resolve(process.cwd(), '.flash-arb-deploym
 
 // In-memory registry of active FlashArb contract addresses per chain (persisted to .flash-arb-deployments.json on updates)
 const DEPLOYED_CONTRACTS: Record<string, string> = {
-  ethereum: (process.env.FLASH_ARB_CONTRACT_ETHEREUM || '').trim(),
-  polygon: (process.env.FLASH_ARB_CONTRACT_POLYGON || '').trim(),
-  bsc: (process.env.FLASH_ARB_CONTRACT_BSC || '').trim(),
+  ethereum: (process.env.FLASH_ARB_CONTRACT_ETHEREUM || '0x5901B4B159Ea0Cab54effcbF00F0076c96AD898D').trim(),
+  polygon: (process.env.FLASH_ARB_CONTRACT_POLYGON || '0xBBA273E057cDa31bB359d8AA8749256246B6d0cC').trim(),
+  bsc: (process.env.FLASH_ARB_CONTRACT_BSC || '0xBBA273E057cDa31bB359d8AA8749256246B6d0cC').trim(),
   avalanche: (process.env.FLASH_ARB_CONTRACT_AVALANCHE || '').trim(),
   arbitrum: '0xeee31ff9e69904b43c124095b6f33aa61505bcc2',
   base: '0x37440674a814f24d9C6ea0990b272215D40c4512',
@@ -1804,6 +1815,8 @@ export interface LiveArbitrageOpportunity {
   grossSpreadUsd: number;
   grossSpreadBps: number;
   dexFeeBps: number;
+  dexFeeUsd?: number;
+  slippageCostUsd?: number;
   estNetProfitUsd: number;
   isProfitable: boolean;
   isActionable: boolean;
@@ -2646,20 +2659,22 @@ class LiveMevAgent {
     const optimalLoanWeth = sized.loanUnits;
     const priceImpactBps = sized.priceImpactBps;
     const netProfitUsd = sized.netProfitUsd;
+    const dexFeeUsd = Number((sized.tradeUsd * (dexFeeBps / 10000)).toFixed(4));
+    const slippageCostUsd = Number((sized.tradeUsd * (priceImpactBps / 10000)).toFixed(4));
     let isProfitable = false;
     let profitGuardStatus: 'PROFIT_SECURED' | 'REVERT_PROTECTION_BLOCKED' = 'REVERT_PROTECTION_BLOCKED';
     let profitGuardReason = '';
 
     if (netEdgeBps <= 0) {
-      profitGuardReason = `Execution Blocked by Profit Guard: gross spread (${grossSpreadBps} bps) is below combined DEX swap fees (${dexFeeBps} bps). Modelled loss $${Math.abs(netProfitUsd).toFixed(2)}.`;
+      profitGuardReason = `Execution Blocked by Profit Guard: gross spread (${grossSpreadBps} bps) is below combined DEX market swap fees (${dexFeeBps} bps / -$${dexFeeUsd.toFixed(2)}). Modelled loss $${Math.abs(netProfitUsd).toFixed(2)}.`;
     } else if (sized.overDepth) {
       profitGuardReason = `Execution Blocked by Profit Guard: minimum clip ($${sized.tradeUsd.toFixed(0)}) exceeds ${(adaptiveDepthFraction * 100).toFixed(1)}% of the shallower pool's measured depth ($${sized.shallowDepthUsd.toFixed(0)}), so the impact model is not reliable.`;
     } else if (netProfitUsd >= this.minProfitThresholdUsd) {
       isProfitable = true;
       profitGuardStatus = 'PROFIT_SECURED';
-      profitGuardReason = `Profit Guard Passed: modelled net profit +$${netProfitUsd.toFixed(2)} (after ~${priceImpactBps} bps price impact and gas) meets min threshold ($${this.minProfitThresholdUsd.toFixed(2)}).`;
+      profitGuardReason = `Profit Guard Passed: modelled net profit +$${netProfitUsd.toFixed(2)} (after -$${dexFeeUsd.toFixed(2)} DEX fees, -$${slippageCostUsd.toFixed(2)} slippage, and -$${gasCostUsd.toFixed(3)} gas) meets min threshold ($${this.minProfitThresholdUsd.toFixed(2)}).`;
     } else {
-      profitGuardReason = `Execution Blocked by Profit Guard: modelled net profit $${netProfitUsd.toFixed(2)} is below minimum threshold ($${this.minProfitThresholdUsd.toFixed(2)}).`;
+      profitGuardReason = `Execution Blocked by Profit Guard: modelled net profit $${netProfitUsd.toFixed(2)} (after -$${dexFeeUsd.toFixed(2)} DEX fees, -$${slippageCostUsd.toFixed(2)} slippage, -$${gasCostUsd.toFixed(3)} gas) is below minimum threshold ($${this.minProfitThresholdUsd.toFixed(2)}).`;
     }
 
     const cleanBuy = params.buyDex.toLowerCase().replace(/[^a-z0-9]/g, '');
@@ -2683,6 +2698,8 @@ class LiveMevAgent {
       grossSpreadUsd: Number(grossSpreadUsd.toFixed(spreadDecimals)),
       grossSpreadBps,
       dexFeeBps,
+      dexFeeUsd,
+      slippageCostUsd,
       estNetProfitUsd: netProfitUsd,
       isProfitable,
       isActionable: isProfitable,
